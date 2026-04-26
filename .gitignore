@@ -37,6 +37,12 @@ htmlcov/
 .dmypy.json
 dmypy.json
 
+# ruff cache
+.ruff_cache/
+
+# dynamic outputs
+output/
+
 # IDEs
 .vscode/
 .idea/
