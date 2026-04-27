@@ -147,17 +147,21 @@ def format_result_to_markdown(result: Dict[str, Any], file_path: str) -> str:
     return "\n".join(md_lines)
 
 
-def save_markdown_result(result: Dict[str, Any], file_path: str, output_dir: str = "output") -> str:
+def save_markdown_result(result: Dict[str, Any], file_path: str, output_dir: str = None) -> str:
     """Save analysis result as markdown file.
 
     Args:
         result: Analysis result from API
         file_path: Original file path for reference
-        output_dir: Directory to save markdown file
+        output_dir: Directory to save markdown file (default: project root/output)
 
     Returns:
         Path to saved markdown file
     """
+    # Set default output directory to project root/output
+    if output_dir is None:
+        output_dir = str(Path(__file__).parent.parent.parent.parent / "output")
+
     # Create output directory if it doesn't exist
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -195,17 +199,21 @@ def format_text_to_markdown(text: str, file_path: str) -> str:
     return "\n".join(md_lines)
 
 
-def save_text_markdown(text: str, file_path: str, output_dir: str = "output") -> str:
+def save_text_markdown(text: str, file_path: str, output_dir: str = None) -> str:
     """Save text result as markdown file.
 
     Args:
         text: Extracted text content
         file_path: Original file path for reference
-        output_dir: Directory to save markdown file
+        output_dir: Directory to save markdown file (default: project root/output)
 
     Returns:
         Path to saved markdown file
     """
+    # Set default output directory to project root/output
+    if output_dir is None:
+        output_dir = str(Path(__file__).parent.parent.parent.parent / "output")
+
     # Create output directory if it doesn't exist
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)

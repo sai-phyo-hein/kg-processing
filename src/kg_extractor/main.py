@@ -6,13 +6,14 @@ import sys
 from pathlib import Path
 
 from kg_extractor import __version__
-from kg_extractor.agent import run_agent_interactive, run_agent_single_task
-from kg_extractor.input_processor import DocumentProcessor
-from kg_extractor.markdown_formatter import (
+from kg_extractor.tools.agent import run_agent_interactive, run_agent_single_task
+from kg_extractor.tools.workflow import run_workflow
+from kg_extractor.utils.input_processor import DocumentProcessor
+from kg_extractor.utils.markdown_formatter import (
     save_markdown_result,
     save_text_markdown,
 )
-from kg_extractor.parser import (
+from kg_extractor.utils.parser import (
     ImageEncodingError,
     NVIDIAAPIError,
     NVIDIAConfig,
@@ -29,6 +30,156 @@ from kg_extractor.parser import (
     process_document_with_api,
     process_document_with_openrouter,
 )
+from kg_extractor.utils.triple_refiner import refine_triples_from_file
+from kg_extractor.utils.neo4j_graph_builder import build_graph_from_file
+
+
+def workflow_command(args) -> None:
+    """Run the document processing, semantic chunking, triple extraction, refinement, and graph building workflow."""
+    print("🚀 Starting complete workflow...")
+    print(f"📄 Input file: {args.input_file}")
+    print(f"🤖 Provider: {args.provider}")
+    print(f"🧠 Model: {args.model}")
+    print(f"📝 Content type: {args.content_type}")
+    print(f"🎯 Similarity threshold: {args.similarity_threshold}")
+    print(f"📏 Min chunk size: {args.min_chunk_size} tokens")
+    print(f"📏 Max chunk size: {args.max_chunk_size} tokens")
+    print(f"🤖 Chunking LLM: {args.chunking_llm_provider}/{args.chunking_llm_model}")
+    print(f"🔗 Triple LLM: {args.triplet_llm_provider}/{args.triplet_llm_model}")
+    print(f"🔍 Refine triples: {args.refine_triples}")
+    if args.refine_triples:
+        print(f"🤖 Refinement LLM: {args.refinement_llm_provider}/{args.refinement_llm_model}")
+    print(f"🕸️ Build graph: {args.build_graph}")
+    print()
+
+    result = run_workflow(
+        input_file=args.input_file,
+        provider=args.provider,
+        model=args.model,
+        content_type=args.content_type,
+        similarity_threshold=args.similarity_threshold,
+        min_chunk_size=args.min_chunk_size,
+        max_chunk_size=args.max_chunk_size,
+        output_format="markdown",
+        chunking_llm_provider=args.chunking_llm_provider,
+        chunking_llm_model=args.chunking_llm_model,
+        triplet_llm_provider=args.triplet_llm_provider,
+        triplet_llm_model=args.triplet_llm_model,
+        refine_triples=args.refine_triples,
+        refinement_llm_provider=args.refinement_llm_provider,
+        refinement_llm_model=args.refinement_llm_model,
+        build_graph=args.build_graph,
+    )
+
+    if result["status"] == "success":
+        print("✅ Workflow completed successfully!")
+        print(f"📄 Markdown output: {result['markdown_output']}")
+        print(f"🧩 Chunks output: {result['chunks_output']}")
+        print(f"🔗 Triples output: {result['triples_output']}")
+        if result['refined_output']:
+            print(f"🔍 Refined triples: {result['refined_output']}")
+        if result['graph_stats']:
+            stats = result['graph_stats']
+            print(f"🕸️ Graph built:")
+            print(f"   - Entities: {stats['entities_created']}")
+            print(f"   - Relationships: {stats['relationships_created']}")
+            if stats['errors']:
+                print(f"   - Errors: {len(stats['errors'])}")
+    else:
+        print(f"❌ Workflow failed: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+
+
+def refine_command(args) -> None:
+    """Refine knowledge graph triples using Qdrant for entity resolution."""
+    print("🔍 Starting triple refinement with Qdrant...")
+    print(f"📄 Input file: {args.input_file}")
+    print(f"🤖 LLM Provider: {args.llm_provider}")
+    print(f"🧠 LLM Model: {args.llm_model}")
+    print()
+
+    try:
+        # Check for Qdrant configuration
+        import os
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+
+        if not qdrant_url or not qdrant_api_key:
+            print("❌ Error: QDRANT_URL and QDRANT_API_KEY must be set in environment variables", file=sys.stderr)
+            sys.exit(1)
+
+        # Refine triples
+        output_path = refine_triples_from_file(
+            input_path=args.input_file,
+            output_path=args.output,
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            llm_provider=args.llm_provider,
+            llm_model=args.llm_model,
+        )
+
+        # Read the output to get statistics
+        with open(output_path, "r", encoding="utf-8") as f:
+            output_data = json.load(f)
+        total_triples = output_data.get("total_triples", 0)
+        total_chunks = output_data.get("total_chunks", 0)
+
+        print("✅ Triple refinement completed successfully!")
+        print(f"📊 Total triples refined: {total_triples}")
+        print(f"🧩 Total chunks processed: {total_chunks}")
+        print(f"📄 Output file: {output_path}")
+
+    except FileNotFoundError as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except json.JSONDecodeError as e:
+        print(f"❌ Error reading triples file: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error refining triples: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def graph_command(args) -> None:
+    """Build Neo4j graph from refined triples."""
+    print("🕸️ Starting Neo4j graph building...")
+    print(f"📄 Input file: {args.input_file}")
+    print()
+
+    try:
+        # Check for Neo4j configuration
+        import os
+        neo4j_uri = os.getenv("NEO4J_URI")
+        neo4j_user = os.getenv("NEO4J_USER") or os.getenv("NEO4J_USERNAME")
+        neo4j_password = os.getenv("NEO4J_PASSWORD")
+
+        if not neo4j_uri or not neo4j_user or not neo4j_password:
+            print("❌ Error: NEO4J_URI, NEO4J_USER (or NEO4J_USERNAME), and NEO4J_PASSWORD must be set in environment variables", file=sys.stderr)
+            sys.exit(1)
+
+        # Build graph
+        stats = build_graph_from_file(
+            input_path=args.input_file,
+            neo4j_uri=neo4j_uri,
+            neo4j_user=neo4j_user,
+            neo4j_password=neo4j_password,
+        )
+
+        print("✅ Graph building completed successfully!")
+        print(f"📊 Statistics:")
+        print(f"   - Entities created: {stats['entities_created']}")
+        print(f"   - Relationships created: {stats['relationships_created']}")
+        if stats['errors']:
+            print(f"   - Errors: {len(stats['errors'])}")
+            for error in stats['errors'][:5]:  # Show first 5 errors
+                print(f"     - {error}")
+
+    except FileNotFoundError as e:
+        print(f"❌ Error: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error building graph: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 def main() -> None:
@@ -43,9 +194,223 @@ Examples:
   %(prog)s --content-type table spreadsheet.xlsx
   %(prog)s --output result.json --format json presentation.pptx
   %(prog)s --max-tokens 4096 --temperature 0.3 report.docx
+  %(prog)s workflow document.pdf --similarity-threshold 0.5
+  %(prog)s workflow document.pdf --triplet-llm-provider openai --triplet-llm-model gpt-4o-mini
+  %(prog)s refine test_triples.json --llm-provider openai --llm-model gpt-4o-mini
         """,
     )
 
+    # Add subcommands
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    # Default process command (backward compatibility)
+    process_parser = subparsers.add_parser("process", help="Process a document file")
+    process_parser.add_argument(
+        "file_path",
+        type=str,
+        help="Path to document file (images, PDF, DOCX, PPTX, XLSX)",
+    )
+    process_parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="Use streaming API response (images only)",
+    )
+    process_parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["nvidia", "openrouter", "groq"],
+        default="nvidia",
+        help="API provider to use (default: nvidia)",
+    )
+    process_parser.add_argument(
+        "--model",
+        type=str,
+        default="google/gemma-3-27b-it",
+        help="Model to use (default: google/gemma-3-27b-it for nvidia, "
+        "google/gemma-4-31b-it:free for openrouter)",
+    )
+    process_parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=2048,
+        help="Maximum tokens in response (default: 2048)",
+    )
+    process_parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.20,
+        help="Sampling temperature (default: 0.20)",
+    )
+    process_parser.add_argument(
+        "--top-p",
+        type=float,
+        default=0.70,
+        help="Nucleus sampling parameter (default: 0.70)",
+    )
+    process_parser.add_argument(
+        "--content-type",
+        type=str,
+        choices=["text", "diagram", "table", "mixed"],
+        default="mixed",
+        help="Type of content to focus on (default: mixed)",
+    )
+    process_parser.add_argument(
+        "--output",
+        type=str,
+        help="Output file path (optional)",
+    )
+    process_parser.add_argument(
+        "--format",
+        type=str,
+        choices=["text", "json", "markdown"],
+        default="text",
+        help="Output format (default: text)",
+    )
+
+    # Workflow command
+    workflow_parser = subparsers.add_parser("workflow", help="Run document processing, semantic chunking, and triple extraction workflow")
+    workflow_parser.add_argument(
+        "input_file",
+        type=str,
+        help="Input document file",
+    )
+    workflow_parser.add_argument(
+        "--provider",
+        type=str,
+        choices=["nvidia", "openrouter"],
+        default="nvidia",
+        help="API provider (default: nvidia)",
+    )
+    workflow_parser.add_argument(
+        "--model",
+        type=str,
+        default="microsoft/phi-4-multimodal-instruct",
+        help="Model to use (default: microsoft/phi-4-multimodal-instruct)",
+    )
+    workflow_parser.add_argument(
+        "--content-type",
+        type=str,
+        choices=["text", "diagram", "table", "mixed"],
+        default="mixed",
+        help="Content type (default: mixed)",
+    )
+    workflow_parser.add_argument(
+        "--similarity-threshold",
+        type=float,
+        default=0.5,
+        help="Similarity threshold for chunking (0.0-1.0, default: 0.5)",
+    )
+    workflow_parser.add_argument(
+        "--min-chunk-size",
+        type=int,
+        default=100,
+        help="Minimum tokens per chunk (default: 100)",
+    )
+    workflow_parser.add_argument(
+        "--max-chunk-size",
+        type=int,
+        default=1000,
+        help="Maximum tokens per chunk (default: 1000)",
+    )
+    workflow_parser.add_argument(
+        "--chunking-llm-provider",
+        type=str,
+        choices=["openai", "groq", "nvidia", "openrouter"],
+        default="openai",
+        help="LLM provider for chunking analysis (default: openai)",
+    )
+    workflow_parser.add_argument(
+        "--chunking-llm-model",
+        type=str,
+        default="gpt-4o-mini",
+        help="LLM model for chunking analysis (default: gpt-4o-mini)",
+    )
+    workflow_parser.add_argument(
+        "--triplet-llm-provider",
+        type=str,
+        choices=["openai", "groq", "nvidia", "openrouter"],
+        default="openai",
+        help="LLM provider for triple extraction (default: openai)",
+    )
+    workflow_parser.add_argument(
+        "--triplet-llm-model",
+        type=str,
+        default="gpt-4o-mini",
+        help="LLM model for triple extraction (default: gpt-4o-mini)",
+    )
+    workflow_parser.add_argument(
+        "--refine-triples",
+        action="store_true",
+        default=True,
+        help="Refine triples using Qdrant for entity resolution (default: True)",
+    )
+    workflow_parser.add_argument(
+        "--no-refine-triples",
+        dest="refine_triples",
+        action="store_false",
+        help="Skip triple refinement step",
+    )
+    workflow_parser.add_argument(
+        "--refinement-llm-provider",
+        type=str,
+        choices=["openai", "groq", "nvidia", "openrouter"],
+        default="openai",
+        help="LLM provider for triple refinement (default: openai)",
+    )
+    workflow_parser.add_argument(
+        "--refinement-llm-model",
+        type=str,
+        default="gpt-4o-mini",
+        help="LLM model for triple refinement (default: gpt-4o-mini)",
+    )
+    workflow_parser.add_argument(
+        "--build-graph",
+        action="store_true",
+        default=True,
+        help="Build Neo4j graph from refined triples (default: True)",
+    )
+    workflow_parser.add_argument(
+        "--no-build-graph",
+        dest="build_graph",
+        action="store_false",
+        help="Skip Neo4j graph building step",
+    )
+
+    # Graph command
+    graph_parser = subparsers.add_parser("graph", help="Build Neo4j graph from refined triples")
+    graph_parser.add_argument(
+        "input_file",
+        type=str,
+        help="Input refined triples JSON file",
+    )
+
+    # Refine command
+    refine_parser = subparsers.add_parser("refine", help="Refine knowledge graph triples using Qdrant for entity resolution")
+    refine_parser.add_argument(
+        "input_file",
+        type=str,
+        help="Input triples JSON file",
+    )
+    refine_parser.add_argument(
+        "--output",
+        type=str,
+        help="Output file path (default: input_path with _refined suffix)",
+    )
+    refine_parser.add_argument(
+        "--llm-provider",
+        type=str,
+        choices=["openai", "groq", "nvidia", "openrouter"],
+        default="openai",
+        help="LLM provider for canonical comparison (default: openai)",
+    )
+    refine_parser.add_argument(
+        "--llm-model",
+        type=str,
+        default="gpt-4o-mini",
+        help="LLM model for canonical comparison (default: gpt-4o-mini)",
+    )
+
+    # For backward compatibility, also support the old argument format
     parser.add_argument(
         "--agent",
         action="store_true",
@@ -146,6 +511,30 @@ Examples:
     args = parser.parse_args()
 
     try:
+        # Handle workflow command
+        if args.command == "workflow":
+            workflow_command(args)
+            return
+
+        # Handle refine command
+        if args.command == "refine":
+            refine_command(args)
+            return
+
+        # Handle graph command
+        if args.command == "graph":
+            graph_command(args)
+            return
+
+        # Handle process command
+        if args.command == "process":
+            # Map process command args to the old format
+            args.file_path = args.file_path
+            # Fall through to the processing logic below
+        elif args.command is None and not args.agent and not args.file_path:
+            # No command specified and no file path, show help
+            parser.print_help()
+            sys.exit(0)
         # Handle agent mode
         if args.agent:
             if args.agent_task:

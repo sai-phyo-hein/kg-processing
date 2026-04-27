@@ -4,13 +4,14 @@ import base64
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, List, Tuple
 
 import requests
 from dotenv import load_dotenv
 
-from kg_extractor.input_processor import (
+from kg_extractor.utils.input_processor import (
     DocumentProcessor,
     get_content_specific_prompt,
     get_system_prompt,
@@ -413,6 +414,238 @@ def get_groq_api_key() -> str:
     return api_key
 
 
+def _process_single_page_nvidia(
+    page_num: int,
+    base64_image: str,
+    config: NVIDIAConfig,
+    system_prompt: str,
+    content_prompt: str,
+) -> Dict[str, Any]:
+    """Process a single page using NVIDIA API.
+
+    Args:
+        page_num: Page number (1-indexed)
+        base64_image: Base64 encoded image
+        config: NVIDIA API configuration
+        system_prompt: System prompt for the API
+        content_prompt: Content-specific prompt
+
+    Returns:
+        Parsed result for the page
+
+    Raises:
+        NVIDIAAPIError: If API call fails
+    """
+    # Build payload with system prompt
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": content_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    },
+                ],
+            },
+        ],
+        "max_tokens": config.max_tokens,
+        "temperature": config.temperature,
+        "top_p": config.top_p,
+        "stream": False,  # Always use non-streaming for structured output
+    }
+
+    # Make API call
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                NVIDIA_API_URL, headers=headers, json=payload, timeout=60
+            )  # Longer timeout for document processing
+
+            if response.status_code == 200:
+                result = response.json()
+                if "choices" in result and len(result["choices"]) > 0:
+                    content = result["choices"][0]["message"]["content"]
+
+                    # Try to parse as JSON
+                    try:
+                        parsed_content = json.loads(content)
+                        parsed_content["page_number"] = page_num
+                        return parsed_content
+                    except json.JSONDecodeError:
+                        # If not JSON, wrap in simple structure
+                        return {
+                            "page_number": page_num,
+                            "content": {"text": content},
+                            "metadata": {
+                                "has_text": True,
+                                "has_diagrams": False,
+                                "has_tables": False,
+                                "content_quality": "medium",
+                            },
+                        }
+                else:
+                    raise NVIDIAAPIError("Invalid API response format")
+            elif response.status_code == 401:
+                raise NVIDIAAPIError("Invalid API key")
+            elif response.status_code == 429:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+                raise NVIDIAAPIError("Rate limit exceeded")
+            else:
+                error_msg = response.text
+                try:
+                    error_data = response.json()
+                    if "error" in error_data:
+                        error_msg = error_data["error"]
+                except ValueError:
+                    pass
+                raise NVIDIAAPIError(f"API error ({response.status_code}): {error_msg}")
+
+        except requests.exceptions.Timeout:
+            last_error = "API request timed out"
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+        except requests.exceptions.RequestException as e:
+            last_error = f"Network error: {e}"
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+
+    if last_error:
+        raise NVIDIAAPIError(
+            f"API call failed for page {page_num} after {MAX_RETRIES} attempts: {last_error}"
+        )
+
+
+def _process_single_page_openrouter(
+    page_num: int,
+    base64_image: str,
+    config: OpenRouterConfig,
+    system_prompt: str,
+    content_prompt: str,
+) -> Dict[str, Any]:
+    """Process a single page using OpenRouter API.
+
+    Args:
+        page_num: Page number (1-indexed)
+        base64_image: Base64 encoded image
+        config: OpenRouter API configuration
+        system_prompt: System prompt for the API
+        content_prompt: Content-specific prompt
+
+    Returns:
+        Parsed result for the page
+
+    Raises:
+        OpenRouterAPIError: If API call fails
+    """
+    # Build payload with system prompt
+    payload = {
+        "model": config.model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": content_prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
+                    },
+                ],
+            },
+        ],
+        "max_tokens": config.max_tokens,
+        "temperature": config.temperature,
+        "stream": False,  # Always use non-streaming for structured output
+    }
+
+    # Make API call
+    headers = {
+        "Authorization": f"Bearer {config.api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/anthropics/claude-code",
+        "X-Title": "KG Extractor",
+    }
+
+    last_error = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                OPENROUTER_API_URL, headers=headers, json=payload, timeout=60
+            )  # Longer timeout for document processing
+
+            if response.status_code == 200:
+                result = response.json()
+                if "choices" in result and len(result["choices"]) > 0:
+                    content = result["choices"][0]["message"]["content"]
+
+                    # Try to parse as JSON
+                    try:
+                        parsed_content = json.loads(content)
+                        parsed_content["page_number"] = page_num
+                        return parsed_content
+                    except json.JSONDecodeError:
+                        # If not JSON, wrap in simple structure
+                        return {
+                            "page_number": page_num,
+                            "content": {"text": content},
+                            "metadata": {
+                                "has_text": True,
+                                "has_diagrams": False,
+                                "has_tables": False,
+                                "content_quality": "medium",
+                            },
+                        }
+                else:
+                    raise OpenRouterAPIError("Invalid API response format")
+            elif response.status_code == 401:
+                raise OpenRouterAPIError("Invalid API key")
+            elif response.status_code == 429:
+                if attempt < MAX_RETRIES - 1:
+                    time.sleep(RETRY_DELAY * (attempt + 1))
+                    continue
+                raise OpenRouterAPIError("Rate limit exceeded")
+            else:
+                error_msg = response.text
+                try:
+                    error_data = response.json()
+                    if "error" in error_data:
+                        error_msg = error_data["error"]
+                except ValueError:
+                    pass
+                raise OpenRouterAPIError(f"API error ({response.status_code}): {error_msg}")
+
+        except requests.exceptions.Timeout:
+            last_error = "API request timed out"
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+        except requests.exceptions.RequestException as e:
+            last_error = f"Network error: {e}"
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY * (attempt + 1))
+                continue
+
+    if last_error:
+        raise OpenRouterAPIError(
+            f"API call failed for page {page_num} after {MAX_RETRIES} attempts: {last_error}"
+        )
+
+
 def process_document_with_api(
     file_path: str,
     config: NVIDIAConfig,
@@ -443,104 +676,33 @@ def process_document_with_api(
     system_prompt = get_system_prompt()
     content_prompt = get_content_specific_prompt(content_type)
 
-    # Process each page/image
+    # Process pages in parallel
     results = []
-    for page_num, base64_image in enumerate(base64_images, 1):
-        # Build payload with system prompt
-        payload = {
-            "model": config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": content_prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                        },
-                    ],
-                },
-            ],
-            "max_tokens": config.max_tokens,
-            "temperature": config.temperature,
-            "top_p": config.top_p,
-            "stream": False,  # Always use non-streaming for structured output
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all page processing tasks
+        future_to_page = {
+            executor.submit(
+                _process_single_page_nvidia,
+                page_num,
+                base64_image,
+                config,
+                system_prompt,
+                content_prompt,
+            ): page_num
+            for page_num, base64_image in enumerate(base64_images, 1)
         }
 
-        # Make API call
-        headers = {
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-
-        last_error = None
-        for attempt in range(MAX_RETRIES):
+        # Collect results as they complete
+        for future in as_completed(future_to_page):
+            page_num = future_to_page[future]
             try:
-                response = requests.post(
-                    NVIDIA_API_URL, headers=headers, json=payload, timeout=60
-                )  # Longer timeout for document processing
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                raise NVIDIAAPIError(f"Failed to process page {page_num}: {e}") from e
 
-                if response.status_code == 200:
-                    result = response.json()
-                    if "choices" in result and len(result["choices"]) > 0:
-                        content = result["choices"][0]["message"]["content"]
-
-                        # Try to parse as JSON
-                        try:
-                            parsed_content = json.loads(content)
-                            parsed_content["page_number"] = page_num
-                            results.append(parsed_content)
-                        except json.JSONDecodeError:
-                            # If not JSON, wrap in simple structure
-                            results.append(
-                                {
-                                    "page_number": page_num,
-                                    "content": {"text": content},
-                                    "metadata": {
-                                        "has_text": True,
-                                        "has_diagrams": False,
-                                        "has_tables": False,
-                                        "content_quality": "medium",
-                                    },
-                                }
-                            )
-                        break
-                    else:
-                        raise NVIDIAAPIError("Invalid API response format")
-                elif response.status_code == 401:
-                    raise NVIDIAAPIError("Invalid API key")
-                elif response.status_code == 429:
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_DELAY * (attempt + 1))
-                        continue
-                    raise NVIDIAAPIError("Rate limit exceeded")
-                else:
-                    error_msg = response.text
-                    try:
-                        error_data = response.json()
-                        if "error" in error_data:
-                            error_msg = error_data["error"]
-                    except ValueError:
-                        pass
-                    raise NVIDIAAPIError(f"API error ({response.status_code}): {error_msg}")
-
-            except requests.exceptions.Timeout:
-                last_error = "API request timed out"
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
-            except requests.exceptions.RequestException as e:
-                last_error = f"Network error: {e}"
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
-
-        if last_error:
-            raise NVIDIAAPIError(
-                f"API call failed for page {page_num} after {MAX_RETRIES} attempts: {last_error}"
-            )
+    # Sort results by page number to maintain order
+    results.sort(key=lambda x: x["page_number"])
 
     # Combine results
     return {
@@ -633,104 +795,33 @@ def process_document_with_openrouter(
     system_prompt = get_system_prompt()
     content_prompt = get_content_specific_prompt(content_type)
 
-    # Process each page/image
+    # Process pages in parallel
     results = []
-    for page_num, base64_image in enumerate(base64_images, 1):
-        # Build payload with system prompt
-        payload = {
-            "model": config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": content_prompt},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"},
-                        },
-                    ],
-                },
-            ],
-            "max_tokens": config.max_tokens,
-            "temperature": config.temperature,
-            "stream": False,  # Always use non-streaming for structured output
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        # Submit all page processing tasks
+        future_to_page = {
+            executor.submit(
+                _process_single_page_openrouter,
+                page_num,
+                base64_image,
+                config,
+                system_prompt,
+                content_prompt,
+            ): page_num
+            for page_num, base64_image in enumerate(base64_images, 1)
         }
 
-        # Make API call
-        headers = {
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": "https://github.com/anthropics/claude-code",
-            "X-Title": "KG Extractor",
-        }
-
-        last_error = None
-        for attempt in range(MAX_RETRIES):
+        # Collect results as they complete
+        for future in as_completed(future_to_page):
+            page_num = future_to_page[future]
             try:
-                response = requests.post(
-                    OPENROUTER_API_URL, headers=headers, json=payload, timeout=60
-                )  # Longer timeout for document processing
+                result = future.result()
+                results.append(result)
+            except Exception as e:
+                raise OpenRouterAPIError(f"Failed to process page {page_num}: {e}") from e
 
-                if response.status_code == 200:
-                    result = response.json()
-                    if "choices" in result and len(result["choices"]) > 0:
-                        content = result["choices"][0]["message"]["content"]
-
-                        # Try to parse as JSON
-                        try:
-                            parsed_content = json.loads(content)
-                            parsed_content["page_number"] = page_num
-                            results.append(parsed_content)
-                        except json.JSONDecodeError:
-                            # If not JSON, wrap in simple structure
-                            results.append(
-                                {
-                                    "page_number": page_num,
-                                    "content": {"text": content},
-                                    "metadata": {
-                                        "has_text": True,
-                                        "has_diagrams": False,
-                                        "has_tables": False,
-                                        "content_quality": "medium",
-                                    },
-                                }
-                            )
-                        break
-                    else:
-                        raise OpenRouterAPIError("Invalid API response format")
-                elif response.status_code == 401:
-                    raise OpenRouterAPIError("Invalid API key")
-                elif response.status_code == 429:
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_DELAY * (attempt + 1))
-                        continue
-                    raise OpenRouterAPIError("Rate limit exceeded")
-                else:
-                    error_msg = response.text
-                    try:
-                        error_data = response.json()
-                        if "error" in error_data:
-                            error_msg = error_data["error"]
-                    except ValueError:
-                        pass
-                    raise OpenRouterAPIError(f"API error ({response.status_code}): {error_msg}")
-
-            except requests.exceptions.Timeout:
-                last_error = "API request timed out"
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
-            except requests.exceptions.RequestException as e:
-                last_error = f"Network error: {e}"
-                if attempt < MAX_RETRIES - 1:
-                    time.sleep(RETRY_DELAY * (attempt + 1))
-                    continue
-
-        if last_error:
-            raise OpenRouterAPIError(
-                f"API call failed for page {page_num} after {MAX_RETRIES} attempts: {last_error}"
-            )
+    # Sort results by page number to maintain order
+    results.sort(key=lambda x: x["page_number"])
 
     # Combine results
     return {

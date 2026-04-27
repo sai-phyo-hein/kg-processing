@@ -1,0 +1,17 @@
+{
+  "collection_name": "entity_registry",
+  "description": "Entity registry for subject and object entities",
+  "sparse_vector_name": "entity_vector",
+  "vector_config": {
+    "datatype": "float32",
+    "distance": "Cosine",
+    "hnsw_config": {
+      "ef_construct": 256,
+      "m": 24,
+      "payload_m": 24
+    },
+    "on_disk": false,
+    "size": 1536
+  },
+  "vector_name": "entity"
+}

@@ -5,14 +5,18 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from dotenv import load_dotenv
 from langchain.agents import create_agent as create_langchain_agent
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 
-from kg_extractor.input_processor import DocumentProcessor
-from kg_extractor.markdown_formatter import save_markdown_result, save_text_markdown
-from kg_extractor.parser import (
+# Load environment variables
+load_dotenv()
+
+from kg_extractor.utils.input_processor import DocumentProcessor
+from kg_extractor.utils.markdown_formatter import save_markdown_result, save_text_markdown
+from kg_extractor.utils.parser import (
     GroqAPIError,
     NVIDIAAPIError,
     NVIDIAConfig,
@@ -26,6 +30,9 @@ from kg_extractor.parser import (
     process_document_with_api,
     process_document_with_openrouter,
 )
+from kg_extractor.utils.semantic_chunker import chunk_markdown_file
+from kg_extractor.utils.triple_extractor import extract_triples_from_chunks
+from kg_extractor.utils.triple_refiner import refine_triples_from_file
 
 
 @tool
@@ -296,6 +303,188 @@ def list_markdown_files(directory: str = "output") -> str:
         return f"Error listing files: {e}"
 
 
+@tool
+def semantic_chunk_markdown(
+    file_path: str,
+    similarity_threshold: float = 0.5,
+    min_chunk_size: int = 100,
+    max_chunk_size: int = 1000,
+    llm_provider: str = "openai",
+    llm_model: str = "gpt-4o-mini",
+) -> str:
+    """Perform semantic chunking on a markdown file using LLM analysis.
+
+    The LLM reads the content and determines where topic changes occur based on its understanding.
+    Output chunks contain only chunk_id and content for simplicity.
+
+    Args:
+        file_path: Path to the markdown file to chunk
+        similarity_threshold: Threshold for detecting topic changes (0.0-1.0)
+        min_chunk_size: Minimum tokens per chunk
+        max_chunk_size: Maximum tokens per chunk
+        llm_provider: LLM provider to use (openai, groq, nvidia, openrouter)
+        llm_model: Model to use for LLM analysis
+
+    Returns:
+        Result of chunking with chunk count and output file path
+    """
+    try:
+        path = Path(file_path)
+        if not path.exists():
+            return f"Error: File not found: {file_path}"
+
+        # Validate parameters
+        if not 0.0 <= similarity_threshold <= 1.0:
+            return f"Error: similarity_threshold must be between 0.0 and 1.0, got {similarity_threshold}"
+        if min_chunk_size < 0:
+            return f"Error: min_chunk_size must be non-negative, got {min_chunk_size}"
+        if max_chunk_size < min_chunk_size:
+            return f"Error: max_chunk_size ({max_chunk_size}) must be >= min_chunk_size ({min_chunk_size})"
+
+        # Perform chunking
+        output_path = chunk_markdown_file(
+            file_path=file_path,
+            similarity_threshold=similarity_threshold,
+            min_chunk_size=min_chunk_size,
+            max_chunk_size=max_chunk_size,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            output_dir=str(Path(__file__).parent.parent.parent.parent / "output"),
+        )
+
+        # Read the output to get chunk count
+        with open(output_path, "r", encoding="utf-8") as f:
+            output_data = json.load(f)
+        chunk_count = output_data.get("total_chunks", 0)
+
+        return f"Successfully chunked {file_path} into {chunk_count} chunks using {llm_provider}/{llm_model}. Output saved to: {output_path}"
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except json.JSONDecodeError as e:
+        return f"Error reading chunk output: {e}"
+    except Exception as e:
+        return f"Error chunking markdown: {e}"
+
+
+@tool
+def extract_triples_tool(
+    chunks_file: str,
+    source_file: str = "",
+    llm_provider: str = "openai",
+    llm_model: str = "gpt-4o-mini",
+) -> str:
+    """Extract knowledge graph triples from chunks using LLM analysis.
+
+    The LLM analyzes each chunk and extracts triples with two-level predicate hierarchy
+    and temporal metadata for knowledge graph construction.
+
+    Args:
+        chunks_file: Path to the chunks JSON file
+        source_file: Original source file path for context
+        llm_provider: LLM provider to use (openai, groq, nvidia, openrouter)
+        llm_model: Model to use for LLM analysis
+
+    Returns:
+        Result of triple extraction with triple count and output file path
+    """
+    try:
+        path = Path(chunks_file)
+        if not path.exists():
+            return f"Error: Chunks file not found: {chunks_file}"
+
+        # Read chunks
+        with open(path, "r", encoding="utf-8") as f:
+            chunks_data = json.load(f)
+
+        chunks = chunks_data.get("chunks", [])
+
+        if not chunks:
+            return f"Error: No chunks found in {chunks_file}"
+
+        # Extract triples
+        output_path = extract_triples_from_chunks(
+            chunks=chunks,
+            source_file=source_file,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+            output_dir=str(Path(__file__).parent.parent.parent.parent / "output"),
+        )
+
+        # Read the output to get triple count
+        with open(output_path, "r", encoding="utf-8") as f:
+            output_data = json.load(f)
+        triple_count = output_data.get("total_triples", 0)
+
+        return f"Successfully extracted {triple_count} triples from {len(chunks)} chunks using {llm_provider}/{llm_model}. Output saved to: {output_path}"
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except json.JSONDecodeError as e:
+        return f"Error reading chunks file: {e}"
+    except Exception as e:
+        return f"Error extracting triples: {e}"
+
+
+@tool
+def refine_triples_tool(
+    triples_file: str,
+    output_path: Optional[str] = None,
+    llm_provider: str = "openai",
+    llm_model: str = "gpt-4o-mini",
+) -> str:
+    """Refine knowledge graph triples using Qdrant for entity resolution.
+
+    This tool queries Qdrant for existing entities, predicates, and ontologies,
+    uses LLM to determine canonical forms, and updates triples with canonical references.
+
+    Args:
+        triples_file: Path to the triples JSON file to refine
+        output_path: Path to save refined triples (default: input_path with _refined suffix)
+        llm_provider: LLM provider for canonical comparison (openai, groq, nvidia, openrouter)
+        llm_model: Model for LLM analysis
+
+    Returns:
+        Result of triple refinement with output file path
+    """
+    try:
+        path = Path(triples_file)
+        if not path.exists():
+            return f"Error: Triples file not found: {triples_file}"
+
+        # Check for Qdrant configuration
+        qdrant_url = os.getenv("QDRANT_URL")
+        qdrant_api_key = os.getenv("QDRANT_API_KEY")
+
+        if not qdrant_url or not qdrant_api_key:
+            return f"Error: QDRANT_URL and QDRANT_API_KEY must be set in environment variables"
+
+        # Refine triples
+        output_path_result = refine_triples_from_file(
+            input_path=triples_file,
+            output_path=output_path,
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            llm_provider=llm_provider,
+            llm_model=llm_model,
+        )
+
+        # Read the output to get statistics
+        with open(output_path_result, "r", encoding="utf-8") as f:
+            output_data = json.load(f)
+        total_triples = output_data.get("total_triples", 0)
+        total_chunks = output_data.get("total_chunks", 0)
+
+        return f"Successfully refined {total_triples} triples from {total_chunks} chunks using {llm_provider}/{llm_model} and Qdrant. Output saved to: {output_path_result}"
+
+    except FileNotFoundError as e:
+        return f"Error: {e}"
+    except json.JSONDecodeError as e:
+        return f"Error reading triples file: {e}"
+    except Exception as e:
+        return f"Error refining triples: {e}"
+
+
 def create_agent(
     provider: str = "openai",
     model: str = "gpt-4o-mini",
@@ -320,6 +509,9 @@ def create_agent(
         edit_markdown_file,
         search_markdown_content,
         list_markdown_files,
+        semantic_chunk_markdown,
+        extract_triples_tool,
+        refine_triples_tool,
     ]
 
     # Create system prompt
@@ -331,11 +523,38 @@ You have access to the following tools:
 3. edit_markdown_file - Edit markdown files at specific lines
 4. search_markdown_content - Search for content in markdown files
 5. list_markdown_files - List all markdown files in a directory
+6. semantic_chunk_markdown - Perform semantic chunking on markdown using LLM analysis
+7. extract_triples_tool - Extract knowledge graph triples from chunks using LLM analysis
+8. refine_triples_tool - Refine triples using Qdrant for entity resolution
 
 When processing documents:
 - Use the appropriate provider (nvidia or openrouter) and model
 - Specify the content type (text, diagram, table, mixed) based on what you need to extract
 - Use markdown format for best readability
+
+When chunking markdown:
+- Use semantic_chunk_markdown to split content based on topic shifts detected by LLM analysis
+- The LLM reads the content and determines where topic changes occur based on semantic understanding
+- Specify llm_provider and llm_model to control which LLM performs the chunking analysis
+- Adjust similarity_threshold (0.0-1.0) to provide guidance to the LLM on chunk granularity
+- Lower threshold = more chunks (finer granularity)
+- Higher threshold = fewer chunks (coarser granularity)
+- Output chunks contain only chunk_id and content for simplicity
+
+When extracting triples:
+- Use extract_triples_tool to extract knowledge graph triples from chunks
+- The LLM analyzes each chunk and extracts triples with two-level predicate hierarchy
+- Triples include subject, predicate, object, and temporal metadata
+- Specify llm_provider and llm_model to control which LLM performs the triple extraction
+- Output includes both per-chunk results and flattened all_triples array
+
+When refining triples:
+- Use refine_triples_tool to perform entity resolution using Qdrant
+- The tool queries Qdrant for existing entities, predicates, and ontologies
+- Uses LLM to determine canonical forms and identify synonyms
+- Updates triples with canonical references for consistency
+- Requires QDRANT_URL and QDRANT_API_KEY environment variables to be set
+- Specify llm_provider and llm_model to control which LLM performs the canonical comparison
 
 When editing markdown files:
 - Always read the file first to understand its structure
@@ -343,7 +562,7 @@ When editing markdown files:
 - Use search to find specific content if needed
 - Be careful with line numbers after insertions
 
-Help users process their documents and make edits to markdown files efficiently."""
+Help users process their documents, make edits to markdown files, perform semantic chunking, extract knowledge graph triples, and refine triples for entity resolution efficiently."""
 
     # Create the LLM based on provider
     if provider == "openai":
