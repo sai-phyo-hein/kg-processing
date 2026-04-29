@@ -445,11 +445,22 @@ Analyze the entities and return the canonical form in JSON format:"""
             canonical_id = data.get("canonical_id")
             synonyms = data.get("synonyms", [])
 
+            # Handle string "None" vs actual None
+            if canonical_id == "None":
+                canonical_id = None
+
             # If no canonical determined, use current entity
             if not canonical:
                 canonical = current_entity
                 canonical_id = None
                 synonyms = [e["payload"]["name"] for e in existing_entities]
+
+            # If canonical_id is None but canonical matches an existing entity, use its ID
+            if canonical_id is None and canonical:
+                for existing_entity in existing_entities:
+                    if existing_entity["payload"]["name"] == canonical:
+                        canonical_id = existing_entity["id"]
+                        break
 
             return {
                 "canonical": canonical,
@@ -577,7 +588,7 @@ Analyze the entities and return the canonical form in JSON format:"""
         """Batch upsert entities to Qdrant.
 
         Args:
-            entities: List of entity dictionaries with name, type, synonyms, source_chunk
+            entities: List of entity dictionaries with name, type, synonyms, etc.
             collection_name: Name of the collection
 
         Returns:
@@ -610,8 +621,7 @@ Analyze the entities and return the canonical form in JSON format:"""
                         "name": entity["name"],
                         "type": entity["type"],
                         "is_canonical": entity.get("is_canonical", True),
-                        "synonyms": entity.get("synonyms", []),
-                        "source_chunk": entity["source_chunk"],
+                        "synonyms": entity.get("synonyms", [])
                     },
                 )
                 points.append(point)
@@ -626,8 +636,10 @@ Analyze the entities and return the canonical form in JSON format:"""
             return {entity["name"]: self._generate_uuid(entity["name"]) for entity in entities}
 
         except Exception as e:
-            print(f"Warning: Failed to batch upsert entities: {e}")
-            return {}
+            print(f"Error: Failed to batch upsert entities to {collection_name}: {e}")
+            print(f"  Entities being upserted: {[e['name'] for e in entities]}")
+            # Re-raise the error to make it visible
+            raise
 
     def _upsert_entity(
         self,
@@ -636,7 +648,6 @@ Analyze the entities and return the canonical form in JSON format:"""
         entity_type: str,
         is_canonical: bool,
         synonyms: List[str],
-        source_chunk: int,
     ) -> str:
         """Upsert a single entity to Qdrant (for backward compatibility).
 
@@ -646,8 +657,6 @@ Analyze the entities and return the canonical form in JSON format:"""
             entity_type: Type of entity
             is_canonical: Whether this is the canonical form
             synonyms: List of synonyms
-            source_chunk: Source chunk ID
-
         Returns:
             ID of the upserted point
         """
@@ -656,8 +665,7 @@ Analyze the entities and return the canonical form in JSON format:"""
                 "name": name,
                 "type": entity_type,
                 "is_canonical": is_canonical,
-                "synonyms": synonyms,
-                "source_chunk": source_chunk,
+                "synonyms": synonyms
             }],
             collection_name,
         )
@@ -668,7 +676,6 @@ Analyze the entities and return the canonical form in JSON format:"""
         entity_name: str,
         entity_type: str,
         collection_name: str,
-        source_chunk: int,
     ) -> Dict[str, Any]:
         """Refine a single entity using Qdrant.
 
@@ -676,7 +683,6 @@ Analyze the entities and return the canonical form in JSON format:"""
             entity_name: Name of the entity to refine
             entity_type: Type of the entity
             collection_name: Name of the Qdrant collection
-            source_chunk: Source chunk ID
 
         Returns:
             Dictionary with refined entity information
@@ -700,13 +706,12 @@ Analyze the entities and return the canonical form in JSON format:"""
                 entity_type=entity_type,
                 is_canonical=True,
                 synonyms=canonical_info["synonyms"],
-                source_chunk=source_chunk,
             )
 
         return {
             "original": entity_name,
             "canonical": canonical_info["canonical"],
-            "canonical_id": upserted_id or canonical_info.get("canonical_id"),
+            "canonical_id": upserted_id if upserted_id else canonical_info.get("canonical_id"),
             "synonyms": canonical_info["synonyms"],
             "is_new": canonical_info["is_new"],
         }
@@ -874,6 +879,32 @@ Analyze the entities and return the canonical form in JSON format:"""
                             if (cache_key[0] == collection_name and
                                 cached_entity["canonical"] == canonical_info["canonical"]):
                                 cached_entity["canonical_id"] = canonical_id
+                elif canonical_info.get("canonical_id"):
+                    # Entity exists in Qdrant, update cache with existing ID
+                    for (cache_key, cached_entity) in entity_cache.items():
+                        if (cache_key[0] == collection_name and
+                            cached_entity["canonical"] == canonical_info["canonical"]):
+                            cached_entity["canonical_id"] = canonical_info["canonical_id"]
+
+                    # Check if we need to update existing entity to canonical
+                    # Find the existing entity in matches
+                    for match in matches:
+                        if match["id"] == canonical_info["canonical_id"]:
+                            # Update the entity to be canonical if it wasn't already
+                            if not match["payload"].get("is_canonical", False):
+                                try:
+                                    self.qdrant_client.set_payload(
+                                        collection_name=collection_name,
+                                        payload={
+                                            "is_canonical": True,
+                                            "synonyms": canonical_info["synonyms"],
+                                        },
+                                        points=[canonical_info["canonical_id"]],
+                                    )
+                                    print(f"  Updated entity '{canonical_info['canonical']}' to canonical")
+                                except Exception as e:
+                                    print(f"  Warning: Failed to update entity to canonical: {e}")
+                            break
 
         # Now refine all triples using the cached results
         refined_chunks = []
@@ -931,14 +962,14 @@ Analyze the entities and return the canonical form in JSON format:"""
                 refined_triple = {
                     "subject": {
                         "name": refined_subject["canonical"],
-                        "type": refined_subject["canonical_id"] or triple["subject"]["type"],
+                        "type": refined_subject["type"],
                         "original_name": triple["subject"]["name"],
                     },
                     "predicate": refined_predicate["canonical"],
                     "original_predicate": triple["predicate"],
                     "object": {
                         "name": refined_object["canonical"],
-                        "type": refined_object_type["canonical"],
+                        "type": refined_object_type["type"],
                         "original_name": triple["object"]["name"],
                         "original_type": triple["object"]["type"],
                     },

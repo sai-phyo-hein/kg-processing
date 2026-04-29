@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+from kg_extractor.utils.schema_parser import get_schema_parser
+
 
 class Neo4jGraphBuilder:
     """Build knowledge graphs in Neo4j from refined triples."""
@@ -17,6 +19,8 @@ class Neo4jGraphBuilder:
         neo4j_uri: Optional[str] = None,
         neo4j_user: Optional[str] = None,
         neo4j_password: Optional[str] = None,
+        with_schema: bool = False,
+        schema_path: Optional[str] = None,
     ):
         """Initialize the Neo4j graph builder.
 
@@ -24,12 +28,20 @@ class Neo4jGraphBuilder:
             neo4j_uri: Neo4j server URI (from env if not provided)
             neo4j_user: Neo4j username (from env if not provided)
             neo4j_password: Neo4j password (from env if not provided)
+            with_schema: Whether to validate against schema (default: False)
+            schema_path: Path to schema.md file (default: utils/schema.md)
         """
         import os
 
         self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI")
         self.neo4j_user = neo4j_user or os.getenv("NEO4J_USER") or os.getenv("NEO4J_USERNAME")
         self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD")
+        self.with_schema = with_schema
+
+        # Initialize schema parser if with_schema is enabled
+        self.schema_parser = None
+        if self.with_schema:
+            self.schema_parser = get_schema_parser(schema_path)
 
         # Initialize Neo4j driver
         self._init_neo4j_driver()
@@ -70,6 +82,72 @@ class Neo4jGraphBuilder:
                 except Exception as e:
                     print(f"Warning: Failed to create constraint: {e}")
 
+    def _validate_entity_type(self, entity_type: str) -> bool:
+        """Validate entity type against schema.
+
+        Args:
+            entity_type: Entity type to validate
+
+        Returns:
+            True if valid, False otherwise
+        """
+        if not self.with_schema or self.schema_parser is None:
+            return True
+
+        # Map common entity types to schema node types
+        type_mapping = {
+            "Entity": "Entity",  # Generic entity
+            "SocialCapital": "SocialCapital",
+            "Activity": "Activity",
+            "Impact": "Impact",
+            "TargetGroup": "TargetGroup",
+            "Domain": "Domain",
+            "Tambon": "Tambon",
+            "Village": "Village",
+            "Evidence": "Evidence",
+        }
+
+        # Check if the type is in our mapping or directly valid
+        mapped_type = type_mapping.get(entity_type, entity_type)
+        return self.schema_parser.validate_node_type(mapped_type)
+
+    def _validate_relation(
+        self,
+        subject_type: str,
+        relation: str,
+        object_type: str,
+    ) -> bool:
+        """Validate relation against schema.
+
+        Args:
+            subject_type: Type of subject entity
+            relation: Relation name
+            object_type: Type of object entity
+
+        Returns:
+            True if valid, False otherwise
+        """
+        if not self.with_schema or self.schema_parser is None:
+            return True
+
+        # Map common entity types to schema node types
+        type_mapping = {
+            "Entity": "Entity",  # Generic entity
+            "SocialCapital": "SocialCapital",
+            "Activity": "Activity",
+            "Impact": "Impact",
+            "TargetGroup": "TargetGroup",
+            "Domain": "Domain",
+            "Tambon": "Tambon",
+            "Village": "Village",
+            "Evidence": "Evidence",
+        }
+
+        mapped_subject = type_mapping.get(subject_type, subject_type)
+        mapped_object = type_mapping.get(object_type, object_type)
+
+        return self.schema_parser.validate_relation(mapped_subject, relation, mapped_object)
+
     def _batch_create_nodes(
         self,
         nodes_data: List[Dict[str, Any]],
@@ -87,13 +165,17 @@ class Neo4jGraphBuilder:
         if not nodes_data:
             return 0
 
+        # Validate node type if schema validation is enabled
+        if not self._validate_entity_type(node_type):
+            print(f"Warning: Invalid node type '{node_type}' according to schema. Skipping node creation.")
+            return 0
+
         with self.driver.session() as session:
             query = f"""
             UNWIND $nodes_data AS node
             MERGE (n:{node_type} {{canonical_id: node.canonical_id}})
             SET n.name = node.name,
                 n.type = node.type,
-                n.source_chunk = node.source_chunk,
                 n.updated_at = datetime()
             RETURN count(n) as count
             """
@@ -117,6 +199,27 @@ class Neo4jGraphBuilder:
         if not relationships_data:
             return 0
 
+        # Filter relationships based on schema validation
+        valid_relationships = []
+        for rel in relationships_data:
+            # Get source and target types from the relationship data
+            # We need to look up the entity types from the nodes
+            source_type = rel.get("source_type", "Entity")
+            target_type = rel.get("target_type", "Entity")
+            relation = rel.get("edge_type", "")
+
+            # Validate relation if schema validation is enabled
+            if self._validate_relation(source_type, relation, target_type):
+                valid_relationships.append(rel)
+            else:
+                print(
+                    f"Warning: Invalid relation '{relation}' from {source_type} to {target_type} "
+                    f"according to schema. Skipping relationship creation."
+                )
+
+        if not valid_relationships:
+            return 0
+
         with self.driver.session() as session:
             query = """
             UNWIND $relationships_data AS rel
@@ -132,7 +235,7 @@ class Neo4jGraphBuilder:
             RETURN count(relationship) as count
             """
 
-            result = session.run(query, relationships_data=relationships_data)
+            result = session.run(query, relationships_data=valid_relationships)
             record = result.single()
             return record["count"] if record else 0
 
@@ -177,7 +280,6 @@ class Neo4jGraphBuilder:
                             "canonical_id": source_canonical_id,
                             "name": source_name,
                             "type": source_type,
-                            "source_chunk": chunk_id,
                         }
 
                     # Get target entity (object) with canonical_id
@@ -191,7 +293,6 @@ class Neo4jGraphBuilder:
                             "canonical_id": target_canonical_id,
                             "name": target_name,
                             "type": target_type,
-                            "source_chunk": chunk_id,
                         }
 
                     # Get predicate name as edge type
@@ -215,7 +316,9 @@ class Neo4jGraphBuilder:
                     if source_canonical_id and target_canonical_id:
                         relationships_data.append({
                             "source_id": source_canonical_id,
+                            "source_type": source_type,
                             "target_id": target_canonical_id,
+                            "target_type": target_type,
                             "edge_type": predicate_name,
                             "edge_props": edge_props,
                         })
@@ -246,6 +349,8 @@ def build_graph_from_file(
     neo4j_uri: Optional[str] = None,
     neo4j_user: Optional[str] = None,
     neo4j_password: Optional[str] = None,
+    with_schema: bool = False,
+    schema_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build Neo4j graph from refined triples file.
 
@@ -254,6 +359,8 @@ def build_graph_from_file(
         neo4j_uri: Neo4j server URI
         neo4j_user: Neo4j username
         neo4j_password: Neo4j password
+        with_schema: Whether to validate against schema (default: False)
+        schema_path: Path to schema.md file (default: utils/schema.md)
 
     Returns:
         Statistics about the graph building process
@@ -267,6 +374,8 @@ def build_graph_from_file(
         neo4j_uri=neo4j_uri,
         neo4j_user=neo4j_user,
         neo4j_password=neo4j_password,
+        with_schema=with_schema,
+        schema_path=schema_path,
     )
 
     try:

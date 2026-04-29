@@ -40,7 +40,6 @@ for collection_name in collections:
                 print(f"   Type: {payload.get('type', 'N/A')}")
                 print(f"   Is Canonical: {payload.get('is_canonical', 'N/A')}")
                 print(f"   Synonyms: {payload.get('synonyms', [])}")
-                print(f"   Source Chunk: {payload.get('source_chunk', 'N/A')}")
         else:
             print("No points found in collection")
 

@@ -20,11 +20,13 @@ dependencies = [
     "groq>=1.0.0",
     "qdrant-client>=1.12.0",
     "neo4j>=5.0.0",
+    "tiktoken>=0.5.0",
 ]
 
 [project.scripts]
 kg-extractor = "kg_extractor.main:main"
 kg-agent = "kg_extractor.agent:main"
+kg-reasoning = "kg_reasoning.main:main"
 
 [build-system]
 requires = ["hatchling"]

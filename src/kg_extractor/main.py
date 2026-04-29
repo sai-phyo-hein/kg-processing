@@ -7,7 +7,7 @@ from pathlib import Path
 
 from kg_extractor import __version__
 from kg_extractor.tools.agent import run_agent_interactive, run_agent_single_task
-from kg_extractor.tools.workflow import run_workflow
+from kg_extractor.tools.langgraph_workflow import run_langgraph_workflow
 from kg_extractor.utils.input_processor import DocumentProcessor
 from kg_extractor.utils.markdown_formatter import (
     save_markdown_result,
@@ -19,75 +19,33 @@ from kg_extractor.utils.parser import (
     NVIDIAConfig,
     OpenRouterAPIError,
     OpenRouterConfig,
+    OpenAIAPIError,
+    OpenAIConfig,
+    GoogleAPIError,
+    GoogleConfig,
     extract_text_from_document,
+    extract_text_from_document_openai,
     extract_text_from_document_openrouter,
+    extract_text_from_document_google,
     extract_text_from_image,
+    extract_text_from_image_openai,
     extract_text_from_image_openrouter,
+    extract_text_from_image_google,
     extract_text_from_image_streaming,
+    extract_text_from_image_streaming_openai,
     extract_text_from_image_streaming_openrouter,
+    extract_text_from_image_streaming_google,
     get_api_key,
+    get_openai_api_key,
     get_openrouter_api_key,
+    get_google_api_key,
     process_document_with_api,
+    process_document_with_openai,
     process_document_with_openrouter,
+    process_document_with_google,
 )
 from kg_extractor.utils.triple_refiner import refine_triples_from_file
 from kg_extractor.utils.neo4j_graph_builder import build_graph_from_file
-
-
-def workflow_command(args) -> None:
-    """Run the document processing, semantic chunking, triple extraction, refinement, and graph building workflow."""
-    print("🚀 Starting complete workflow...")
-    print(f"📄 Input file: {args.input_file}")
-    print(f"🤖 Provider: {args.provider}")
-    print(f"🧠 Model: {args.model}")
-    print(f"📝 Content type: {args.content_type}")
-    print(f"🎯 Similarity threshold: {args.similarity_threshold}")
-    print(f"📏 Min chunk size: {args.min_chunk_size} tokens")
-    print(f"📏 Max chunk size: {args.max_chunk_size} tokens")
-    print(f"🤖 Chunking LLM: {args.chunking_llm_provider}/{args.chunking_llm_model}")
-    print(f"🔗 Triple LLM: {args.triplet_llm_provider}/{args.triplet_llm_model}")
-    print(f"🔍 Refine triples: {args.refine_triples}")
-    if args.refine_triples:
-        print(f"🤖 Refinement LLM: {args.refinement_llm_provider}/{args.refinement_llm_model}")
-    print(f"🕸️ Build graph: {args.build_graph}")
-    print()
-
-    result = run_workflow(
-        input_file=args.input_file,
-        provider=args.provider,
-        model=args.model,
-        content_type=args.content_type,
-        similarity_threshold=args.similarity_threshold,
-        min_chunk_size=args.min_chunk_size,
-        max_chunk_size=args.max_chunk_size,
-        output_format="markdown",
-        chunking_llm_provider=args.chunking_llm_provider,
-        chunking_llm_model=args.chunking_llm_model,
-        triplet_llm_provider=args.triplet_llm_provider,
-        triplet_llm_model=args.triplet_llm_model,
-        refine_triples=args.refine_triples,
-        refinement_llm_provider=args.refinement_llm_provider,
-        refinement_llm_model=args.refinement_llm_model,
-        build_graph=args.build_graph,
-    )
-
-    if result["status"] == "success":
-        print("✅ Workflow completed successfully!")
-        print(f"📄 Markdown output: {result['markdown_output']}")
-        print(f"🧩 Chunks output: {result['chunks_output']}")
-        print(f"🔗 Triples output: {result['triples_output']}")
-        if result['refined_output']:
-            print(f"🔍 Refined triples: {result['refined_output']}")
-        if result['graph_stats']:
-            stats = result['graph_stats']
-            print(f"🕸️ Graph built:")
-            print(f"   - Entities: {stats['entities_created']}")
-            print(f"   - Relationships: {stats['relationships_created']}")
-            if stats['errors']:
-                print(f"   - Errors: {len(stats['errors'])}")
-    else:
-        print(f"❌ Workflow failed: {result['error']}", file=sys.stderr)
-        sys.exit(1)
 
 
 def refine_command(args) -> None:
@@ -144,6 +102,7 @@ def graph_command(args) -> None:
     """Build Neo4j graph from refined triples."""
     print("🕸️ Starting Neo4j graph building...")
     print(f"📄 Input file: {args.input_file}")
+    print(f"📋 With schema: {args.with_schema}")
     print()
 
     try:
@@ -163,6 +122,7 @@ def graph_command(args) -> None:
             neo4j_uri=neo4j_uri,
             neo4j_user=neo4j_user,
             neo4j_password=neo4j_password,
+            with_schema=args.with_schema,
         )
 
         print("✅ Graph building completed successfully!")
@@ -182,6 +142,64 @@ def graph_command(args) -> None:
         sys.exit(1)
 
 
+def langgraph_command(args) -> None:
+    """Run document processing using LangGraph workflow."""
+    print("🚀 Starting LangGraph workflow...")
+    print(f"📄 Input file: {args.input_file}")
+    print(f"🤖 Provider: {args.provider}")
+    print(f"🧠 Model: {args.model}")
+    print(f"📝 Content type: {args.content_type}")
+    print(f"🎯 Similarity threshold: {args.similarity_threshold}")
+    print(f"📏 Min chunk size: {args.min_chunk_size} tokens")
+    print(f"📏 Max chunk size: {args.max_chunk_size} tokens")
+    print(f"🤖 Chunking LLM: {args.chunking_llm_provider}/{args.chunking_llm_model}")
+    print(f"🔗 Triple LLM: {args.triplet_llm_provider}/{args.triplet_llm_model}")
+    print(f"🔍 Refine triples: {args.refine_triples}")
+    if args.refine_triples:
+        print(f"🤖 Refinement LLM: {args.refinement_llm_provider}/{args.refinement_llm_model}")
+    print(f"🕸️ Build graph: {args.build_graph}")
+    print(f"📋 With schema: {args.with_schema}")
+    print()
+
+    result = run_langgraph_workflow(
+        input_file=args.input_file,
+        provider=args.provider,
+        model=args.model,
+        content_type=args.content_type,
+        similarity_threshold=args.similarity_threshold,
+        min_chunk_size=args.min_chunk_size,
+        max_chunk_size=args.max_chunk_size,
+        output_format="markdown",
+        chunking_llm_provider=args.chunking_llm_provider,
+        chunking_llm_model=args.chunking_llm_model,
+        triplet_llm_provider=args.triplet_llm_provider,
+        triplet_llm_model=args.triplet_llm_model,
+        refine_triples=args.refine_triples,
+        refinement_llm_provider=args.refinement_llm_provider,
+        refinement_llm_model=args.refinement_llm_model,
+        build_graph=args.build_graph,
+        with_schema=args.with_schema,
+    )
+
+    if result["status"] == "success":
+        print("✅ LangGraph workflow completed successfully!")
+        print(f"📄 Markdown output: {result['markdown_output']}")
+        print(f"🧩 Chunks output: {result['chunks_output']}")
+        print(f"🔗 Triples output: {result['triples_output']}")
+        if result['refined_output']:
+            print(f"🔍 Refined triples: {result['refined_output']}")
+        if result['graph_stats']:
+            stats = result['graph_stats']
+            print(f"🕸️ Graph built:")
+            print(f"   - Entities: {stats['entities_created']}")
+            print(f"   - Relationships: {stats['relationships_created']}")
+            if stats['errors']:
+                print(f"   - Errors: {len(stats['errors'])}")
+    else:
+        print(f"❌ LangGraph workflow failed: {result['error']}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
     """Main entry point for the application."""
     parser = argparse.ArgumentParser(
@@ -194,8 +212,8 @@ Examples:
   %(prog)s --content-type table spreadsheet.xlsx
   %(prog)s --output result.json --format json presentation.pptx
   %(prog)s --max-tokens 4096 --temperature 0.3 report.docx
-  %(prog)s workflow document.pdf --similarity-threshold 0.5
-  %(prog)s workflow document.pdf --triplet-llm-provider openai --triplet-llm-model gpt-4o-mini
+  %(prog)s langgraph document.pdf --similarity-threshold 0.5
+  %(prog)s langgraph document.pdf --triplet-llm-provider openai --triplet-llm-model gpt-4o-mini
   %(prog)s refine test_triples.json --llm-provider openai --llm-model gpt-4o-mini
         """,
     )
@@ -218,7 +236,7 @@ Examples:
     process_parser.add_argument(
         "--provider",
         type=str,
-        choices=["nvidia", "openrouter", "groq"],
+        choices=["nvidia", "openrouter", "openai", "groq", "google"],
         default="nvidia",
         help="API provider to use (default: nvidia)",
     )
@@ -227,7 +245,8 @@ Examples:
         type=str,
         default="google/gemma-3-27b-it",
         help="Model to use (default: google/gemma-3-27b-it for nvidia, "
-        "google/gemma-4-31b-it:free for openrouter)",
+        "google/gemma-4-31b-it:free for openrouter, gpt-4o for openai, "
+        "google/gemini-3.1-flash-lite-preview for google)",
     )
     process_parser.add_argument(
         "--max-tokens",
@@ -267,113 +286,120 @@ Examples:
         help="Output format (default: text)",
     )
 
-    # Workflow command
-    workflow_parser = subparsers.add_parser("workflow", help="Run document processing, semantic chunking, and triple extraction workflow")
-    workflow_parser.add_argument(
+    # LangGraph workflow command
+    langgraph_parser = subparsers.add_parser("langgraph", help="Run document processing using LangGraph workflow")
+    langgraph_parser.add_argument(
         "input_file",
         type=str,
         help="Input document file",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--provider",
         type=str,
-        choices=["nvidia", "openrouter"],
+        choices=["nvidia", "openrouter", "openai", "google"],
         default="nvidia",
         help="API provider (default: nvidia)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--model",
         type=str,
         default="microsoft/phi-4-multimodal-instruct",
-        help="Model to use (default: microsoft/phi-4-multimodal-instruct)",
+        help="Model to use (default: microsoft/phi-4-multimodal-instruct for nvidia, "
+        "gpt-4o for openai, google/gemini-3.1-flash-lite-preview for google)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--content-type",
         type=str,
         choices=["text", "diagram", "table", "mixed"],
         default="mixed",
         help="Content type (default: mixed)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--similarity-threshold",
         type=float,
         default=0.5,
         help="Similarity threshold for chunking (0.0-1.0, default: 0.5)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--min-chunk-size",
         type=int,
         default=100,
         help="Minimum tokens per chunk (default: 100)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--max-chunk-size",
         type=int,
         default=1000,
         help="Maximum tokens per chunk (default: 1000)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--chunking-llm-provider",
         type=str,
         choices=["openai", "groq", "nvidia", "openrouter"],
         default="openai",
         help="LLM provider for chunking analysis (default: openai)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--chunking-llm-model",
         type=str,
         default="gpt-4o-mini",
         help="LLM model for chunking analysis (default: gpt-4o-mini)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--triplet-llm-provider",
         type=str,
         choices=["openai", "groq", "nvidia", "openrouter"],
         default="openai",
         help="LLM provider for triple extraction (default: openai)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--triplet-llm-model",
         type=str,
         default="gpt-4o-mini",
         help="LLM model for triple extraction (default: gpt-4o-mini)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--refine-triples",
         action="store_true",
         default=True,
         help="Refine triples using Qdrant for entity resolution (default: True)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--no-refine-triples",
         dest="refine_triples",
         action="store_false",
         help="Skip triple refinement step",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--refinement-llm-provider",
         type=str,
         choices=["openai", "groq", "nvidia", "openrouter"],
         default="openai",
         help="LLM provider for triple refinement (default: openai)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--refinement-llm-model",
         type=str,
         default="gpt-4o-mini",
         help="LLM model for triple refinement (default: gpt-4o-mini)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--build-graph",
         action="store_true",
         default=True,
         help="Build Neo4j graph from refined triples (default: True)",
     )
-    workflow_parser.add_argument(
+    langgraph_parser.add_argument(
         "--no-build-graph",
         dest="build_graph",
         action="store_false",
         help="Skip Neo4j graph building step",
+    )
+    langgraph_parser.add_argument(
+        "--with-schema",
+        action="store_true",
+        default=False,
+        help="Validate triples and graph against schema.md (default: False)",
     )
 
     # Graph command
@@ -382,6 +408,12 @@ Examples:
         "input_file",
         type=str,
         help="Input refined triples JSON file",
+    )
+    graph_parser.add_argument(
+        "--with-schema",
+        action="store_true",
+        default=False,
+        help="Validate triples and graph against schema.md (default: False)",
     )
 
     # Refine command
@@ -446,7 +478,7 @@ Examples:
     parser.add_argument(
         "--provider",
         type=str,
-        choices=["nvidia", "openrouter", "groq"],
+        choices=["nvidia", "openrouter", "openai", "groq", "google"],
         default="nvidia",
         help="API provider to use (default: nvidia)",
     )
@@ -456,7 +488,8 @@ Examples:
         type=str,
         default="google/gemma-3-27b-it",
         help="Model to use (default: google/gemma-3-27b-it for nvidia, "
-        "google/gemma-4-31b-it:free for openrouter)",
+        "google/gemma-4-31b-it:free for openrouter, gpt-4o for openai, "
+        "google/gemini-3.1-flash-lite-preview for google)",
     )
 
     parser.add_argument(
@@ -511,9 +544,9 @@ Examples:
     args = parser.parse_args()
 
     try:
-        # Handle workflow command
-        if args.command == "workflow":
-            workflow_command(args)
+        # Handle langgraph command
+        if args.command == "langgraph":
+            langgraph_command(args)
             return
 
         # Handle refine command
@@ -598,6 +631,26 @@ Examples:
                     top_p=args.top_p,
                     stream=args.stream,
                 )
+            elif args.provider == "openai":
+                api_key = get_openai_api_key()
+                config = OpenAIConfig(
+                    api_key=api_key,
+                    model=args.model if args.model != "google/gemma-3-27b-it" else "gpt-4o",
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    stream=args.stream,
+                )
+            elif args.provider == "google":
+                api_key = get_google_api_key()
+                config = GoogleConfig(
+                    api_key=api_key,
+                    model=args.model if args.model != "google/gemma-3-27b-it" else "google/gemini-3.1-flash-lite-preview",
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    stream=args.stream,
+                )
             else:  # openrouter
                 api_key = get_openrouter_api_key()
                 config = OpenRouterConfig(
@@ -608,7 +661,7 @@ Examples:
                     top_p=args.top_p,
                     stream=args.stream,
                 )
-        except (NVIDIAAPIError, OpenRouterAPIError) as e:
+        except (NVIDIAAPIError, OpenRouterAPIError, OpenAIAPIError, GoogleAPIError) as e:
             print(f"Error: {e}", file=sys.stderr)
             if args.provider == "nvidia":
                 print(
@@ -616,6 +669,18 @@ Examples:
                     file=sys.stderr,
                 )
                 print("You can get an API key from: https://build.nvidia.com/", file=sys.stderr)
+            elif args.provider == "openai":
+                print(
+                    "\nPlease set your OPENAI_API_KEY environment variable.",
+                    file=sys.stderr,
+                )
+                print("You can get an API key from: https://platform.openai.com/", file=sys.stderr)
+            elif args.provider == "google":
+                print(
+                    "\nPlease set your GOOGLE_API_KEY environment variable.",
+                    file=sys.stderr,
+                )
+                print("You can get an API key from: https://aistudio.google.com/app/apikey", file=sys.stderr)
             else:
                 print(
                     "\nPlease set your OPENROUTER_API_KEY environment variable.",
@@ -640,7 +705,19 @@ Examples:
                                 result += chunk
                             else:
                                 print(chunk, end="", flush=True)
-                    else:
+                    elif args.provider == "openai":
+                        for chunk in extract_text_from_image_streaming_openai(args.file_path, config):
+                            if args.output:
+                                result += chunk
+                            else:
+                                print(chunk, end="", flush=True)
+                    elif args.provider == "google":
+                        for chunk in extract_text_from_image_streaming_google(args.file_path, config):
+                            if args.output:
+                                result += chunk
+                            else:
+                                print(chunk, end="", flush=True)
+                    else:  # openrouter
                         for chunk in extract_text_from_image_streaming_openrouter(
                             args.file_path, config
                         ):
@@ -658,7 +735,11 @@ Examples:
                     # Non-streaming mode
                     if args.provider == "nvidia":
                         text = extract_text_from_image(args.file_path, config)
-                    else:
+                    elif args.provider == "openai":
+                        text = extract_text_from_image_openai(args.file_path, config)
+                    elif args.provider == "google":
+                        text = extract_text_from_image_google(args.file_path, config)
+                    else:  # openrouter
                         text = extract_text_from_image_openrouter(args.file_path, config)
 
                     if args.format == "markdown":
@@ -685,7 +766,15 @@ Examples:
                         result = extract_text_from_document(
                             args.file_path, config, args.content_type
                         )
-                    else:
+                    elif args.provider == "openai":
+                        result = extract_text_from_document_openai(
+                            args.file_path, config, args.content_type
+                        )
+                    elif args.provider == "google":
+                        result = extract_text_from_document_google(
+                            args.file_path, config, args.content_type
+                        )
+                    else:  # openrouter
                         result = extract_text_from_document_openrouter(
                             args.file_path, config, args.content_type
                         )
@@ -702,7 +791,15 @@ Examples:
                         result = process_document_with_api(
                             args.file_path, config, args.content_type
                         )
-                    else:
+                    elif args.provider == "openai":
+                        result = process_document_with_openai(
+                            args.file_path, config, args.content_type
+                        )
+                    elif args.provider == "google":
+                        result = process_document_with_google(
+                            args.file_path, config, args.content_type
+                        )
+                    else:  # openrouter
                         result = process_document_with_openrouter(
                             args.file_path, config, args.content_type
                         )
@@ -714,7 +811,15 @@ Examples:
                     # Get text output
                     if args.provider == "nvidia":
                         text = extract_text_from_document(args.file_path, config, args.content_type)
-                    else:
+                    elif args.provider == "openai":
+                        text = extract_text_from_document_openai(
+                            args.file_path, config, args.content_type
+                        )
+                    elif args.provider == "google":
+                        text = extract_text_from_document_google(
+                            args.file_path, config, args.content_type
+                        )
+                    else:  # openrouter
                         text = extract_text_from_document_openrouter(
                             args.file_path, config, args.content_type
                         )
@@ -729,7 +834,7 @@ Examples:
         except ImageEncodingError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
-        except (NVIDIAAPIError, OpenRouterAPIError) as e:
+        except (NVIDIAAPIError, OpenRouterAPIError, OpenAIAPIError, GoogleAPIError) as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
         except ValueError as e:

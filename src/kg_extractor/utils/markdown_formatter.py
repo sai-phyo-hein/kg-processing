@@ -30,16 +30,17 @@ def format_result_to_markdown(result: Dict[str, Any], file_path: str) -> str:
     )
     md_lines.append("---\n")
 
+    # Start flag for all extracted content
+    md_lines.append("<start>\n")
+
     # Process each page
     for page in result.get("pages", []):
         page_num = page.get("page_number", 1)
         content = page.get("content", {})
 
-        md_lines.append(f"\n## Page {page_num}\n")
-
         # Text content - handle both string and JSON string formats
         if "text" in content and content["text"]:
-            md_lines.append("### Text Content\n")
+            # Removed "### Text Content" header as requested
             text_data = content["text"]
 
             # Try to parse if it's a JSON string wrapped in markdown code blocks
@@ -104,7 +105,7 @@ def format_result_to_markdown(result: Dict[str, Any], file_path: str) -> str:
 
         # Diagrams (from original content structure, not nested)
         if "diagrams" in content and content["diagrams"]:
-            md_lines.append("### Diagrams and Charts\n")
+            # Removed "### Diagrams and Charts" header as requested
             for i, diagram in enumerate(content["diagrams"], 1):
                 md_lines.append(f"#### Diagram {i}\n")
                 if "type" in diagram:
@@ -117,7 +118,7 @@ def format_result_to_markdown(result: Dict[str, Any], file_path: str) -> str:
 
         # Tables (from original content structure, not nested)
         if "tables" in content and content["tables"]:
-            md_lines.append("### Tables\n")
+            # Removed "### Tables" header as requested
             for i, table in enumerate(content["tables"], 1):
                 md_lines.append(f"#### Table {i}\n")
                 if "title" in table:
@@ -133,7 +134,7 @@ def format_result_to_markdown(result: Dict[str, Any], file_path: str) -> str:
 
         # Metadata
         if "metadata" in content:
-            md_lines.append("### Page Metadata\n")
+            # Removed "### Page Metadata" header as requested
             metadata = content["metadata"]
             md_lines.append(f"- **Has Text:** {metadata.get('has_text', False)}")
             md_lines.append(f"- **Has Diagrams:** {metadata.get('has_diagrams', False)}")
@@ -143,6 +144,9 @@ def format_result_to_markdown(result: Dict[str, Any], file_path: str) -> str:
             md_lines.append("")
 
         md_lines.append("---\n")
+
+    # End flag for all extracted content
+    md_lines.append("</end>\n")
 
     return "\n".join(md_lines)
 

@@ -33,12 +33,14 @@ class TripleExtractor:
         self,
         chunks: List[Dict[str, Any]],
         source_file: str = "",
+        with_schema: bool = False,
     ) -> List[Dict[str, Any]]:
         """Extract triples from multiple chunks in parallel.
 
         Args:
             chunks: List of chunk dictionaries with chunk_id and content
             source_file: Source file path for context
+            with_schema: Whether to validate triples against schema.md
 
         Returns:
             List of triple extraction results
@@ -53,6 +55,7 @@ class TripleExtractor:
                     self._extract_triples_from_single_chunk,
                     chunk,
                     source_file,
+                    with_schema,
                 ): chunk["chunk_id"]
                 for chunk in chunks
             }
@@ -81,12 +84,14 @@ class TripleExtractor:
         self,
         chunk: Dict[str, Any],
         source_file: str = "",
+        with_schema: bool = False,
     ) -> Dict[str, Any]:
         """Extract triples from a single chunk.
 
         Args:
             chunk: Chunk dictionary with chunk_id and content
             source_file: Source file path for context
+            with_schema: Whether to validate triples against schema.md
 
         Returns:
             Dictionary with chunk_id and extracted triples
@@ -95,7 +100,7 @@ class TripleExtractor:
         content = chunk["content"]
 
         # Create prompt for triple extraction
-        prompt = create_triple_extraction_prompt(content, source_file, chunk_id)
+        prompt = create_triple_extraction_prompt(content, source_file, chunk_id, with_schema)
 
         # Get LLM response
         response = self._get_llm_response(prompt)
@@ -259,6 +264,7 @@ def extract_triples_from_chunks(
     llm_provider: str = "openai",
     llm_model: str = "gpt-4o-mini",
     output_dir: str = None,
+    with_schema: bool = False,
 ) -> str:
     """Extract triples from chunks using LLM analysis and save results.
 
@@ -268,6 +274,7 @@ def extract_triples_from_chunks(
         llm_provider: LLM provider to use
         llm_model: Model to use for LLM analysis
         output_dir: Directory to save triples (default: project root/output)
+        with_schema: Whether to validate triples against schema.md
 
     Returns:
         Path to saved triples file
@@ -282,7 +289,7 @@ def extract_triples_from_chunks(
     )
 
     # Extract triples from chunks
-    triple_results = extractor.extract_triples_from_chunks(chunks, source_file)
+    triple_results = extractor.extract_triples_from_chunks(chunks, source_file, with_schema)
 
     # Generate output path
     if source_file:

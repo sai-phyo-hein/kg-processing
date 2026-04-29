@@ -35,8 +35,7 @@ for predicate in test_predicates:
         name=predicate,
         entity_type="predicate",
         is_canonical=True,
-        synonyms=[],
-        source_chunk=1,
+        synonyms=[]
     )
     print(f"  Upserted: {predicate} -> {point_id}")
 

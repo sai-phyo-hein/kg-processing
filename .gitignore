@@ -60,3 +60,13 @@ Thumbs.db
 
 
 *.log
+
+
+# Processin files
+*.pdf
+*.xlsx
+*.pptx
+*.docx
+*.png
+*.jpg
+
