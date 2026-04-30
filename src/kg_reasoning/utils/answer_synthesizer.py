@@ -110,6 +110,95 @@ class AnswerSynthesizer:
         # Clean up response
         return self._clean_response(response)
 
+    def synthesize_answer_from_multiple_queries(
+        self,
+        user_query: str,
+        all_results: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """Synthesize a natural language answer from multiple Neo4j query results.
+
+        Args:
+            user_query: The original user query
+            all_results: Dictionary of results from multiple queries
+                Format: {
+                    "query_key": {
+                        "query": "...",
+                        "query_type": "merged|individual_entity|individual_predicate",
+                        "description": "...",
+                        "results": [...],
+                        "result_count": N
+                    }
+                }
+
+        Returns:
+            Natural language answer
+        """
+        # Build comprehensive context from all query results
+        prompt_parts = [
+            "You are an expert at analyzing knowledge graph data and synthesizing comprehensive natural language answers.",
+            "",
+            "**User's Question:**",
+            user_query,
+            "",
+            "**Results from Multiple Queries:**",
+            "I've executed multiple queries to gather comprehensive information:",
+            ""
+        ]
+
+        # Add results from each query
+        for query_key, result_dict in all_results.items():
+            query_type = result_dict.get("query_type", "unknown")
+            description = result_dict.get("description", "")
+            query = result_dict.get("query", "")
+            results = result_dict.get("results", [])
+            result_count = result_dict.get("result_count", 0)
+            error = result_dict.get("error", None)
+
+            prompt_parts.append(f"### Query: {description}")
+            prompt_parts.append(f"**Type:** {query_type}")
+            prompt_parts.append(f"**Cypher:** `{query}`")
+
+            if error:
+                prompt_parts.append(f"**Status:** Failed - {error}")
+            else:
+                prompt_parts.append(f"**Results:** {result_count} records found")
+
+                if results:
+                    # Format results as JSON for clarity
+                    prompt_parts.append("**Data:**")
+                    prompt_parts.append("```json")
+                    prompt_parts.append(json.dumps(results[:10], indent=2))  # Limit to 10 records per query
+                    if result_count > 10:
+                        prompt_parts.append(f"... and {result_count - 10} more records")
+                    prompt_parts.append("```")
+
+            prompt_parts.append("")
+
+        # Add synthesis instructions
+        prompt_parts.extend([
+            "**Instructions:**",
+            "1. Analyze ALL the query results above",
+            "2. Synthesize a comprehensive, natural language answer to the user's question",
+            "3. Integrate information from both the merged query and individual queries",
+            "4. Highlight patterns, relationships, and key findings",
+            "5. If different queries provide complementary information, combine them coherently",
+            "6. If queries show contradictions or uncertainties, mention them",
+            "7. Use specific names, values, and relationships from the data",
+            "8. Keep the answer concise but informative (2-4 paragraphs)",
+            "9. Do NOT mention the technical details of the queries themselves",
+            "10. Focus on answering the user's question directly",
+            "",
+            "**Your Answer:**"
+        ])
+
+        prompt = "\n".join(prompt_parts)
+
+        # Get LLM response
+        response = self._get_llm_response(prompt)
+
+        # Clean up response
+        return self._clean_response(response)
+
     def _clean_response(self, response: str) -> str:
         """Clean up the LLM response.
 

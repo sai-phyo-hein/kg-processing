@@ -334,3 +334,177 @@ Generate the Cypher query and return the result in JSON format:"""
 
         # Parse response
         return self._parse_cypher_response(response)
+
+    def generate_multiple_cypher_queries(
+        self,
+        refined_query: str,
+        entity_matches: List[Dict[str, Any]],
+        predicate_matches: List[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Generate multiple Cypher queries: one merged and individual queries for each entity/predicate.
+
+        Args:
+            refined_query: The refined user query
+            entity_matches: List of matched entities from Qdrant
+            predicate_matches: List of matched predicates from Qdrant
+
+        Returns:
+            List of dictionaries with Cypher queries and metadata
+        """
+        queries = []
+
+        # 1. Generate merged query with all entities and predicates
+        merged_query = self.generate_cypher_with_entities(
+            refined_query, entity_matches, predicate_matches
+        )
+        merged_query["query_type"] = "merged"
+        merged_query["description"] = "Merged query with all entities and predicates"
+        queries.append(merged_query)
+
+        # 2. Generate individual queries for each entity
+        for idx, entity_match in enumerate(entity_matches[:5]):  # Limit to top 5
+            entity_name = entity_match["payload"].get("name", "")
+            entity_type = entity_match["payload"].get("type", "")
+
+            if not entity_name:
+                continue
+
+            # Generate query for this specific entity
+            single_entity_query = self._generate_single_entity_query(
+                refined_query, entity_name, entity_type
+            )
+            single_entity_query["query_type"] = "individual_entity"
+            single_entity_query["description"] = f"Query for entity: {entity_name}"
+            single_entity_query["entity_name"] = entity_name
+            queries.append(single_entity_query)
+
+        # 3. Generate individual queries for each predicate
+        if predicate_matches:
+            for idx, predicate_match in enumerate(predicate_matches[:3]):  # Limit to top 3
+                predicate_name = predicate_match["payload"].get("name", "")
+
+                if not predicate_name:
+                    continue
+
+                # Generate query for this specific predicate
+                single_predicate_query = self._generate_single_predicate_query(
+                    refined_query, predicate_name
+                )
+                single_predicate_query["query_type"] = "individual_predicate"
+                single_predicate_query["description"] = f"Query for predicate: {predicate_name}"
+                single_predicate_query["predicate_name"] = predicate_name
+                queries.append(single_predicate_query)
+
+        return queries
+
+    def _generate_single_entity_query(
+        self,
+        refined_query: str,
+        entity_name: str,
+        entity_type: str,
+    ) -> Dict[str, Any]:
+        """Generate a Cypher query for a single entity.
+
+        Args:
+            refined_query: The refined user query
+            entity_name: Name of the entity
+            entity_type: Type of the entity
+
+        Returns:
+            Dictionary with Cypher query and metadata
+        """
+        prompt = f"""You are an expert in Neo4j Cypher query generation.
+
+Generate a Cypher query to retrieve information about a specific entity and its relationships.
+
+**User Query:**
+{refined_query}
+
+**Target Entity:**
+- Name: {entity_name}
+- Type: {entity_type}
+
+**Graph Schema:**
+- Node labels: Entity
+- Node properties: name, type, canonical_id, updated_at
+- Relationship types: Various predicates (dynamic)
+
+**IMPORTANT Cypher Syntax Rules:**
+1. Use proper MATCH patterns: `MATCH (n:Entity)-[r]-(m) WHERE n.name = 'value' RETURN n, r, m`
+2. For finding entities by name: `MATCH (n:Entity) WHERE n.name CONTAINS 'value' RETURN n`
+3. NEVER use `relationships()` function
+4. Use `(n)-[r]-(m)` for undirected relationships
+
+**Instructions:**
+1. Generate a query that finds the entity by name
+2. Include its relationships and connected nodes
+3. Use CONTAINS for flexible name matching
+4. Limit results (LIMIT 20)
+
+**Output Format (JSON):**
+```json
+{{
+  "cypher_query": "MATCH (n:Entity)-[r]-(m) WHERE n.name CONTAINS '{entity_name}' RETURN n, r, m LIMIT 20",
+  "query_explanation": "Retrieves entity '{entity_name}' and its relationships",
+  "expected_result_type": "relationships",
+  "result_structure": "entity node, relationships, connected nodes"
+}}
+```
+
+Generate the Cypher query:"""
+
+        response = self._get_llm_response(prompt)
+        return self._parse_cypher_response(response)
+
+    def _generate_single_predicate_query(
+        self,
+        refined_query: str,
+        predicate_name: str,
+    ) -> Dict[str, Any]:
+        """Generate a Cypher query for a specific predicate/relationship.
+
+        Args:
+            refined_query: The refined user query
+            predicate_name: Name of the predicate/relationship
+
+        Returns:
+            Dictionary with Cypher query and metadata
+        """
+        prompt = f"""You are an expert in Neo4j Cypher query generation.
+
+Generate a Cypher query to find all relationships of a specific type.
+
+**User Query:**
+{refined_query}
+
+**Target Relationship Type:**
+{predicate_name}
+
+**Graph Schema:**
+- Node labels: Entity
+- Relationship types: Various predicates (dynamic)
+
+**IMPORTANT Cypher Syntax Rules:**
+1. Use proper MATCH patterns with relationship type: `MATCH (n:Entity)-[r:{predicate_name}]-(m) RETURN n, r, m`
+2. NEVER use `relationships()` function
+3. Include both source and target nodes
+
+**Instructions:**
+1. Generate a query that finds all relationships of type '{predicate_name}'
+2. Include source and target nodes
+3. Limit results (LIMIT 20)
+
+**Output Format (JSON):**
+```json
+{{
+  "cypher_query": "MATCH (n:Entity)-[r:`{predicate_name}`]-(m) RETURN n, r, m LIMIT 20",
+  "query_explanation": "Retrieves all relationships of type '{predicate_name}'",
+  "expected_result_type": "relationships",
+  "result_structure": "source node, relationship, target node"
+}}
+```
+
+Generate the Cypher query:"""
+
+        response = self._get_llm_response(prompt)
+        return self._parse_cypher_response(response)

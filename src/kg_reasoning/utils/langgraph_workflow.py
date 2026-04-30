@@ -40,7 +40,9 @@ class ReasoningState(TypedDict):
     refined_query: str | None
     cypher_query: str | None
     cypher_explanation: str | None
+    cypher_queries: list[Dict[str, Any]] | None  # List of multiple queries (merged + individual)
     neo4j_results: list[Dict[str, Any]] | None
+    all_neo4j_results: Dict[str, list[Dict[str, Any]]] | None  # Results from all queries
     high_connectivity_nodes: list[Dict[str, Any]] | None
     query_suggestions: list[Dict[str, Any]] | None
     topics: list[str] | None
@@ -162,9 +164,9 @@ def refine_query_node(state: ReasoningState) -> ReasoningState:
 
 
 def generate_cypher_node(state: ReasoningState) -> ReasoningState:
-    """Generate Cypher query from refined query or high connectivity nodes."""
+    """Generate Cypher queries (both merged and individual) from refined query or high connectivity nodes."""
     try:
-        print("🔮 Generating Cypher query...")
+        print("🔮 Generating Cypher queries (merged + individual)...")
 
         generator = CypherGenerator(
             llm_provider=state["llm_provider"],
@@ -174,11 +176,11 @@ def generate_cypher_node(state: ReasoningState) -> ReasoningState:
         # Check if we have high connectivity nodes (no entity matches case)
         if state.get("high_connectivity_nodes"):
             print("   Using high connectivity nodes for query generation")
-            # Generate a query based on high connectivity nodes
+            # Generate a single query based on high connectivity nodes
             high_connectivity_nodes = state["high_connectivity_nodes"]
             node_names = [node.get("name", "") for node in high_connectivity_nodes if node.get("name")]
 
-            # Create a query that explores relationships between high connectivity nodes
+            # Generate a query that explores relationships between high connectivity nodes
             if node_names:
                 # Generate a query that asks about the data in general
                 query_context = f"Available entities in the knowledge graph: {', '.join(node_names[:10])}"
@@ -190,17 +192,53 @@ def generate_cypher_node(state: ReasoningState) -> ReasoningState:
                 cypher_result = generator.generate_cypher(
                     f"{state['user_query']}. Please provide a comprehensive overview of the available information."
                 )
-        elif state.get("refined_query"):
-            # Normal case with refined query
-            cypher_result = generator.generate_cypher(state["refined_query"])
+
+            # Store single query for high connectivity case
+            state["cypher_queries"] = [
+                {
+                    **cypher_result,
+                    "query_type": "high_connectivity",
+                    "description": "Query based on high connectivity nodes"
+                }
+            ]
+            state["cypher_query"] = cypher_result["cypher_query"]
+            state["cypher_explanation"] = cypher_result["query_explanation"]
+
+        elif state.get("entity_matches") or state.get("predicate_matches"):
+            # Generate multiple queries: merged + individual
+            print("   Generating merged and individual queries for matched entities and predicates")
+            entity_matches = state.get("entity_matches", [])
+            predicate_matches = state.get("predicate_matches", [])
+
+            queries = generator.generate_multiple_cypher_queries(
+                state.get("refined_query", state["user_query"]),
+                entity_matches,
+                predicate_matches
+            )
+
+            state["cypher_queries"] = queries
+            # Store the merged query as the main one for backward compatibility
+            if queries:
+                state["cypher_query"] = queries[0]["cypher_query"]
+                state["cypher_explanation"] = queries[0]["query_explanation"]
+
+            print(f"   Generated {len(queries)} queries: 1 merged + {len(queries)-1} individual")
+
         else:
             # Fallback to original query
             cypher_result = generator.generate_cypher(state["user_query"])
+            state["cypher_queries"] = [
+                {
+                    **cypher_result,
+                    "query_type": "fallback",
+                    "description": "Fallback query based on original user query"
+                }
+            ]
+            state["cypher_query"] = cypher_result["cypher_query"]
+            state["cypher_explanation"] = cypher_result["query_explanation"]
 
-        state["cypher_query"] = cypher_result["cypher_query"]
-        state["cypher_explanation"] = cypher_result["query_explanation"]
         state["current_step"] = "execute_query"
-        print(f"✅ Cypher generation completed: {state['cypher_query']}")
+        print(f"✅ Cypher generation completed: {len(state.get('cypher_queries', []))} queries generated")
 
     except Exception as e:
         state["status"] = "error"
@@ -211,13 +249,13 @@ def generate_cypher_node(state: ReasoningState) -> ReasoningState:
 
 
 def execute_query_node(state: ReasoningState) -> ReasoningState:
-    """Execute Cypher query against Neo4j."""
+    """Execute all Cypher queries against Neo4j."""
     try:
-        print("🕸️  Executing Neo4j query...")
-        print(f"   Query: {state['cypher_query']}")
+        print("🕸️  Executing Neo4j queries...")
 
-        if not state["cypher_query"]:
-            raise ValueError("No Cypher query available")
+        cypher_queries = state.get("cypher_queries", [])
+        if not cypher_queries:
+            raise ValueError("No Cypher queries available")
 
         neo4j = Neo4jQuery(
             neo4j_uri=state["neo4j_uri"],
@@ -225,11 +263,54 @@ def execute_query_node(state: ReasoningState) -> ReasoningState:
             neo4j_password=state["neo4j_password"],
         )
 
-        results = neo4j.execute_query(state["cypher_query"])
+        all_results = {}
+        total_results_count = 0
 
-        state["neo4j_results"] = results
+        # Execute each query
+        for idx, query_dict in enumerate(cypher_queries):
+            query = query_dict.get("cypher_query", "")
+            query_type = query_dict.get("query_type", "unknown")
+            description = query_dict.get("description", "")
+
+            if not query:
+                print(f"   ⚠️  Skipping empty query {idx + 1}")
+                continue
+
+            print(f"   Executing query {idx + 1}/{len(cypher_queries)} ({query_type}): {query[:100]}...")
+
+            try:
+                results = neo4j.execute_query(query)
+                query_key = f"{query_type}_{idx}"
+                all_results[query_key] = {
+                    "query": query,
+                    "query_type": query_type,
+                    "description": description,
+                    "results": results,
+                    "result_count": len(results)
+                }
+                total_results_count += len(results)
+                print(f"   ✅ Query {idx + 1} returned {len(results)} results")
+
+            except Exception as query_error:
+                print(f"   ⚠️  Query {idx + 1} failed: {query_error}")
+                all_results[f"{query_type}_{idx}"] = {
+                    "query": query,
+                    "query_type": query_type,
+                    "description": description,
+                    "results": [],
+                    "result_count": 0,
+                    "error": str(query_error)
+                }
+
+        # Store all results
+        state["all_neo4j_results"] = all_results
+        # Store merged results for backward compatibility
+        if all_results:
+            first_key = list(all_results.keys())[0]
+            state["neo4j_results"] = all_results[first_key]["results"]
+
         state["current_step"] = "synthesize_answer"
-        print(f"✅ Query execution completed: {len(results)} results found")
+        print(f"✅ Query execution completed: {len(all_results)} queries executed, {total_results_count} total results")
 
     except Exception as e:
         state["status"] = "error"
@@ -240,12 +321,24 @@ def execute_query_node(state: ReasoningState) -> ReasoningState:
 
 
 def synthesize_answer_node(state: ReasoningState) -> ReasoningState:
-    """Synthesize natural language answer from Neo4j results."""
+    """Synthesize natural language answer from all Neo4j query results."""
     try:
-        print("📝 Synthesizing answer...")
+        print("📝 Synthesizing answer from all query results...")
 
-        if not state["neo4j_results"]:
+        all_results = state.get("all_neo4j_results", {})
+
+        if not all_results:
             # Handle empty results gracefully
+            state["answer"] = "No results found in the knowledge graph for your query. Please try rephrasing your question or ask about different entities."
+            state["current_step"] = "complete"
+            state["status"] = "success"
+            print(f"✅ Answer synthesis completed (no results)")
+            return state
+
+        # Check if any query returned results
+        has_results = any(result_dict["result_count"] > 0 for result_dict in all_results.values())
+
+        if not has_results:
             state["answer"] = "No results found in the knowledge graph for your query. Please try rephrasing your question or ask about different entities."
             state["current_step"] = "complete"
             state["status"] = "success"
@@ -257,10 +350,10 @@ def synthesize_answer_node(state: ReasoningState) -> ReasoningState:
             llm_model=state["llm_model"],
         )
 
-        answer = synthesizer.synthesize_answer(
+        # Synthesize answer from all results
+        answer = synthesizer.synthesize_answer_from_multiple_queries(
             state["user_query"],
-            state["neo4j_results"],
-            state["cypher_query"] or "",
+            all_results,
         )
 
         state["answer"] = answer
@@ -433,7 +526,9 @@ def run_langgraph_workflow(
         "refined_query": None,
         "cypher_query": None,
         "cypher_explanation": None,
+        "cypher_queries": None,
         "neo4j_results": None,
+        "all_neo4j_results": None,
         "high_connectivity_nodes": None,
         "query_suggestions": None,
         "topics": None,
@@ -459,8 +554,10 @@ def run_langgraph_workflow(
             "keywords": final_state["keywords"],
             "refined_query": final_state["refined_query"],
             "cypher_query": final_state["cypher_query"],
+            "cypher_queries": final_state["cypher_queries"],
             "cypher_explanation": final_state["cypher_explanation"],
             "neo4j_results": final_state["neo4j_results"],
+            "all_neo4j_results": final_state["all_neo4j_results"],
             "high_connectivity_nodes": final_state["high_connectivity_nodes"],
             "suggestions": final_state["query_suggestions"],
             "topics": final_state["topics"],
