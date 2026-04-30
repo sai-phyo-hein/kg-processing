@@ -332,8 +332,23 @@ def build_graph_node(state: WorkflowState) -> WorkflowState:
         if not path.exists():
             raise FileNotFoundError(f"Refined triples file not found: {state['refined_path']}")
 
+        # Get Neo4j connection parameters from environment
+        import os
+        neo4j_uri = os.getenv("NEO4J_URI")
+        neo4j_user = os.getenv("NEO4J_USER") or os.getenv("NEO4J_USERNAME")
+        neo4j_password = os.getenv("NEO4J_PASSWORD")
+
+        if not neo4j_uri or not neo4j_user or not neo4j_password:
+            raise ValueError("NEO4J_URI, NEO4J_USER (or NEO4J_USERNAME), and NEO4J_PASSWORD must be set in environment variables")
+
         # Build graph
-        stats = build_graph_from_file(state["refined_path"], with_schema=state["with_schema"])
+        stats = build_graph_from_file(
+            state["refined_path"],
+            neo4j_uri=neo4j_uri,
+            neo4j_user=neo4j_user,
+            neo4j_password=neo4j_password,
+            with_schema=state["with_schema"],
+        )
 
         state["graph_stats"] = stats
         state["current_step"] = "complete"
