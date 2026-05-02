@@ -208,7 +208,15 @@ Your task is to generate a valid Cypher query to answer the user's question usin
 - Node labels: Entity
 - Node properties: name, type, canonical_id, updated_at
 - Relationship types: Various predicates (dynamic based on extracted triples)
-- Relationship properties: chunk_id, updated_at, and other extracted properties
+- Relationship properties:
+  * community_id: Unique identifier for the community/village where this relationship was extracted
+  * chunk_id: Chunk identifier from the source document
+  * updated_at: Timestamp of when the relationship was created/updated
+  * other extracted properties: Various domain-specific properties from the extraction
+
+**Filtering by Community:**
+You can filter relationships by community using: `WHERE r.community_id = 'community_identifier'`
+Example: `MATCH (n:Entity)-[r]-(m) WHERE r.community_id = '1_บ้านหนองกอก' RETURN n, r, m`
 
 **IMPORTANT Cypher Syntax Rules:**
 1. Use proper MATCH patterns: `MATCH (n:Entity)-[r]-(m) WHERE n.name = 'value' RETURN n, r, m`
@@ -283,7 +291,15 @@ Your task is to generate a Cypher query to explore the knowledge graph using hig
 - Node labels: Entity
 - Node properties: name, type, canonical_id, updated_at
 - Relationship types: Various predicates (dynamic based on extracted triples)
-- Relationship properties: chunk_id, updated_at, and other extracted properties
+- Relationship properties:
+  * community_id: Unique identifier for the community/village where this relationship was extracted
+  * chunk_id: Chunk identifier from the source document
+  * updated_at: Timestamp of when the relationship was created/updated
+  * other extracted properties: Various domain-specific properties from the extraction
+
+**Filtering by Community:**
+You can filter relationships by community using: `WHERE r.community_id = 'community_identifier'`
+Example: `MATCH (n:Entity)-[r]-(m) WHERE r.community_id = '1_บ้านหนองกอก' RETURN n, r, m`
 
 **IMPORTANT Cypher Syntax Rules:**
 1. Use proper MATCH patterns: `MATCH (n:Entity)-[r]-(m) WHERE n.name = 'value' RETURN n, r, m`

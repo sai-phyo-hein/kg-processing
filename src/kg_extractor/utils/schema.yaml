@@ -1,0 +1,83 @@
+# RECAP Knowledge Graph Schema
+
+node_types:
+  - Tambon
+  - Village
+  - SocialCapital
+  - Domain
+  - Activity
+  - TargetGroup
+  - Impact
+  - Evidence
+  - Resource
+  - EnablingFactor
+  - CommunityIssue
+  - CapabilityDimension
+  - CapabilityAssessment
+  - Innovation
+  - Actor
+
+relations:
+  - Village BELONGS_TO Tambon
+  - SocialCapital BELONGS_TO Tambon
+  - SocialCapital LOCATED_IN Village
+  - SocialCapital PERFORMS Activity
+  - Activity BELONGS_TO Domain
+  - Activity TARGETS TargetGroup
+  - Activity PRODUCES Impact
+  - Impact AFFECTS TargetGroup
+  - Evidence SUPPORTS SocialCapital
+  - Evidence SUPPORTS Activity
+  - Evidence SUPPORTS Impact
+  - Actor BELONGS_TO SocialCapital
+  - Actor PARTICIPATES_IN Activity
+  - Activity USES Resource
+  - Activity ENABLED_BY EnablingFactor
+  - Activity ADDRESSES CommunityIssue
+  - Impact STRENGTHENS CapabilityDimension
+  - SocialCapital CONNECTED_TO SocialCapital
+  - Innovation EMERGES_FROM Activity
+
+enum_values:
+  SocialCapitalLevel:
+    - PERSON_FAMILY
+    - SOCIAL_GROUP_COMMUNITY_ORG
+    - AGENCY_RESOURCE_SOURCE
+    - VILLAGE_COMMUNITY
+    - TAMBON
+    - NETWORK
+
+  DomainCode:
+    - SOCIAL
+    - ECONOMIC
+    - ENVIRONMENT
+    - HEALTH
+    - GOVERNANCE
+
+  ScopeLevel:
+    - VILLAGE
+    - TAMBON
+    - NETWORK
+
+  ImpactType:
+    - DIRECT
+    - INDIRECT
+    - SHORT_TERM
+    - LONG_TERM
+
+  EvidenceStrength:
+    - STRONG
+    - MODERATE
+    - WEAK
+    - CLAIMED
+
+  ResourceType:
+    - PEOPLE
+    - DATA
+    - BUDGET
+    - METHOD
+    - TECHNOLOGY
+    - FACILITY
+    - KNOWLEDGE
+    - NETWORK
+    - POLICY

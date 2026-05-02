@@ -453,8 +453,6 @@ uv run kg-reasoning langgraph "What are the key drivers of business valuation?"
   "source_file": "document_analysis.md",
   "total_chunks": 5,
   "similarity_threshold": 0.5,
-  "min_chunk_size": 100,
-  "max_chunk_size": 1000,
   "llm_provider": "openai",
   "llm_model": "gpt-4o-mini",
   "chunks": [

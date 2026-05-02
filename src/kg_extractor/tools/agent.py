@@ -307,8 +307,6 @@ def list_markdown_files(directory: str = "output") -> str:
 def semantic_chunk_markdown(
     file_path: str,
     similarity_threshold: float = 0.5,
-    min_chunk_size: int = 100,
-    max_chunk_size: int = 1000,
     llm_provider: str = "openai",
     llm_model: str = "gpt-4o-mini",
 ) -> str:
@@ -320,8 +318,6 @@ def semantic_chunk_markdown(
     Args:
         file_path: Path to the markdown file to chunk
         similarity_threshold: Threshold for detecting topic changes (0.0-1.0)
-        min_chunk_size: Minimum tokens per chunk
-        max_chunk_size: Maximum tokens per chunk
         llm_provider: LLM provider to use (openai, groq, nvidia, openrouter)
         llm_model: Model to use for LLM analysis
 
@@ -336,17 +332,11 @@ def semantic_chunk_markdown(
         # Validate parameters
         if not 0.0 <= similarity_threshold <= 1.0:
             return f"Error: similarity_threshold must be between 0.0 and 1.0, got {similarity_threshold}"
-        if min_chunk_size < 0:
-            return f"Error: min_chunk_size must be non-negative, got {min_chunk_size}"
-        if max_chunk_size < min_chunk_size:
-            return f"Error: max_chunk_size ({max_chunk_size}) must be >= min_chunk_size ({min_chunk_size})"
 
         # Perform chunking
         output_path = chunk_markdown_file(
             file_path=file_path,
             similarity_threshold=similarity_threshold,
-            min_chunk_size=min_chunk_size,
-            max_chunk_size=max_chunk_size,
             llm_provider=llm_provider,
             llm_model=llm_model,
             output_dir=str(Path(__file__).parent.parent.parent.parent / "output"),

@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import List, Optional
 
 from kg_extractor import __version__
 from kg_extractor.tools.agent import run_agent_interactive, run_agent_single_task
@@ -46,6 +47,54 @@ from kg_extractor.utils.parser import (
 )
 from kg_extractor.utils.triple_refiner import refine_triples_from_file
 from kg_extractor.utils.neo4j_graph_builder import build_graph_from_file
+
+
+def parse_pages_argument(pages_str: str) -> Optional[List[int]]:
+    """Parse pages argument string into list of page numbers.
+
+    Args:
+        pages_str: String like "1,2,4,6" or "2-5" or "1,3-5,7"
+
+    Returns:
+        List of page numbers (1-indexed), or None if pages_str is None/empty
+
+    Raises:
+        ValueError: If pages string format is invalid
+    """
+    if not pages_str:
+        return None
+
+    pages = set()
+    parts = pages_str.split(',')
+
+    for part in parts:
+        part = part.strip()
+        if '-' in part:
+            # Handle range like "2-5"
+            try:
+                start, end = part.split('-')
+                start_num = int(start.strip())
+                end_num = int(end.strip())
+                if start_num < 1 or end_num < 1:
+                    raise ValueError("Page numbers must be positive integers")
+                if start_num > end_num:
+                    raise ValueError(f"Invalid range: {part}. Start must be <= end")
+                pages.update(range(start_num, end_num + 1))
+            except ValueError as e:
+                if "invalid literal" in str(e):
+                    raise ValueError(f"Invalid page range format: {part}")
+                raise
+        else:
+            # Handle single page like "4"
+            try:
+                page_num = int(part)
+                if page_num < 1:
+                    raise ValueError("Page numbers must be positive integers")
+                pages.add(page_num)
+            except ValueError:
+                raise ValueError(f"Invalid page number: {part}")
+
+    return sorted(list(pages))
 
 
 def refine_command(args) -> None:
@@ -150,8 +199,6 @@ def langgraph_command(args) -> None:
     print(f"🧠 Model: {args.model}")
     print(f"📝 Content type: {args.content_type}")
     print(f"🎯 Similarity threshold: {args.similarity_threshold}")
-    print(f"📏 Min chunk size: {args.min_chunk_size} tokens")
-    print(f"📏 Max chunk size: {args.max_chunk_size} tokens")
     print(f"🤖 Chunking LLM: {args.chunking_llm_provider}/{args.chunking_llm_model}")
     print(f"🔗 Triple LLM: {args.triplet_llm_provider}/{args.triplet_llm_model}")
     print(f"🔍 Refine triples: {args.refine_triples}")
@@ -159,6 +206,19 @@ def langgraph_command(args) -> None:
         print(f"🤖 Refinement LLM: {args.refinement_llm_provider}/{args.refinement_llm_model}")
     print(f"🕸️ Build graph: {args.build_graph}")
     print(f"📋 With schema: {args.with_schema}")
+    if args.until:
+        print(f"⏹️ Stop after: {args.until}")
+
+    # Parse pages argument if provided
+    pages_to_process = None
+    if args.pages:
+        try:
+            pages_to_process = parse_pages_argument(args.pages)
+            print(f"📄 Processing pages: {', '.join(map(str, pages_to_process))}")
+        except ValueError as e:
+            print(f"❌ Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
     print()
 
     result = run_langgraph_workflow(
@@ -167,8 +227,6 @@ def langgraph_command(args) -> None:
         model=args.model,
         content_type=args.content_type,
         similarity_threshold=args.similarity_threshold,
-        min_chunk_size=args.min_chunk_size,
-        max_chunk_size=args.max_chunk_size,
         output_format="markdown",
         chunking_llm_provider=args.chunking_llm_provider,
         chunking_llm_model=args.chunking_llm_model,
@@ -179,11 +237,15 @@ def langgraph_command(args) -> None:
         refinement_llm_model=args.refinement_llm_model,
         build_graph=args.build_graph,
         with_schema=args.with_schema,
+        until_step=args.until,
+        pages=pages_to_process,
     )
 
     if result["status"] == "success":
         print("✅ LangGraph workflow completed successfully!")
         print(f"📄 Markdown output: {result['markdown_output']}")
+        if result['metadata']:
+            print(f"📊 Metadata extracted: {result['metadata'].get('unique_id')}")
         print(f"🧩 Chunks output: {result['chunks_output']}")
         print(f"🔗 Triples output: {result['triples_output']}")
         if result['refined_output']:
@@ -212,8 +274,13 @@ Examples:
   %(prog)s --content-type table spreadsheet.xlsx
   %(prog)s --output result.json --format json presentation.pptx
   %(prog)s --max-tokens 4096 --temperature 0.3 report.docx
+  %(prog)s --pages 1,2,4,6 document.pdf
+  %(prog)s --pages 2-5 document.pdf
   %(prog)s langgraph document.pdf --similarity-threshold 0.5
   %(prog)s langgraph document.pdf --triplet-llm-provider openai --triplet-llm-model gpt-4o-mini
+  %(prog)s langgraph document.pdf --until triple_extraction
+  %(prog)s langgraph document.pdf --until semantic_chunking --no-refine-triples
+  %(prog)s langgraph document.pdf --pages 1,3-5,7
   %(prog)s refine test_triples.json --llm-provider openai --llm-model gpt-4o-mini
         """,
     )
@@ -285,6 +352,12 @@ Examples:
         default="text",
         help="Output format (default: text)",
     )
+    process_parser.add_argument(
+        "--pages",
+        type=str,
+        default=None,
+        help="Process only specific pages (e.g., '1,2,4,6' or '2-5' or '1,3-5,7')",
+    )
 
     # LangGraph workflow command
     langgraph_parser = subparsers.add_parser("langgraph", help="Run document processing using LangGraph workflow")
@@ -319,18 +392,6 @@ Examples:
         type=float,
         default=0.5,
         help="Similarity threshold for chunking (0.0-1.0, default: 0.5)",
-    )
-    langgraph_parser.add_argument(
-        "--min-chunk-size",
-        type=int,
-        default=100,
-        help="Minimum tokens per chunk (default: 100)",
-    )
-    langgraph_parser.add_argument(
-        "--max-chunk-size",
-        type=int,
-        default=1000,
-        help="Maximum tokens per chunk (default: 1000)",
     )
     langgraph_parser.add_argument(
         "--chunking-llm-provider",
@@ -400,6 +461,19 @@ Examples:
         action="store_true",
         default=False,
         help="Validate triples and graph against schema.md (default: False)",
+    )
+    langgraph_parser.add_argument(
+        "--until",
+        type=str,
+        choices=["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_refining", "graph_building"],
+        default=None,
+        help="Stop workflow after this step (default: run all steps)",
+    )
+    langgraph_parser.add_argument(
+        "--pages",
+        type=str,
+        default=None,
+        help="Process only specific pages (e.g., '1,2,4,6' or '2-5' or '1,3-5,7')",
     )
 
     # Graph command
@@ -539,6 +613,13 @@ Examples:
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
+    )
+
+    parser.add_argument(
+        "--pages",
+        type=str,
+        default=None,
+        help="Process only specific pages (e.g., '1,2,4,6' or '2-5' or '1,3-5,7')",
     )
 
     args = parser.parse_args()
@@ -692,6 +773,16 @@ Examples:
             print(f"Error: Invalid configuration: {e}", file=sys.stderr)
             sys.exit(1)
 
+        # Parse pages argument if provided
+        pages_to_process = None
+        if hasattr(args, 'pages') and args.pages:
+            try:
+                pages_to_process = parse_pages_argument(args.pages)
+                print(f"Processing pages: {', '.join(map(str, pages_to_process))}", file=sys.stderr)
+            except ValueError as e:
+                print(f"Error: {e}", file=sys.stderr)
+                sys.exit(1)
+
         # Extract content based on file type
         try:
             if file_type == "image":
@@ -764,19 +855,19 @@ Examples:
                     # Get structured JSON output
                     if args.provider == "nvidia":
                         result = extract_text_from_document(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     elif args.provider == "openai":
                         result = extract_text_from_document_openai(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     elif args.provider == "google":
                         result = extract_text_from_document_google(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     else:  # openrouter
                         result = extract_text_from_document_openrouter(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
 
                     if args.output:
@@ -789,19 +880,19 @@ Examples:
                     # Get structured output and convert to markdown
                     if args.provider == "nvidia":
                         result = process_document_with_api(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     elif args.provider == "openai":
                         result = process_document_with_openai(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     elif args.provider == "google":
                         result = process_document_with_google(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     else:  # openrouter
                         result = process_document_with_openrouter(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
 
                     # Save as markdown
@@ -810,18 +901,18 @@ Examples:
                 else:
                     # Get text output
                     if args.provider == "nvidia":
-                        text = extract_text_from_document(args.file_path, config, args.content_type)
+                        text = extract_text_from_document(args.file_path, config, args.content_type, pages=pages_to_process)
                     elif args.provider == "openai":
                         text = extract_text_from_document_openai(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     elif args.provider == "google":
                         text = extract_text_from_document_google(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
                     else:  # openrouter
                         text = extract_text_from_document_openrouter(
-                            args.file_path, config, args.content_type
+                            args.file_path, config, args.content_type, pages=pages_to_process
                         )
 
                     if args.output:

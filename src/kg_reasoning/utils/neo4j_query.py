@@ -282,4 +282,115 @@ class Neo4jQuery:
             for r in results
         ]
 
+        # Get community statistics
+        cypher_query = """
+        MATCH ()-[r]->()
+        WHERE r.community_id IS NOT NULL
+        RETURN r.community_id as community_id, count(r) as relationship_count
+        ORDER BY relationship_count DESC
+        """
+        results = self.execute_query(cypher_query)
+        stats["communities"] = [
+            {"community_id": r.get("community_id", ""), "relationship_count": r.get("relationship_count", 0)}
+            for r in results
+        ]
+
         return stats
+
+    def get_relationships_by_community(
+        self,
+        community_id: str,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Get all relationships for a specific community.
+
+        Args:
+            community_id: The community identifier
+            limit: Maximum number of relationships to return
+
+        Returns:
+            List of relationship dictionaries
+        """
+        cypher_query = """
+        MATCH (n:Entity)-[r]->(m:Entity)
+        WHERE r.community_id = $community_id
+        RETURN type(r) as relationship_type,
+               n.name as source_name,
+               n.type as source_type,
+               m.name as target_name,
+               m.type as target_type,
+               properties(r) as properties
+        LIMIT $limit
+        """
+
+        results = self.execute_query(cypher_query, {"community_id": community_id, "limit": limit})
+
+        return results
+
+    def get_community_subgraph(
+        self,
+        community_id: str,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        """Get the entire subgraph (nodes and relationships) for a specific community.
+
+        Args:
+            community_id: The community identifier
+            limit: Maximum number of relationships to return
+
+        Returns:
+            Dictionary with nodes and relationships
+        """
+        cypher_query = """
+        MATCH (n:Entity)-[r]->(m:Entity)
+        WHERE r.community_id = $community_id
+        RETURN n, r, m
+        LIMIT $limit
+        """
+
+        results = self.execute_query(cypher_query, {"community_id": community_id, "limit": limit})
+
+        # Organize results into nodes and relationships
+        nodes = {}
+        relationships = []
+
+        for result in results:
+            source_node = result.get("n")
+            relationship = result.get("r")
+            target_node = result.get("m")
+
+            # Add nodes to dictionary (deduplicate by id)
+            if source_node:
+                nodes[source_node.get("id")] = source_node
+            if target_node:
+                nodes[target_node.get("id")] = target_node
+
+            # Add relationship
+            if relationship:
+                relationships.append(relationship)
+
+        return {
+            "nodes": list(nodes.values()),
+            "relationships": relationships,
+            "community_id": community_id,
+        }
+
+    def list_communities(self) -> List[Dict[str, Any]]:
+        """Get a list of all communities in the graph with their statistics.
+
+        Returns:
+            List of community dictionaries with statistics
+        """
+        cypher_query = """
+        MATCH ()-[r]->()
+        WHERE r.community_id IS NOT NULL
+        WITH r.community_id as community_id,
+             count(r) as relationship_count,
+             count(DISTINCT startNode(r)) + count(DISTINCT endNode(r)) as entity_count
+        RETURN community_id, relationship_count, entity_count
+        ORDER BY relationship_count DESC
+        """
+
+        results = self.execute_query(cypher_query)
+
+        return results

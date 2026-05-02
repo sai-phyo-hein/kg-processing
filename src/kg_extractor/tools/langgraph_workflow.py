@@ -2,7 +2,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, Dict, TypedDict
+from typing import Any, Dict, List, Literal, TypedDict
 
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
@@ -35,6 +35,8 @@ from kg_extractor.utils.semantic_chunker import chunk_markdown_file
 from kg_extractor.utils.triple_extractor import extract_triples_from_chunks
 from kg_extractor.utils.triple_refiner import refine_triples_from_file
 from kg_extractor.utils.neo4j_graph_builder import build_graph_from_file
+from kg_extractor.utils.metadata_extractor import extract_metadata_with_llm
+from kg_extractor.utils.metadata_db import save_metadata
 
 # Load environment variables
 load_dotenv()
@@ -48,8 +50,6 @@ class WorkflowState(TypedDict):
     model: str
     content_type: str
     similarity_threshold: float
-    min_chunk_size: int
-    max_chunk_size: int
     output_format: str
     chunking_llm_provider: str
     chunking_llm_model: str
@@ -61,9 +61,13 @@ class WorkflowState(TypedDict):
     build_graph: bool
     with_schema: bool
     output_dir: str
+    until_step: Literal["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_refining", "graph_building"] | None
+    pages: List[int] | None
+    metadata_db_path: str
 
     # Intermediate results
     markdown_path: str | None
+    metadata: Dict[str, Any] | None
     chunks_path: str | None
     triples_path: str | None
     refined_path: str | None
@@ -135,19 +139,19 @@ def process_document_node(state: WorkflowState) -> WorkflowState:
         if state["output_format"] == "json":
             if state["provider"] == "nvidia":
                 result = extract_text_from_document(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             elif state["provider"] == "openrouter":
                 result = extract_text_from_document_openrouter(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             elif state["provider"] == "openai":
                 result = extract_text_from_document_openai(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             else:  # google
                 result = extract_text_from_document_google(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
 
             # Save JSON result
@@ -162,19 +166,19 @@ def process_document_node(state: WorkflowState) -> WorkflowState:
         elif state["output_format"] == "markdown":
             if state["provider"] == "nvidia":
                 result = process_document_with_api(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             elif state["provider"] == "openrouter":
                 result = process_document_with_openrouter(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             elif state["provider"] == "openai":
                 result = process_document_with_openai(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             else:  # google
                 result = process_document_with_google(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
 
             # Save markdown result
@@ -184,31 +188,66 @@ def process_document_node(state: WorkflowState) -> WorkflowState:
         else:  # text format
             if state["provider"] == "nvidia":
                 text = extract_text_from_document(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             elif state["provider"] == "openrouter":
                 text = extract_text_from_document_openrouter(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             elif state["provider"] == "openai":
                 text = extract_text_from_document_openai(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
             else:  # google
                 text = extract_text_from_document_google(
-                    state["input_file"], config, state["content_type"]
+                    state["input_file"], config, state["content_type"], pages=state["pages"]
                 )
 
             # Save text result
             output_file = save_text_markdown(text, state["input_file"])
             state["markdown_path"] = output_file
 
-        state["current_step"] = "chunk_document"
+        state["current_step"] = "extract_metadata"
         print(f"✅ Document processed: {state['markdown_path']}")
 
     except Exception as e:
         state["status"] = "error"
         state["error"] = f"Document processing failed: {e}"
+        print(f"❌ Error: {e}")
+
+    return state
+
+
+def extract_metadata_node(state: WorkflowState) -> WorkflowState:
+    """Extract metadata from the processed document using LLM."""
+    try:
+        print("📊 Extracting metadata...")
+
+        if not state["markdown_path"]:
+            raise ValueError("No markdown path available")
+
+        path = Path(state["markdown_path"])
+        if not path.exists():
+            raise FileNotFoundError(f"Markdown file not found: {state['markdown_path']}")
+
+        # Extract metadata using LLM
+        metadata = extract_metadata_with_llm(
+            markdown_path=state["markdown_path"],
+            llm_provider=state["chunking_llm_provider"],  # Reuse chunking LLM config
+            llm_model=state["chunking_llm_model"],
+        )
+
+        # Save metadata to DuckDB
+        db_path = state.get("metadata_db_path", "metadata.db")
+        save_metadata(metadata, db_path)
+
+        state["metadata"] = metadata
+        state["current_step"] = "chunk_document"
+        print(f"✅ Metadata extracted: {metadata.get('unique_id')}")
+
+    except Exception as e:
+        state["status"] = "error"
+        state["error"] = f"Metadata extraction failed: {e}"
         print(f"❌ Error: {e}")
 
     return state
@@ -230,8 +269,6 @@ def chunk_document_node(state: WorkflowState) -> WorkflowState:
         output_path = chunk_markdown_file(
             file_path=state["markdown_path"],
             similarity_threshold=state["similarity_threshold"],
-            min_chunk_size=state["min_chunk_size"],
-            max_chunk_size=state["max_chunk_size"],
             llm_provider=state["chunking_llm_provider"],
             llm_model=state["chunking_llm_model"],
             output_dir=state["output_dir"],
@@ -267,6 +304,11 @@ def extract_triples_node(state: WorkflowState) -> WorkflowState:
 
         chunks = chunks_data.get("chunks", [])
 
+        # Get community_id from metadata
+        community_id = None
+        if state["metadata"]:
+            community_id = state["metadata"].get("unique_id")
+
         # Extract triples
         output_path = extract_triples_from_chunks(
             chunks=chunks,
@@ -275,6 +317,7 @@ def extract_triples_node(state: WorkflowState) -> WorkflowState:
             llm_model=state["triplet_llm_model"],
             output_dir=state["output_dir"],
             with_schema=state["with_schema"],
+            community_id=community_id,
         )
 
         state["triples_path"] = output_path
@@ -385,6 +428,31 @@ def should_build_graph(state: WorkflowState) -> str:
         return "complete"
 
 
+def should_continue_to_next_step(state: WorkflowState, current_step: str) -> str:
+    """Determine whether to continue to the next step or stop at until_step."""
+    if state["status"] == "error":
+        return "error"
+
+    if state["until_step"] is None:
+        return "continue"
+
+    step_mapping = {
+        "process_document": "document_parsing",
+        "extract_metadata": "metadata_extraction",
+        "chunk_document": "semantic_chunking",
+        "extract_triples": "triple_extraction",
+        "refine_triples": "triple_refining",
+        "build_graph": "graph_building",
+    }
+
+    current_step_name = step_mapping.get(current_step)
+
+    if current_step_name == state["until_step"]:
+        return "complete"
+
+    return "continue"
+
+
 def create_langgraph_workflow() -> StateGraph:
     """Create a LangGraph workflow for document processing."""
 
@@ -393,6 +461,7 @@ def create_langgraph_workflow() -> StateGraph:
 
     # Add nodes
     workflow.add_node("process_document", process_document_node)
+    workflow.add_node("extract_metadata", extract_metadata_node)
     workflow.add_node("chunk_document", chunk_document_node)
     workflow.add_node("extract_triples", extract_triples_node)
     workflow.add_node("refine_triples", refine_triples_node)
@@ -401,13 +470,45 @@ def create_langgraph_workflow() -> StateGraph:
     # Define the edges
     workflow.set_entry_point("process_document")
 
-    workflow.add_edge("process_document", "chunk_document")
-    workflow.add_edge("chunk_document", "extract_triples")
+    # Edge from process_document to extract_metadata with until_step check
+    workflow.add_conditional_edges(
+        "process_document",
+        lambda state: should_continue_to_next_step(state, "process_document"),
+        {
+            "continue": "extract_metadata",
+            "complete": END,
+            "error": END,
+        },
+    )
 
-    # Conditional edge for triple refinement
+    # Edge from extract_metadata to chunk_document with until_step check
+    workflow.add_conditional_edges(
+        "extract_metadata",
+        lambda state: should_continue_to_next_step(state, "extract_metadata"),
+        {
+            "continue": "chunk_document",
+            "complete": END,
+            "error": END,
+        },
+    )
+
+    # Edge from chunk_document to extract_triples with until_step check
+    workflow.add_conditional_edges(
+        "chunk_document",
+        lambda state: should_continue_to_next_step(state, "chunk_document"),
+        {
+            "continue": "extract_triples",
+            "complete": END,
+            "error": END,
+        },
+    )
+
+    # Conditional edge for triple extraction
     workflow.add_conditional_edges(
         "extract_triples",
-        should_refine_triples,
+        lambda state: "error" if state["status"] == "error" else (
+            "refine_triples" if state["refine_triples"] else "skip_refine"
+        ),
         {
             "refine_triples": "refine_triples",
             "skip_refine": "build_graph",
@@ -415,20 +516,21 @@ def create_langgraph_workflow() -> StateGraph:
         },
     )
 
-    # Conditional edge for graph building
+    # Conditional edge for triple refinement with until_step check
     workflow.add_conditional_edges(
         "refine_triples",
-        should_build_graph,
+        lambda state: should_continue_to_next_step(state, "refine_triples") if state["status"] != "error" else "error",
         {
-            "build_graph": "build_graph",
+            "continue": "build_graph",
             "complete": END,
             "error": END,
         },
     )
 
+    # Conditional edge for graph building with until_step check
     workflow.add_conditional_edges(
         "build_graph",
-        should_build_graph,
+        lambda state: should_continue_to_next_step(state, "build_graph") if state["status"] != "error" else "error",
         {
             "complete": END,
             "error": END,
@@ -444,8 +546,6 @@ def run_langgraph_workflow(
     model: str = "microsoft/phi-4-multimodal-instruct",
     content_type: str = "mixed",
     similarity_threshold: float = 0.5,
-    min_chunk_size: int = 100,
-    max_chunk_size: int = 1000,
     output_format: str = "markdown",
     chunking_llm_provider: str = "openai",
     chunking_llm_model: str = "gpt-4o-mini",
@@ -456,6 +556,9 @@ def run_langgraph_workflow(
     refinement_llm_model: str = "gpt-4o-mini",
     build_graph: bool = True,
     with_schema: bool = False,
+    until_step: Literal["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_refining", "graph_building"] | None = None,
+    pages: List[int] | None = None,
+    metadata_db_path: str = "metadata.db",
 ) -> Dict[str, Any]:
     """Run the LangGraph workflow for document processing.
 
@@ -465,11 +568,9 @@ def run_langgraph_workflow(
         model: Model to use for document processing
         content_type: Type of content to extract
         similarity_threshold: Threshold for topic change detection
-        min_chunk_size: Minimum tokens per chunk
-        max_chunk_size: Maximum tokens per chunk
         output_format: Output format for document processing
-        chunking_llm_provider: LLM provider for chunking
-        chunking_llm_model: Model to use for chunking analysis
+        chunking_llm_provider: LLM provider for chunking and metadata extraction
+        chunking_llm_model: Model to use for chunking analysis and metadata extraction
         triplet_llm_provider: LLM provider for triple extraction
         triplet_llm_model: Model to use for triple extraction
         refine_triples: Whether to refine triples using Qdrant
@@ -477,6 +578,9 @@ def run_langgraph_workflow(
         refinement_llm_model: Model for triple refinement
         build_graph: Whether to build Neo4j graph from refined triples
         with_schema: Whether to validate triples and graph against schema.md
+        until_step: Stop workflow after this step (None to run all steps)
+        pages: Optional list of page numbers to process (1-indexed)
+        metadata_db_path: Path to DuckDB metadata database file
 
     Returns:
         Dictionary with processing results
@@ -494,8 +598,6 @@ def run_langgraph_workflow(
         "model": model,
         "content_type": content_type,
         "similarity_threshold": similarity_threshold,
-        "min_chunk_size": min_chunk_size,
-        "max_chunk_size": max_chunk_size,
         "output_format": output_format,
         "chunking_llm_provider": chunking_llm_provider,
         "chunking_llm_model": chunking_llm_model,
@@ -507,7 +609,11 @@ def run_langgraph_workflow(
         "build_graph": build_graph,
         "with_schema": with_schema,
         "output_dir": output_dir,
+        "until_step": until_step,
+        "pages": pages,
+        "metadata_db_path": metadata_db_path,
         "markdown_path": None,
+        "metadata": None,
         "chunks_path": None,
         "triples_path": None,
         "refined_path": None,
@@ -524,6 +630,7 @@ def run_langgraph_workflow(
     # Return results
     return {
         "markdown_output": final_state["markdown_path"],
+        "metadata": final_state["metadata"],
         "chunks_output": final_state["chunks_path"],
         "triples_output": final_state["triples_path"],
         "refined_output": final_state["refined_path"],

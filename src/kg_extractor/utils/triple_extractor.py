@@ -94,7 +94,7 @@ class TripleExtractor:
             with_schema: Whether to validate triples against schema.md
 
         Returns:
-            Dictionary with chunk_id and extracted triples
+            Dictionary with chunk_id, document_metadata, and extracted triples
         """
         chunk_id = chunk["chunk_id"]
         content = chunk["content"]
@@ -105,12 +105,13 @@ class TripleExtractor:
         # Get LLM response
         response = self._get_llm_response(prompt)
 
-        # Parse response to extract triples
-        triples = self._parse_llm_response(response)
+        # Parse response to extract triples and metadata
+        parsed_data = self._parse_llm_response(response)
 
         return {
             "chunk_id": chunk_id,
-            "triples": triples,
+            "document_metadata": parsed_data.get("document_metadata", {}),
+            "triples": parsed_data.get("discovered_triples", []),
         }
 
     def _get_llm_response(self, prompt: str) -> str:
@@ -171,16 +172,16 @@ class TripleExtractor:
         except Exception as e:
             # Fallback: return empty response
             print(f"Warning: Failed to get LLM response: {e}")
-            return '{"document_metadata": {"reference_date": null, "source_id": null}, "discovered_triples": []}'
+            return '{"document_metadata": {"reference_date": null, "source_id": null, "chunk_id": null}, "discovered_triples": []}'
 
-    def _parse_llm_response(self, response: str) -> List[Dict[str, Any]]:
-        """Parse LLM response to extract triples.
+    def _parse_llm_response(self, response: str) -> Dict[str, Any]:
+        """Parse LLM response to extract triples and metadata.
 
         Args:
             response: LLM response text
 
         Returns:
-            List of triple dictionaries
+            Dictionary with document metadata and triples
         """
         try:
             # Try to extract JSON from response
@@ -199,32 +200,41 @@ class TripleExtractor:
             # Parse JSON
             data = json.loads(response)
 
-            # Handle new structure with discovered_triples
-            if "discovered_triples" in data:
-                return data["discovered_triples"]
-            # Fallback to old structure with triples
-            elif "triples" in data:
-                return data["triples"]
-            else:
-                return []
+            # Validate new structure
+            if "document_metadata" not in data or "discovered_triples" not in data:
+                print(f"Warning: Invalid response structure: {list(data.keys())}")
+                return {
+                    "document_metadata": {"reference_date": None, "source_id": None, "chunk_id": None},
+                    "discovered_triples": []
+                }
 
-        except json.JSONDecodeError:
-            # Fallback: return empty list
-            return []
+            return data
+
+        except json.JSONDecodeError as e:
+            print(f"Warning: Failed to parse JSON response: {e}")
+            return {
+                "document_metadata": {"reference_date": None, "source_id": None, "chunk_id": None},
+                "discovered_triples": []
+            }
         except Exception as e:
             print(f"Warning: Failed to parse LLM response: {e}")
-            return []
+            return {
+                "document_metadata": {"reference_date": None, "source_id": None, "chunk_id": None},
+                "discovered_triples": []
+            }
 
     def save_triples(
         self,
         triple_results: List[Dict[str, Any]],
         output_path: str,
+        community_id: str = None,
     ) -> str:
         """Save triples to a JSON file.
 
         Args:
             triple_results: List of triple extraction results
             output_path: Path to save the triples
+            community_id: Optional community ID to add to each triple's properties
 
         Returns:
             Path to saved file
@@ -232,12 +242,20 @@ class TripleExtractor:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Flatten all triples from all chunks
+        # Update triples in chunks and flatten all triples
         all_triples = []
         for result in triple_results:
             chunk_id = result["chunk_id"]
             for triple in result.get("triples", []):
+                # Add chunk_id to each triple for backward compatibility
                 triple["chunk_id"] = chunk_id
+
+                # Add community_id to properties if provided
+                if community_id:
+                    if "properties" not in triple:
+                        triple["properties"] = {}
+                    triple["properties"]["community_id"] = community_id
+
                 all_triples.append(triple)
 
         # Create output structure
@@ -265,6 +283,7 @@ def extract_triples_from_chunks(
     llm_model: str = "gpt-4o-mini",
     output_dir: str = None,
     with_schema: bool = False,
+    community_id: str = None,
 ) -> str:
     """Extract triples from chunks using LLM analysis and save results.
 
@@ -275,6 +294,7 @@ def extract_triples_from_chunks(
         llm_model: Model to use for LLM analysis
         output_dir: Directory to save triples (default: project root/output)
         with_schema: Whether to validate triples against schema.md
+        community_id: Optional community ID to add to each triple's properties
 
     Returns:
         Path to saved triples file
@@ -299,7 +319,7 @@ def extract_triples_from_chunks(
         output_filename = "extracted_triples.json"
     output_path = Path(output_dir) / output_filename
 
-    # Save triples
-    result_path = extractor.save_triples(triple_results, str(output_path))
+    # Save triples with community_id
+    result_path = extractor.save_triples(triple_results, str(output_path), community_id)
 
     return result_path

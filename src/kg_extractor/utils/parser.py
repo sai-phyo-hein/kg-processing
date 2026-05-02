@@ -6,14 +6,13 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
 
 from kg_extractor.utils.input_processor import (
     DocumentProcessor,
-    get_content_specific_prompt,
     get_system_prompt,
 )
 
@@ -749,6 +748,7 @@ def process_document_with_api(
     file_path: str,
     config: NVIDIAConfig,
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Process document using NVIDIA API with system prompts.
 
@@ -756,6 +756,7 @@ def process_document_with_api(
         file_path: Path to the document file
         config: NVIDIA API configuration
         content_type: Type of content ('text', 'diagram', 'table', 'mixed')
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Structured analysis result as dictionary
@@ -767,18 +768,24 @@ def process_document_with_api(
     """
     # Process document to get images
     try:
-        file_type, base64_images = DocumentProcessor.process_document(file_path)
+        file_type, base64_images = DocumentProcessor.process_document(file_path, pages=pages)
     except Exception as e:
         raise ValueError(f"Failed to process document: {e}") from e
 
-    # Get system and content-specific prompts
+    # Get system prompt
     system_prompt = get_system_prompt()
-    content_prompt = get_content_specific_prompt(content_type)
+    content_prompt = "Extract all content from this page."
 
     # Process pages in parallel
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
         # Submit all page processing tasks
+        # If pages is specified, use those page numbers, otherwise use sequential numbering
+        if pages:
+            page_numbers = pages
+        else:
+            page_numbers = list(range(1, len(base64_images) + 1))
+
         future_to_page = {
             executor.submit(
                 _process_single_page_nvidia,
@@ -788,7 +795,7 @@ def process_document_with_api(
                 system_prompt,
                 content_prompt,
             ): page_num
-            for page_num, base64_image in enumerate(base64_images, 1)
+            for page_num, base64_image in zip(page_numbers, base64_images)
         }
 
         # Collect results as they complete
@@ -821,6 +828,7 @@ def extract_text_from_document(
     file_path: str,
     config: NVIDIAConfig,
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> str:
     """Extract text from document using NVIDIA API.
 
@@ -828,6 +836,7 @@ def extract_text_from_document(
         file_path: Path to the document file
         config: NVIDIA API configuration
         content_type: Type of content ('text', 'diagram', 'table', 'mixed')
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Extracted and structured text content
@@ -837,7 +846,7 @@ def extract_text_from_document(
         ImageEncodingError: If image encoding fails
         ValueError: If file format is not supported
     """
-    result = process_document_with_api(file_path, config, content_type)
+    result = process_document_with_api(file_path, config, content_type, pages=pages)
 
     # Extract and combine text from all pages
     text_content = []
@@ -870,6 +879,7 @@ def process_document_with_openrouter(
     file_path: str,
     config: OpenRouterConfig,
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Process document using OpenRouter API with system prompts.
 
@@ -877,6 +887,7 @@ def process_document_with_openrouter(
         file_path: Path to the document file
         config: OpenRouter API configuration
         content_type: Type of content ('text', 'diagram', 'table', 'mixed')
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Structured analysis result as dictionary
@@ -888,18 +899,24 @@ def process_document_with_openrouter(
     """
     # Process document to get images
     try:
-        file_type, base64_images = DocumentProcessor.process_document(file_path)
+        file_type, base64_images = DocumentProcessor.process_document(file_path, pages=pages)
     except Exception as e:
         raise ValueError(f"Failed to process document: {e}") from e
 
-    # Get system and content-specific prompts
+    # Get system prompt
     system_prompt = get_system_prompt()
-    content_prompt = get_content_specific_prompt(content_type)
+    content_prompt = "Extract all content from this page."
 
     # Process pages in parallel
     results = []
     with ThreadPoolExecutor(max_workers=5) as executor:
         # Submit all page processing tasks
+        # If pages is specified, use those page numbers, otherwise use sequential numbering
+        if pages:
+            page_numbers = pages
+        else:
+            page_numbers = list(range(1, len(base64_images) + 1))
+
         future_to_page = {
             executor.submit(
                 _process_single_page_openrouter,
@@ -909,7 +926,7 @@ def process_document_with_openrouter(
                 system_prompt,
                 content_prompt,
             ): page_num
-            for page_num, base64_image in enumerate(base64_images, 1)
+            for page_num, base64_image in zip(page_numbers, base64_images)
         }
 
         # Collect results as they complete
@@ -940,6 +957,7 @@ def extract_text_from_document_openrouter(
     file_path: str,
     config: OpenRouterConfig,
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> str:
     """Extract text from document using OpenRouter API.
 
@@ -947,6 +965,7 @@ def extract_text_from_document_openrouter(
         file_path: Path to the document file
         config: OpenRouter API configuration
         content_type: Type of content ('text', 'diagram', 'table', 'mixed')
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Extracted and structured text content
@@ -956,7 +975,7 @@ def extract_text_from_document_openrouter(
         ImageEncodingError: If image encoding fails
         ValueError: If file format is not supported
     """
-    result = process_document_with_openrouter(file_path, config, content_type)
+    result = process_document_with_openrouter(file_path, config, content_type, pages=pages)
 
     # Extract and combine text from all pages
     text_content = []
@@ -1292,6 +1311,7 @@ def process_document_with_openai(
     file_path: str,
     config: "OpenAIConfig",
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Process a document using OpenAI API.
 
@@ -1299,6 +1319,7 @@ def process_document_with_openai(
         file_path: Path to the document file
         config: OpenAI API configuration
         content_type: Type of content to focus on
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Structured analysis result
@@ -1316,7 +1337,7 @@ def process_document_with_openai(
         base64_image = base64.b64encode(image_data).decode("utf-8")
 
         system_prompt = get_system_prompt()
-        content_prompt = get_content_specific_prompt(content_type)
+        content_prompt = "Extract all content from this page."
 
         result = _process_single_page_openai(
             1, base64_image, config, system_prompt, content_prompt
@@ -1334,10 +1355,10 @@ def process_document_with_openai(
 
     elif file_type in ["pdf", "docx", "pptx", "xlsx"]:
         # Handle multi-page documents
-        pages_data = processor.convert_to_images()
+        pages_data = processor.convert_to_images(pages=pages)
 
         system_prompt = get_system_prompt()
-        content_prompt = get_content_specific_prompt(content_type)
+        content_prompt = "Extract all content from this page."
 
         # Process pages in parallel
         results = []
@@ -1388,6 +1409,7 @@ def extract_text_from_document_openai(
     file_path: str,
     config: "OpenAIConfig",
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> str:
     """Extract text from document using OpenAI API.
 
@@ -1395,6 +1417,7 @@ def extract_text_from_document_openai(
         file_path: Path to the document file
         config: OpenAI API configuration
         content_type: Type of content to focus on
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Extracted text content
@@ -1402,7 +1425,7 @@ def extract_text_from_document_openai(
     Raises:
         OpenAIAPIError: If extraction fails
     """
-    result = process_document_with_openai(file_path, config, content_type)
+    result = process_document_with_openai(file_path, config, content_type, pages=pages)
 
     # Extract text from all pages
     text_parts = []
@@ -1439,7 +1462,7 @@ def extract_text_from_image_openai(
     base64_image = base64.b64encode(image_data).decode("utf-8")
 
     system_prompt = get_system_prompt()
-    content_prompt = get_content_specific_prompt("mixed")
+    content_prompt = "Extract all content from this page."
 
     result = _process_single_page_openai(
         1, base64_image, config, system_prompt, content_prompt
@@ -1476,7 +1499,7 @@ def extract_text_from_image_streaming_openai(
     base64_image = base64.b64encode(image_data).decode("utf-8")
 
     system_prompt = get_system_prompt()
-    content_prompt = get_content_specific_prompt("mixed")
+    content_prompt = "Extract all content from this page."
 
     payload = {
         "model": config.model,
@@ -1689,6 +1712,7 @@ def process_document_with_google(
     file_path: str,
     config: GoogleConfig,
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> Dict[str, Any]:
     """Process a document using Google API.
 
@@ -1696,6 +1720,7 @@ def process_document_with_google(
         file_path: Path to the document file
         config: Google API configuration
         content_type: Type of content to focus on
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Structured analysis result
@@ -1713,7 +1738,7 @@ def process_document_with_google(
         base64_image = base64.b64encode(image_data).decode("utf-8")
 
         system_prompt = get_system_prompt()
-        content_prompt = get_content_specific_prompt(content_type)
+        content_prompt = "Extract all content from this page."
 
         result = _process_single_page_google(
             1, base64_image, config, system_prompt, content_prompt
@@ -1731,10 +1756,10 @@ def process_document_with_google(
 
     elif file_type in ["pdf", "docx", "pptx", "xlsx"]:
         # Handle multi-page documents
-        pages_data = processor.convert_to_images()
+        pages_data = processor.convert_to_images(pages=pages)
 
         system_prompt = get_system_prompt()
-        content_prompt = get_content_specific_prompt(content_type)
+        content_prompt = "Extract all content from this page."
 
         # Process pages in parallel
         results = []
@@ -1785,6 +1810,7 @@ def extract_text_from_document_google(
     file_path: str,
     config: GoogleConfig,
     content_type: str = "mixed",
+    pages: Optional[List[int]] = None,
 ) -> str:
     """Extract text from document using Google API.
 
@@ -1792,6 +1818,7 @@ def extract_text_from_document_google(
         file_path: Path to the document file
         config: Google API configuration
         content_type: Type of content to focus on
+        pages: Optional list of page numbers to process (1-indexed)
 
     Returns:
         Extracted text content
@@ -1799,7 +1826,7 @@ def extract_text_from_document_google(
     Raises:
         GoogleAPIError: If extraction fails
     """
-    result = process_document_with_google(file_path, config, content_type)
+    result = process_document_with_google(file_path, config, content_type, pages=pages)
 
     # Extract text from all pages
     text_parts = []
@@ -1836,7 +1863,7 @@ def extract_text_from_image_google(
     base64_image = base64.b64encode(image_data).decode("utf-8")
 
     system_prompt = get_system_prompt()
-    content_prompt = get_content_specific_prompt("mixed")
+    content_prompt = "Extract all content from this page."
 
     result = _process_single_page_google(
         1, base64_image, config, system_prompt, content_prompt
@@ -1873,7 +1900,7 @@ def extract_text_from_image_streaming_google(
     base64_image = base64.b64encode(image_data).decode("utf-8")
 
     system_prompt = get_system_prompt()
-    content_prompt = get_content_specific_prompt("mixed")
+    content_prompt = "Extract all content from this page."
     combined_prompt = f"{system_prompt}\n\n{content_prompt}"
 
     payload = {
