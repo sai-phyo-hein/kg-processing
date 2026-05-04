@@ -316,7 +316,12 @@ class TripleRefiner:
             Prompt string
         """
         existing_list = "\n".join([
-            f"- {e['payload']['name']} (ID: {e['id']}, Score: {e['score']:.2f})"
+            (
+                f"- {e['payload'].get('name_en', e['payload']['name'])} "
+                f"[{e['payload']['name']}] (ID: {e['id']}, Score: {e['score']:.2f})"
+                if e['payload'].get('name_en')
+                else f"- {e['payload']['name']} (ID: {e['id']}, Score: {e['score']:.2f})"
+            )
             for e in existing_entities
         ])
 
@@ -455,10 +460,15 @@ Analyze the entities and return the canonical form in JSON format:"""
                 canonical_id = None
                 synonyms = [e["payload"]["name"] for e in existing_entities]
 
-            # If canonical_id is None but canonical matches an existing entity, use its ID
+            # If canonical_id is None but canonical matches an existing entity,
+            # use its ID — check both 'name' and 'name_en' in the payload.
             if canonical_id is None and canonical:
                 for existing_entity in existing_entities:
-                    if existing_entity["payload"]["name"] == canonical:
+                    payload = existing_entity.get("payload", {})
+                    if (
+                        payload.get("name") == canonical
+                        or payload.get("name_en") == canonical
+                    ):
                         canonical_id = existing_entity["id"]
                         break
 
@@ -588,11 +598,13 @@ Analyze the entities and return the canonical form in JSON format:"""
         """Batch upsert entities to Qdrant.
 
         Args:
-            entities: List of entity dictionaries with name, type, synonyms, etc.
+            entities: List of entity dictionaries with name, name_en, label, attributes, etc.
+                      When name_en is present, it is used for both the embedding and the point
+                      UUID so that queries in either language resolve to the same point.
             collection_name: Name of the collection
 
         Returns:
-            Dictionary mapping entity names to point IDs
+            Dictionary mapping entity names (original) to point IDs
         """
         if not entities:
             return {}
@@ -600,45 +612,67 @@ Analyze the entities and return the canonical form in JSON format:"""
         try:
             from qdrant_client.http import models as qdrant_models
 
-            # Get vector configuration for this collection
             vector_config = self._get_vector_config(collection_name)
             vector_name = self._get_vector_name(collection_name)
 
-            # Get embeddings for all entities in batch
-            entity_names = [entity["name"] for entity in entities]
-            embeddings = self._get_embeddings_batch(entity_names)
+            # Embed using the English name when available so that both a Thai query
+            # ("ทุนทางสังคม") and its English translation ("Social Capital") land on
+            # the same point via multilingual similarity.
+            embed_texts = [entity.get("name_en") or entity["name"] for entity in entities]
+            embeddings = self._get_embeddings_batch(embed_texts)
 
-            # Create points
             points = []
             for entity, embedding in zip(entities, embeddings):
-                point_id = self._generate_uuid(entity["name"])
+                # Derive the canonical key used for UUID from the English name when
+                # available, so English queries return the exact same point ID.
+                canonical_key = entity.get("name_en") or entity["name"]
+                point_id = self._generate_uuid(canonical_key)
+
+                payload: Dict[str, Any] = {
+                    "name": entity["name"],
+                    "is_canonical": entity.get("is_canonical", True),
+                    "synonyms": entity.get("synonyms", []),
+                }
+
+                # English translation — enables bilingual search
+                if entity.get("name_en"):
+                    payload["name_en"] = entity["name_en"]
+
+                # Semantic label (replaces the old "type" field)
+                label = entity.get("label") or entity.get("type", "")
+                if label:
+                    payload["label"] = label
+                # Keep "type" as an alias for backward compatibility
+                payload["type"] = label
+
+                # Unbounded attribute dictionaries
+                if entity.get("attributes"):
+                    payload["attributes"] = entity["attributes"]
+                if entity.get("attributes_en"):
+                    payload["attributes_en"] = entity["attributes_en"]
+
                 point = qdrant_models.PointStruct(
                     id=point_id,
-                    vector={
-                        vector_name: embedding
-                    },
-                    payload={
-                        "name": entity["name"],
-                        "type": entity["type"],
-                        "is_canonical": entity.get("is_canonical", True),
-                        "synonyms": entity.get("synonyms", [])
-                    },
+                    vector={vector_name: embedding},
+                    payload=payload,
                 )
                 points.append(point)
 
-            # Batch upsert
             self.qdrant_client.upsert(
                 collection_name=collection_name,
                 points=points,
             )
 
-            # Return mapping of names to IDs
-            return {entity["name"]: self._generate_uuid(entity["name"]) for entity in entities}
+            # Return mapping: original name → point ID
+            result = {}
+            for entity in entities:
+                canonical_key = entity.get("name_en") or entity["name"]
+                result[entity["name"]] = self._generate_uuid(canonical_key)
+            return result
 
         except Exception as e:
             print(f"Error: Failed to batch upsert entities to {collection_name}: {e}")
             print(f"  Entities being upserted: {[e['name'] for e in entities]}")
-            # Re-raise the error to make it visible
             raise
 
     def _upsert_entity(
@@ -648,27 +682,41 @@ Analyze the entities and return the canonical form in JSON format:"""
         entity_type: str,
         is_canonical: bool,
         synonyms: List[str],
+        name_en: Optional[str] = None,
+        label: Optional[str] = None,
+        attributes: Optional[Dict[str, Any]] = None,
+        attributes_en: Optional[Dict[str, Any]] = None,
     ) -> str:
         """Upsert a single entity to Qdrant (for backward compatibility).
 
         Args:
             collection_name: Name of the collection
-            name: Entity name
-            entity_type: Type of entity
+            name: Entity name (original language)
+            entity_type: Type/label of entity
             is_canonical: Whether this is the canonical form
             synonyms: List of synonyms
+            name_en: English translation of the name (enables bilingual search)
+            label: Semantic PascalCase label (replaces entity_type when provided)
+            attributes: Unbounded attribute dict (original language)
+            attributes_en: Unbounded attribute dict (English)
         Returns:
             ID of the upserted point
         """
-        result = self._batch_upsert_entities(
-            [{
-                "name": name,
-                "type": entity_type,
-                "is_canonical": is_canonical,
-                "synonyms": synonyms
-            }],
-            collection_name,
-        )
+        entity: Dict[str, Any] = {
+            "name": name,
+            "type": entity_type,
+            "label": label or entity_type,
+            "is_canonical": is_canonical,
+            "synonyms": synonyms,
+        }
+        if name_en:
+            entity["name_en"] = name_en
+        if attributes:
+            entity["attributes"] = attributes
+        if attributes_en:
+            entity["attributes_en"] = attributes_en
+
+        result = self._batch_upsert_entities([entity], collection_name)
         return result.get(name)
 
     def _refine_entity(
@@ -722,6 +770,19 @@ Analyze the entities and return the canonical form in JSON format:"""
     ) -> Dict[str, Any]:
         """Refine all triples using Qdrant for entity resolution with batch processing.
 
+        Supports the updated triple format which uses:
+        - subject/object ``label`` (semantic PascalCase) instead of ``type``
+        - ``name_en`` / ``predicate_en`` English translations on non-English sources
+        - Unbounded ``attributes`` / ``attributes_en`` dicts on subjects and objects
+        - ``relationship_attributes`` / ``relationship_attributes_en`` on the edge
+
+        Bilingual search strategy: when a ``name_en`` translation is present the
+        English text is used for both the embedding and the point UUID.  This means
+        a Qdrant query using the Thai original *or* its English translation will
+        resolve to the same point because (a) the stored vector is the English
+        embedding and (b) OpenAI's ``text-embedding-3-small`` is cross-lingual, so
+        semantically equivalent Thai text maps to a very similar vector.
+
         Args:
             triples_data: Dictionary containing triples data
 
@@ -731,101 +792,122 @@ Analyze the entities and return the canonical form in JSON format:"""
         # Ensure collections exist
         self._ensure_collections_exist()
 
-        # Collect all unique entities
-        entities_to_process = {
-            "entity_registry": set(),  # For subjects and objects
-            "predicate_registry": set(),  # For predicates
-            "ontology_registry": set(),  # For entity types
-        }
+        # ── Collect unique entities, keeping the full new-format metadata ─────
+        # Use dicts keyed by original name so we preserve name_en / label /
+        # attributes without losing information when the same name appears in
+        # multiple triples.
+        entity_registry_items: Dict[str, Dict[str, Any]] = {}
+        predicate_registry_items: Dict[str, Dict[str, Any]] = {}
+        ontology_registry_items: Dict[str, Dict[str, Any]] = {}
 
         for chunk_data in triples_data.get("chunks", []):
             for triple in chunk_data.get("triples", []):
-                # Add subject entity
-                entities_to_process["entity_registry"].add((
-                    triple["subject"]["name"],
-                    triple["subject"]["type"],
-                ))
+                subj = triple["subject"]
+                obj = triple["object"]
 
-                # Add predicate
-                entities_to_process["predicate_registry"].add((
-                    triple["predicate"],
-                    "predicate",
-                ))
+                # Subject
+                subj_name = subj["name"]
+                if subj_name not in entity_registry_items:
+                    entity_registry_items[subj_name] = {
+                        "name": subj_name,
+                        "name_en": subj.get("name_en"),
+                        "label": subj.get("label", ""),
+                        "attributes": subj.get("attributes", {}),
+                        "attributes_en": subj.get("attributes_en", {}),
+                    }
 
-                # Add object entity
-                entities_to_process["entity_registry"].add((
-                    triple["object"]["name"],
-                    triple["object"]["type"],
-                ))
+                # Predicate
+                pred = triple["predicate"]
+                pred_en = triple.get("predicate_en")
+                if pred not in predicate_registry_items:
+                    predicate_registry_items[pred] = {
+                        "name": pred,
+                        # predicate_en is already ALL_CAPS_SNAKE_CASE English
+                        "name_en": pred_en,
+                        "label": "predicate",
+                    }
 
-                # Add object type (ontology)
-                entities_to_process["ontology_registry"].add((
-                    triple["object"]["type"],
-                    "ontology",
-                ))
+                # Object
+                obj_name = obj["name"]
+                if obj_name not in entity_registry_items:
+                    entity_registry_items[obj_name] = {
+                        "name": obj_name,
+                        "name_en": obj.get("name_en"),
+                        "label": obj.get("label", ""),
+                        "attributes": obj.get("attributes", {}),
+                        "attributes_en": obj.get("attributes_en", {}),
+                    }
 
-        # Process each collection in batch
-        entity_cache = {}
+                # Labels → ontology_registry (labels are already English PascalCase)
+                for lbl in (subj.get("label", ""), obj.get("label", "")):
+                    if lbl and lbl not in ontology_registry_items:
+                        ontology_registry_items[lbl] = {
+                            "name": lbl,
+                            "name_en": lbl,  # already English
+                            "label": "label",
+                        }
 
-        for collection_name, entities in entities_to_process.items():
-            if not entities:
+        # ── Process each registry collection in batch ─────────────────────────
+        entity_cache: Dict[tuple, Dict[str, Any]] = {}
+
+        collections = {
+            "entity_registry": list(entity_registry_items.values()),
+            "predicate_registry": list(predicate_registry_items.values()),
+            "ontology_registry": list(ontology_registry_items.values()),
+        }
+
+        for collection_name, entity_list in collections.items():
+            if not entity_list:
                 continue
 
-            print(f"Processing {len(entities)} entities in {collection_name}...")
+            print(f"Processing {len(entity_list)} entities in {collection_name}...")
 
-            # Convert to list and get embeddings in batch
-            entity_list = [{"name": name, "type": entity_type} for name, entity_type in entities]
-            entity_names = [entity["name"] for entity in entity_list]
+            # Embed using the English name when present (bilingual search guarantee)
+            embed_texts = [e.get("name_en") or e["name"] for e in entity_list]
 
-            # Get embeddings in batch
-            print(f"  Getting embeddings for {len(entity_names)} entities...")
-            embeddings = self._get_embeddings_batch(entity_names)
+            print(f"  Getting embeddings for {len(embed_texts)} entities...")
+            embeddings = self._get_embeddings_batch(embed_texts)
 
-            # Process entities using similarity-based grouping
             print(f"  Grouping entities by similarity...")
-            processed_canonicals = set()  # Track which canonicals we've already processed
+            processed_canonicals: set = set()
 
             for i, (entity, embedding) in enumerate(zip(entity_list, embeddings)):
-                # Skip if we've already processed this entity as part of a group
                 if entity["name"] in processed_canonicals:
                     continue
 
-                # Query Qdrant for similar entities (will find previously processed ones)
+                # Query Qdrant — the stored vector is the English embedding, so
+                # searching with either Thai or English text will find the same point.
                 matches = self._query_qdrant_with_embedding(
                     collection_name,
                     embedding,
                     limit=5,
                 )
 
-                # Find similar entities in current batch using cosine similarity
+                # Find similar entities in the current batch
                 similar_entities = []
                 for j, (other_entity, other_embedding) in enumerate(zip(entity_list, embeddings)):
                     if i == j:
                         continue
-                    # Calculate cosine similarity
                     similarity = self._cosine_similarity(embedding, other_embedding)
-                    if similarity > 0.75:  # Similarity threshold
+                    if similarity > 0.75:
                         similar_entities.append({
-                            "id": None,  # No ID yet, not in Qdrant
+                            "id": None,
                             "score": similarity,
                             "payload": {
                                 "name": other_entity["name"],
-                                "type": other_entity["type"],
+                                "label": other_entity.get("label", ""),
                             },
                         })
 
-                # Combine Qdrant matches with similar entities from current batch
                 all_matches = matches + similar_entities
 
-                # Determine canonical with LLM (only if we have matches)
                 if all_matches:
                     canonical_info = self._determine_canonical_with_llm(
                         entity["name"],
                         all_matches,
-                        entity["type"],
+                        entity.get("label", ""),
                     )
                 else:
-                    # No matches, this entity is its own canonical
                     canonical_info = {
                         "canonical": entity["name"],
                         "canonical_id": None,
@@ -840,57 +922,80 @@ Analyze the entities and return the canonical form in JSON format:"""
                     "canonical_id": canonical_info.get("canonical_id"),
                     "synonyms": canonical_info["synonyms"],
                     "is_new": canonical_info["is_new"],
-                    "type": entity["type"],
+                    "label": entity.get("label", ""),
+                    "name_en": entity.get("name_en"),
+                    "attributes": entity.get("attributes", {}),
+                    "attributes_en": entity.get("attributes_en", {}),
                 }
 
-                # Mark this entity as processed
                 processed_canonicals.add(entity["name"])
 
-                # Cache results for similar entities that map to the same canonical
+                # Cache similar entities that share the same canonical
                 for similar_entity in similar_entities:
                     similar_name = similar_entity["payload"]["name"]
                     if similar_name not in processed_canonicals:
+                        # Retrieve full info from the source dicts
+                        if collection_name == "entity_registry":
+                            similar_info = entity_registry_items.get(similar_name, {})
+                        elif collection_name == "predicate_registry":
+                            similar_info = predicate_registry_items.get(similar_name, {})
+                        else:
+                            similar_info = ontology_registry_items.get(similar_name, {})
+
                         entity_cache[(collection_name, similar_name)] = {
                             "original": similar_name,
                             "canonical": canonical_info["canonical"],
-                            "canonical_id": None,  # Will be set when canonical is upserted
+                            "canonical_id": None,
                             "synonyms": canonical_info["synonyms"],
-                            "is_new": False,  # Not new, maps to existing canonical
-                            "type": similar_entity["payload"]["type"],
+                            "is_new": False,
+                            "label": similar_info.get("label", ""),
+                            "name_en": similar_info.get("name_en"),
+                            "attributes": similar_info.get("attributes", {}),
+                            "attributes_en": similar_info.get("attributes_en", {}),
                         }
                         processed_canonicals.add(similar_name)
 
-                # If this is a new canonical entity, upsert it immediately
+                # Upsert new canonical entities immediately
                 if canonical_info["is_new"]:
+                    # Use English name when the canonical happens to be the current entity
+                    canonical_name_en = (
+                        entity.get("name_en")
+                        if canonical_info["canonical"] == entity["name"]
+                        else None
+                    )
                     upserted_id = self._batch_upsert_entities(
                         [{
                             "name": canonical_info["canonical"],
-                            "type": entity["type"],
+                            "name_en": canonical_name_en,
+                            "label": entity.get("label", ""),
+                            "attributes": entity.get("attributes", {}),
+                            "attributes_en": entity.get("attributes_en", {}),
                             "is_canonical": True,
                             "synonyms": canonical_info["synonyms"],
-                            "source_chunk": 1,
                         }],
                         collection_name,
                     )
-                    # Update the cache with the upserted ID for all entities that map to this canonical
                     canonical_id = upserted_id.get(canonical_info["canonical"]) if upserted_id else None
                     if canonical_id:
-                        for (cache_key, cached_entity) in entity_cache.items():
-                            if (cache_key[0] == collection_name and
-                                cached_entity["canonical"] == canonical_info["canonical"]):
+                        # Update all cached entries that point to this canonical
+                        for cache_key, cached_entity in entity_cache.items():
+                            if (
+                                cache_key[0] == collection_name
+                                and cached_entity["canonical"] == canonical_info["canonical"]
+                            ):
                                 cached_entity["canonical_id"] = canonical_id
+
                 elif canonical_info.get("canonical_id"):
-                    # Entity exists in Qdrant, update cache with existing ID
-                    for (cache_key, cached_entity) in entity_cache.items():
-                        if (cache_key[0] == collection_name and
-                            cached_entity["canonical"] == canonical_info["canonical"]):
+                    for cache_key, cached_entity in entity_cache.items():
+                        if (
+                            cache_key[0] == collection_name
+                            and cached_entity["canonical"] == canonical_info["canonical"]
+                        ):
                             cached_entity["canonical_id"] = canonical_info["canonical_id"]
 
-                    # Check if we need to update existing entity to canonical
-                    # Find the existing entity in matches
+                    # Mark existing entity as canonical if it wasn't already
                     for match in matches:
                         if match["id"] == canonical_info["canonical_id"]:
-                            # Update the entity to be canonical if it wasn't already
                             if not match["payload"].get("is_canonical", False):
                                 try:
                                     self.qdrant_client.set_payload(
@@ -906,7 +1011,7 @@ Analyze the entities and return the canonical form in JSON format:"""
                                     print(f"  Warning: Failed to update entity to canonical: {e}")
                             break
 
-        # Now refine all triples using the cached results
+        # ── Build refined triples ──────────────────────────────────────────────
         refined_chunks = []
 
         for chunk_data in triples_data.get("chunks", []):
@@ -914,18 +1019,24 @@ Analyze the entities and return the canonical form in JSON format:"""
             refined_triples = []
 
             for triple in chunk_data.get("triples", []):
-                # Get refined subject
-                subject_key = ("entity_registry", triple["subject"]["name"])
+                subj_raw = triple["subject"]
+                obj_raw = triple["object"]
+
+                # Refined subject
+                subject_key = ("entity_registry", subj_raw["name"])
                 refined_subject = entity_cache.get(subject_key, {
-                    "original": triple["subject"]["name"],
-                    "canonical": triple["subject"]["name"],
+                    "original": subj_raw["name"],
+                    "canonical": subj_raw["name"],
                     "canonical_id": None,
                     "synonyms": [],
                     "is_new": True,
-                    "type": triple["subject"]["type"],
+                    "label": subj_raw.get("label", ""),
+                    "name_en": subj_raw.get("name_en"),
+                    "attributes": subj_raw.get("attributes", {}),
+                    "attributes_en": subj_raw.get("attributes_en", {}),
                 })
 
-                # Get refined predicate
+                # Refined predicate
                 predicate_key = ("predicate_registry", triple["predicate"])
                 refined_predicate = entity_cache.get(predicate_key, {
                     "original": triple["predicate"],
@@ -933,55 +1044,94 @@ Analyze the entities and return the canonical form in JSON format:"""
                     "canonical_id": None,
                     "synonyms": [],
                     "is_new": True,
-                    "type": "predicate",
+                    "label": "predicate",
+                    "name_en": triple.get("predicate_en"),
                 })
 
-                # Get refined object
-                object_key = ("entity_registry", triple["object"]["name"])
+                # Refined object
+                object_key = ("entity_registry", obj_raw["name"])
                 refined_object = entity_cache.get(object_key, {
-                    "original": triple["object"]["name"],
-                    "canonical": triple["object"]["name"],
+                    "original": obj_raw["name"],
+                    "canonical": obj_raw["name"],
                     "canonical_id": None,
                     "synonyms": [],
                     "is_new": True,
-                    "type": triple["object"]["type"],
+                    "label": obj_raw.get("label", ""),
+                    "name_en": obj_raw.get("name_en"),
+                    "attributes": obj_raw.get("attributes", {}),
+                    "attributes_en": obj_raw.get("attributes_en", {}),
                 })
 
-                # Get refined object type
-                object_type_key = ("ontology_registry", triple["object"]["type"])
-                refined_object_type = entity_cache.get(object_type_key, {
-                    "original": triple["object"]["type"],
-                    "canonical": triple["object"]["type"],
+                # Refined object label (ontology registry)
+                obj_label_raw = obj_raw.get("label", "")
+                object_label_key = ("ontology_registry", obj_label_raw)
+                refined_object_label = entity_cache.get(object_label_key, {
+                    "original": obj_label_raw,
+                    "canonical": obj_label_raw,
                     "canonical_id": None,
                     "synonyms": [],
                     "is_new": True,
-                    "type": "ontology",
+                    "label": "label",
                 })
 
-                # Create refined triple
-                refined_triple = {
+                # Canonical label for the object (fall back through layers)
+                canonical_obj_label = (
+                    refined_object_label["canonical"]
+                    or refined_object.get("label", "")
+                    or obj_label_raw
+                )
+
+                refined_triple: Dict[str, Any] = {
                     "subject": {
                         "name": refined_subject["canonical"],
-                        "type": refined_subject["type"],
-                        "original_name": triple["subject"]["name"],
+                        "original_name": subj_raw["name"],
+                        "label": refined_subject.get("label", ""),
+                        # type kept for backward compatibility with neo4j_graph_builder
+                        "type": refined_subject.get("label", ""),
                     },
                     "predicate": refined_predicate["canonical"],
                     "original_predicate": triple["predicate"],
                     "object": {
                         "name": refined_object["canonical"],
-                        "type": refined_object_type["type"],
-                        "original_name": triple["object"]["name"],
-                        "original_type": triple["object"]["type"],
+                        "original_name": obj_raw["name"],
+                        "label": canonical_obj_label,
+                        # type kept for backward compatibility
+                        "type": canonical_obj_label,
+                        "original_label": obj_label_raw,
                     },
-                    "properties": triple["properties"],
+                    "properties": triple.get("properties", {}),
                     "chunk_id": chunk_id,
                     "refinement": {
                         "subject": refined_subject,
                         "predicate": refined_predicate,
                         "object": refined_object,
-                        "object_type": refined_object_type,
+                        "object_label": refined_object_label,
                     },
                 }
+
+                # ── Optional English-translation fields (new format) ──────────
+                if refined_subject.get("name_en"):
+                    refined_triple["subject"]["name_en"] = refined_subject["name_en"]
+                if subj_raw.get("attributes"):
+                    refined_triple["subject"]["attributes"] = subj_raw["attributes"]
+                if subj_raw.get("attributes_en"):
+                    refined_triple["subject"]["attributes_en"] = subj_raw["attributes_en"]
+
+                pred_en = triple.get("predicate_en") or refined_predicate.get("name_en")
+                if pred_en:
+                    refined_triple["predicate_en"] = pred_en
+
+                if refined_object.get("name_en"):
+                    refined_triple["object"]["name_en"] = refined_object["name_en"]
+                if obj_raw.get("attributes"):
+                    refined_triple["object"]["attributes"] = obj_raw["attributes"]
+                if obj_raw.get("attributes_en"):
+                    refined_triple["object"]["attributes_en"] = obj_raw["attributes_en"]
+
+                if triple.get("relationship_attributes"):
+                    refined_triple["relationship_attributes"] = triple["relationship_attributes"]
+                if triple.get("relationship_attributes_en"):
+                    refined_triple["relationship_attributes_en"] = triple["relationship_attributes_en"]
 
                 refined_triples.append(refined_triple)
 
@@ -990,8 +1140,7 @@ Analyze the entities and return the canonical form in JSON format:"""
                 "triples": refined_triples,
             })
 
-        # Create refined output
-        refined_data = {
+        refined_data: Dict[str, Any] = {
             "source_file": triples_data.get("source_file"),
             "total_chunks": len(refined_chunks),
             "total_triples": sum(len(c["triples"]) for c in refined_chunks),

@@ -273,7 +273,8 @@ class Neo4jGraphBuilder:
                     source_refinement = triple["refinement"]["subject"]
                     source_canonical_id = source_refinement["canonical_id"]
                     source_name = triple["subject"]["name"]
-                    source_type = triple["subject"]["type"]
+                    # Support both new "label" field and legacy "type" field
+                    source_type = triple["subject"].get("label") or triple["subject"].get("type", "Entity")
 
                     if source_canonical_id and source_canonical_id not in created_entities:
                         created_entities[source_canonical_id] = {
@@ -286,7 +287,8 @@ class Neo4jGraphBuilder:
                     target_refinement = triple["refinement"]["object"]
                     target_canonical_id = target_refinement["canonical_id"]
                     target_name = triple["object"]["name"]
-                    target_type = triple["object"]["type"]
+                    # Support both new "label" field and legacy "type" field
+                    target_type = triple["object"].get("label") or triple["object"].get("type", "Entity")
 
                     if target_canonical_id and target_canonical_id not in created_entities:
                         created_entities[target_canonical_id] = {
