@@ -1,20 +1,76 @@
-# KG Extractor
+# Knowledge Graph Processing
 
-Extract structured content from documents using AI APIs for knowledge graph construction, with intelligent agent-based processing, LLM-based semantic chunking, and OpenIE triple extraction with causal discovery.
+Two-module system for extracting knowledge from documents and reasoning over the resulting knowledge graphs.
 
-## Features
+## Modules
 
-- Multi-API provider support: OpenAI, NVIDIA, OpenRouter, Groq
-- Multi-format support: Images (PNG, JPEG, WEBP, GIF, BMP), Documents (PDF, DOCX, PPTX, XLSX)
-- LangGraph workflow: Document processing → LLM-based semantic chunking → OpenIE triple extraction
-- Intelligent content processing: Text restructuring, diagram analysis, table-to-JSON conversion
-- Semantic chunking: LLM-based topic boundary detection (not embedding-based)
-- Knowledge graph triple extraction: OpenIE with zero-shot discovery, causal discovery, temporal metadata
-- LangChain Agent Integration: Document processing, markdown editing, triple extraction tools
-- Triple refinement with Qdrant: Entity resolution and canonical ID matching
-- Neo4j graph building: Automatic knowledge graph construction from refined triples
-- Schema validation: Validate triples and graph against predefined schema (optional)
-- Modular architecture with comprehensive error handling
+### kg-extractor
+Extract structured content from documents → semantic chunks → knowledge graph triples.
+
+**Features:**
+- Multi-format support: PDF, DOCX, PPTX, XLSX, PNG, JPEG, WEBP, GIF, BMP
+- Multi-API providers: OpenAI, NVIDIA, OpenRouter, Groq, Google
+- LLM-based semantic chunking with topic boundary detection
+- OpenIE triple extraction with causal discovery and temporal metadata
+- Triple refinement with Qdrant (entity resolution, canonical ID assignment)
+- Neo4j graph building with schema validation (optional)
+
+**Quick Start:**
+```bash
+# Process document and build knowledge graph
+uv run kg-extractor langgraph document.pdf
+
+# Custom refinement & graph building
+uv run kg-extractor langgraph document.pdf --refinement-provider openai --refinement-model gpt-4o-mini --build-graph --with-schema
+```
+
+**Key Options:**
+- `--chunk-granularity`: Semantic chunking granularity (0.0-1.0, default: 0.5)
+- `--similarity-threshold`: Entity resolution threshold (0.0-1.0, default: 0.85)
+- `--chunking-provider/model`: LLM for semantic chunking (default: openai/gpt-4o-mini)
+- `--triplet-provider/model`: LLM for triple extraction (default: openai/gpt-4o-mini)
+- `--refinement-provider/model`: LLM for triple refinement (default: openai/gpt-4o-mini)
+- `--with-schema`: Enable schema validation
+- `--until <step>`: Stop after specific step (document_parsing, metadata_extraction, semantic_chunking, triple_extraction, triple_refining, graph_building)
+- `--pages`: Process specific pages (e.g., '1,3-5,7')
+
+**Debug Modes:**
+```bash
+# Refine existing triples
+uv run kg-extractor langgraph document.pdf --refine-triples
+
+# Build graph from existing refined triples
+uv run kg-extractor langgraph document.pdf --build-graph
+```
+
+### kg-reasoning
+Query knowledge graphs using multi-agent reasoning (Orchestrator → Workers → Synthesizer).
+
+**Features:**
+- Multi-agent workflow: Orchestrator plans strategies, Workers execute searches, Synthesizer answers
+- Entity extraction and matching against Qdrant vector database
+- Neo4j Cypher query execution
+- Natural language answer synthesis
+
+**Quick Start:**
+```bash
+# Query the knowledge graph
+uv run kg-reasoning query "What drives Thailand ecommerce?"
+
+# With verbose output
+uv run kg-reasoning query "How does debt affect company performance?" --verbose
+
+# Save results to file
+uv run kg-reasoning query "What are market volatility causes?" --output result.json
+```
+
+**Key Options:**
+- `--llm-provider`: LLM provider (default: openai)
+- `--orchestrator-model`: Orchestrator agent model (default: gpt-4o)
+- `--worker-model`: Worker agents model (default: gpt-4o-mini)
+- `--synthesizer-model`: Synthesizer agent model (default: gpt-4o)
+- `--output`: Save results to JSON file
+- `--verbose`: Show workflow metadata (strategies, entities found, execution time)
 
 ## Key Technical Concepts
 
@@ -184,7 +240,7 @@ uv run kg-extractor --agent --agent-model gpt-4o-mini --agent-task "List all mar
 uv run kg-extractor langgraph document.pdf
 
 # Customize providers and models
-uv run kg-extractor langgraph document.pdf --provider openai --chunking-llm-provider openai --triplet-llm-provider openai
+uv run kg-extractor langgraph document.pdf --provider openai --chunking-provider openai --triplet-provider openai
 
 # Customize chunking parameters
 uv run kg-extractor langgraph document.pdf --similarity-threshold 0.3 --min-chunk-size 50 --max-chunk-size 800
@@ -561,16 +617,16 @@ When `--with-schema` is enabled:
 - `--provider`: API provider for document processing - nvidia/openrouter/openai (default: nvidia)
 - `--model`: Model for document processing (default: microsoft/phi-4-multimodal-instruct for nvidia, gpt-4o for openai)
 - `--content-type`: Content focus - text/diagram/table/mixed (default: mixed)
-- `--chunking-llm-provider`: LLM provider for chunking - openai/groq/nvidia/openrouter (default: openai)
-- `--chunking-llm-model`: Model for chunking (default: gpt-4o-mini)
+- `--chunking-provider`: LLM provider for chunking - openai/groq/nvidia/openrouter (default: openai)
+- `--chunking-model`: Model for chunking (default: gpt-4o-mini)
 - `--similarity-threshold`: Threshold for topic change detection (0.0-1.0, default: 0.5)
 - `--min-chunk-size`: Minimum tokens per chunk (default: 100)
 - `--max-chunk-size`: Maximum tokens per chunk (default: 1000)
-- `--triplet-llm-provider`: LLM provider for triple extraction - openai/groq/nvidia/openrouter (default: openai)
-- `--triplet-llm-model`: Model for triple extraction (default: gpt-4o-mini)
+- `--triplet-provider`: LLM provider for triple extraction - openai/groq/nvidia/openrouter (default: openai)
+- `--triplet-model`: Model for triple extraction (default: gpt-4o-mini)
 - `--refine-triples` / `--no-refine-triples`: Enable/disable triple refinement (default: True)
-- `--refinement-llm-provider`: LLM provider for triple refinement (default: openai)
-- `--refinement-llm-model`: Model for triple refinement (default: gpt-4o-mini)
+- `--refinement-provider`: LLM provider for triple refinement (default: openai)
+- `--refinement-model`: Model for triple refinement (default: gpt-4o-mini)
 - `--build-graph` / `--no-build-graph`: Enable/disable Neo4j graph building (default: True)
 - `--with-schema`: Enable schema validation for triples and graph (default: False)
 
