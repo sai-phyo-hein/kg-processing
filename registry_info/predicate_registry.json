@@ -1,6 +1,9 @@
 {
   "collection_name": "predicate_registry",
   "description": "Predicate registry for relationship predicates",
+  "vector_name": "predicate",
+  "vector_name_en": "predicate_en",
+  "vector_name_th": "predicate_th",
   "sparse_vector_name": "predicate_vector",
   "vector_config": {
     "datatype": "float32",
@@ -12,6 +15,5 @@
     },
     "on_disk": false,
     "size": 1536
-  },
-  "vector_name": "predicate"
+  }
 }

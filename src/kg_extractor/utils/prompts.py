@@ -486,7 +486,6 @@ LANGUAGE RULES — APPLY TO EVERY FIELD
   Attribute values     → source language
   Attribute keys       → always English snake_case        (programmatic)
   label                → always English PascalCase        (programmatic)
-  relationship_class   → always English ALL_CAPS          (programmatic)
   evidence_quote       → always verbatim from source      (never translated)
 
 For non-English sources, add these translation fields alongside every
@@ -503,7 +502,7 @@ human-readable field:
       (same keys, values translated to English)
 
 Fields that never get translated:
-  label, relationship_class, attribute keys, evidence_quote, validFrom, validTo
+  label, attribute keys, evidence_quote, validFrom, validTo
 
 Translation quality:
   - Translate meaning accurately, not word-for-word
@@ -550,13 +549,13 @@ FORBIDDEN LABELS — never use these regardless of domain:
   ↑ these are too generic to be meaningful or are raw data types
 
 ──────────────────────────────────────
-RULE 3 — RELATIONSHIP CLASS IS DYNAMIC
+RULE 3 — RELATIONSHIP LABEL IS DYNAMIC
 ──────────────────────────────────────
-Do not use a fixed list of relationship classes. For every predicate, derive
+Do not use a fixed list of relationship labels. For every predicate, derive
 the most semantically accurate English ALL_CAPS category that describes the
 conceptual nature of the relationship.
 
-PRINCIPLES FOR CHOOSING A RELATIONSHIP CLASS:
+PRINCIPLES FOR CHOOSING A RELATIONSHIP LABEL:
   - Describe what KIND OF CONNECTION exists between subject and object
   - Be broad enough to group similar relationships, specific enough to be
     meaningful
@@ -759,7 +758,7 @@ ENGLISH-DOMINANT SOURCE (detected_language: "en" or "mixed-en"):
         "snake_case_key": "value"
       }},
       "properties": {{
-        "relationship_class": "SEMANTIC_ALL_CAPS_CLASS",
+        "label": "SEMANTIC_ALL_CAPS_CLASS",
         "status": "Current | Archived",
         "evidence_quote": "verbatim substring from the content",
         "validFrom": "YYYY-MM-DD or null",
@@ -818,7 +817,7 @@ _en fields are MANDATORY on every triple — omitting them is an error.
         "snake_case_key": "value translated to English"
       }},
       "properties": {{
-        "relationship_class": "SEMANTIC_ALL_CAPS_CLASS",
+        "label": "SEMANTIC_ALL_CAPS_CLASS",
         "status": "Current | Archived",
         "evidence_quote": "ข้อความต้นฉบับ verbatim — ไม่แปล",
         "validFrom": "YYYY-MM-DD or null",
@@ -839,9 +838,7 @@ FIELD NOTES:
 - subject.attributes_en / object.attributes_en: omit if parent attributes is omitted
 - relationship_attributes: omit entirely when empty — never output {{}}
 - relationship_attributes_en: omit if relationship_attributes is omitted
-- label: semantic English PascalCase — specific to the domain and entity type;
-         never DomainEntity, Entity, Thing, Object, Other, or raw data types
-- relationship_class: semantic English ALL_CAPS — specific to the nature of the
+- label (for predicates): semantic English ALL_CAPS — specific to the nature of the
          relationship; never OTHER, GENERAL, MISC, UNKNOWN, RELATIONSHIP
 - predicate_en: ALL_CAPS_SNAKE_CASE English verb phrase — mandatory for non-English
 - evidence_quote: verbatim from source — never translated, never paraphrased
@@ -886,7 +883,7 @@ trades at a Bangkok EBITDA multiple of 5.5x–7.5x and a regional multiple of
         "reference_year": "2024"
       }},
       "properties": {{
-        "relationship_class": "MARKET_PERFORMANCE",
+        "label": "MARKET_PERFORMANCE",
         "status": "Current",
         "evidence_quote": "Thailand's e-commerce sector reached ฿1.1 trillion in 2024",
         "validFrom": "2024-01-01",
@@ -910,7 +907,7 @@ trades at a Bangkok EBITDA multiple of 5.5x–7.5x and a regional multiple of
         "reference_year": "2024"
       }},
       "properties": {{
-        "relationship_class": "MARKET_PERFORMANCE",
+        "label": "MARKET_PERFORMANCE",
         "status": "Current",
         "evidence_quote": "representing 14% year-over-year growth",
         "validFrom": "2024-01-01",
@@ -934,7 +931,7 @@ trades at a Bangkok EBITDA multiple of 5.5x–7.5x and a regional multiple of
         "basis": "digital marketplace size"
       }},
       "properties": {{
-        "relationship_class": "MARKET_POSITION",
+        "label": "MARKET_POSITION",
         "status": "Current",
         "evidence_quote": "positioning as ASEAN's second-largest digital marketplace",
         "validFrom": null,
@@ -956,7 +953,7 @@ trades at a Bangkok EBITDA multiple of 5.5x–7.5x and a regional multiple of
         "value": "40 million"
       }},
       "properties": {{
-        "relationship_class": "MARKET_REACH",
+        "label": "MARKET_REACH",
         "status": "Current",
         "evidence_quote": "with over 40 million online shoppers",
         "validFrom": null,
@@ -978,7 +975,7 @@ trades at a Bangkok EBITDA multiple of 5.5x–7.5x and a regional multiple of
         "value": "7,400"
       }},
       "properties": {{
-        "relationship_class": "MARKET_REACH",
+        "label": "MARKET_REACH",
         "status": "Current",
         "evidence_quote": "7,400 registered e-commerce businesses",
         "validFrom": null,
@@ -1005,7 +1002,7 @@ trades at a Bangkok EBITDA multiple of 5.5x–7.5x and a regional multiple of
         "applicable_revenue_range": "฿10M–฿50M"
       }},
       "properties": {{
-        "relationship_class": "VALUATION",
+        "label": "VALUATION",
         "status": "Current",
         "evidence_quote": "trades at a Bangkok EBITDA multiple of 5.5x–7.5x and a regional multiple of 5.0x–7.0x",
         "validFrom": null,
@@ -1045,7 +1042,7 @@ Given (Thai): "ศักยภาพของชุมชนท้องถิ�
         "label": "SocialCapital"
       }},
       "properties": {{
-        "relationship_class": "CAUSATION",
+        "label": "CAUSATION",
         "status": "Current",
         "evidence_quote": "ศักยภาพของชุมชนท้องถิ่นเกิดจากการนำใช้ทุนทางสังคมทั้งหมดในชุมชน",
         "validFrom": null,
@@ -1077,7 +1074,7 @@ Given (Thai): "ศักยภาพของชุมชนท้องถิ�
         }}
       }},
       "properties": {{
-        "relationship_class": "COMPOSITION",
+        "label": "COMPOSITION",
         "status": "Current",
         "evidence_quote": "ประกอบด้วย ๑) บุคคล ได้แก่ ผู้นำ นักสู้ ปราชญ์",
         "validFrom": null,
@@ -1115,7 +1112,7 @@ Given (Thai): "ศักยภาพของชุมชนท้องถิ�
         "reference_year": "2024"
       }},
       "properties": {{
-        "relationship_class": "MARKET_PERFORMANCE",
+        "label": "MARKET_PERFORMANCE",
         "status": "Current",
         "evidence_quote": "ตลาด E-Commerce ไทยแตะระดับ ฿1.1 ล้านล้านบาท ในปี 2567",
         "validFrom": "2024-01-01",
@@ -1147,7 +1144,7 @@ Given (Thai): "ศักยภาพของชุมชนท้องถิ�
         "reference_year": "2024"
       }},
       "properties": {{
-        "relationship_class": "MARKET_PERFORMANCE",
+        "label": "MARKET_PERFORMANCE",
         "status": "Current",
         "evidence_quote": "เติบโต 14% เมื่อเทียบปีต่อปี",
         "validFrom": "2024-01-01",
@@ -1172,9 +1169,9 @@ ANTI-PATTERN REFERENCE
     label: "Percentage" / "CurrencyValue" / "Count"
     Fix: derive a label describing the kind of metric — "GrowthRate", "MarketValue"
 
-  ✗ OTHER used as relationship_class:
-    relationship_class: "OTHER" / "GENERAL" / "MISC"
-    Fix: derive a specific class — "CAUSATION", "COMPOSITION", "ASSOCIATION" —
+  ✗ OTHER used as relationship label:
+    label (in properties): "OTHER" / "GENERAL" / "MISC"
+    Fix: derive a specific label — "CAUSATION", "COMPOSITION", "ASSOCIATION" —
          or invent an accurate ALL_CAPS term
 
   ✗ _en fields missing on non-English source:
@@ -1223,7 +1220,7 @@ FINAL CHECKLIST — RUN BEFORE OUTPUT
   □ _en fields present on EVERY triple for non-English sources — no exceptions
   □ _en fields absent for English-dominant sources
   □ label is a specific semantic English PascalCase term — not generic, not a data type
-  □ relationship_class is a specific semantic English ALL_CAPS term — not OTHER/GENERAL
+  □ label (in properties) is a specific semantic English ALL_CAPS term — not OTHER/GENERAL
   □ Predicate is a verb phrase in source language, grounded in the evidence quote
   □ predicate_en is ALL_CAPS_SNAKE_CASE English verb phrase (non-English sources only)
   □ Different metrics produce separate triples to separate value entities

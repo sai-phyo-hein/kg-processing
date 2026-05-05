@@ -1,6 +1,9 @@
 {
   "collection_name": "label_registry",
   "description": "Label registry for entity types",
+  "vector_name": "label",
+  "vector_name_en": "label_en",
+  "vector_name_th": "label_th",
   "sparse_vector_name": "label_vector",
   "vector_config": {
     "datatype": "float32",
@@ -12,6 +15,5 @@
     },
     "on_disk": false,
     "size": 1536
-  },
-  "vector_name": "label"
+  }
 }
