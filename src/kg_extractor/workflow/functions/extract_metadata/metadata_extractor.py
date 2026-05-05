@@ -13,43 +13,37 @@ from kg_extractor.utils.parser import (
 )
 from kg_extractor.utils.prompts import create_metadata_extraction_prompt
 
-_ALL_FIELDS = [
-    "document_title",
-    "document_file_name",
-    "document_file_type",
-    "document_total_pages",
-    "document_content_type",
-    "location_village",
-    "location_moo",
-    "location_country",
-]
+def _load_metadata_config() -> dict:
+    """Load metadata field config from metadata_config.yaml."""
+    config_path = Path(__file__).parent.parent.parent.parent / "utils" / "metadata_config.yaml"
+    try:
+        import yaml
+        with open(config_path, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load metadata_config.yaml: {e}")
 
 
-def _get_example_metadata(db_path: str) -> Optional[Dict[str, Any]]:
-    """Fetch the first metadata record from database as an example.
+_METADATA_CONFIG = _load_metadata_config()
+_ALL_FIELDS: list = _METADATA_CONFIG.get("fields") or []
+_MANDATORY_FIELDS: list = _METADATA_CONFIG.get("mandatory") or []
 
-    Args:
-        db_path: Path to DuckDB database file
+
+def _get_example_metadata() -> Optional[Dict[str, Any]]:
+    """Fetch the first metadata record from Qdrant as an example.
 
     Returns:
-        Example metadata dictionary or None if database is empty
+        Example metadata dictionary or None if collection is empty
     """
     try:
-        import duckdb
-        conn = duckdb.connect(db_path)
-        result = conn.execute("SELECT * FROM metadata LIMIT 1").fetchone()
-        conn.close()
-
-        if result:
-            columns = [
-                'unique_id', 'document_title', 'document_file_name', 'document_file_type',
-                'document_total_pages', 'document_content_type', 'location_village',
-                'location_moo', 'location_country', 'created_at', 'updated_at'
-            ]
-            # Exclude timestamps from example
-            example = dict(zip(columns, result))
-            example.pop('created_at', None)
-            example.pop('updated_at', None)
+        from kg_extractor.workflow.functions.extract_metadata.metadata_updater import MetadataUpdater
+        
+        updater = MetadataUpdater()
+        all_metadata = updater.get_all_metadata()
+        
+        if all_metadata:
+            # Exclude unique_id from example
+            example = dict(all_metadata[0])
             example.pop('unique_id', None)
             return example
     except Exception as e:
@@ -101,7 +95,6 @@ def extract_metadata_with_llm(
     markdown_path: str,
     llm_provider: str = "openai",
     llm_model: str = "gpt-4o-mini",
-    db_path: str = "metadata.db",
 ) -> Dict[str, Any]:
     """Extract metadata from analyzed markdown file using hybrid regex + LLM approach.
 
@@ -112,7 +105,6 @@ def extract_metadata_with_llm(
         markdown_path: Path to the markdown analysis file
         llm_provider: LLM provider (openai, groq, nvidia, openrouter)
         llm_model: LLM model name
-        db_path: Path to metadata database for fetching examples
 
     Returns:
         Dictionary containing extracted metadata
@@ -132,8 +124,8 @@ def extract_metadata_with_llm(
 
     # Step 3: call LLM only for missing fields, with a small content sample
     if missing_fields:
-        # Fetch an example from the database to help LLM mimic format
-        example = _get_example_metadata(db_path)
+        # Fetch an example from Qdrant to help LLM mimic format
+        example = _get_example_metadata()
 
         # Sample: front of document (titles/headers) + tail (summary/location info)
         sample = content[:2000] + ("\n...\n" + content[-1000:] if len(content) > 3000 else "")
@@ -155,10 +147,18 @@ def extract_metadata_with_llm(
     # Merge: regex results take priority over LLM
     metadata = {**llm_metadata, **searched}
 
-    # Generate unique ID from location fields
-    moo = metadata.get("location_moo", "").replace("หมู่ที่ ", "").replace(" ", "")
-    village = metadata.get("location_village", "").split("(")[0].strip()
-    metadata["unique_id"] = f"{moo}_{village}" if moo and village else source_file
+    # Validate mandatory fields
+    for field in _MANDATORY_FIELDS:
+        if not str(metadata.get(field, "")).strip():
+            raise ValueError(f"{field} is mandatory but not found in document: {source_file}")
+
+    # Construct unique_id from mandatory fields (joined with "_"), fall back to file name
+    if _MANDATORY_FIELDS:
+        metadata["unique_id"] = "_".join(
+            str(metadata[f]).strip() for f in _MANDATORY_FIELDS
+        )
+    else:
+        metadata["unique_id"] = source_file
 
     llm_fields_used = missing_fields if missing_fields else []
     regex_fields_used = list(searched.keys())

@@ -3,12 +3,12 @@
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from kg_extractor.processors.docx_processor import process_docx
-from kg_extractor.processors.image_processor import process_image
-from kg_extractor.processors.pdf_processor import process_pdf
-from kg_extractor.processors.pptx_processor import process_pptx
-from kg_extractor.utils.prompts import get_system_prompt  # noqa: F401
-from kg_extractor.processors.xlsx_processor import process_xlsx
+from .process_docx import process_docx
+from .process_image import process_image
+from .process_pdf import process_pdf
+from .process_pptx import process_pptx
+from kg_extractor.utils.prompts import get_parsing_prompt  # noqa: F401
+from .process_xlsx import process_xlsx
 
 
 class DocumentProcessor:

@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from kg_extractor.utils.schema_parser import get_schema_parser
+from kg_extractor.workflow.functions.build_graph.schema_parser import get_schema_parser
 
 
 class Neo4jGraphBuilder:

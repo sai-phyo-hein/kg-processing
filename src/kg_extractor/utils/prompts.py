@@ -58,7 +58,7 @@ schema, either:
     return formatted_schema
 
 
-def get_system_prompt() -> str:
+def get_parsing_prompt() -> str:
     """Get the system prompt for content extraction.
 
     Returns:
@@ -289,32 +289,32 @@ space, complete the current sentence first, then stop."""
 def create_chunking_prompt(
     content: str,
     file_path: str,
-    similarity_threshold: float,
+    chunk_granularity: float,
 ) -> str:
     """Create a prompt for the LLM to analyze content and determine chunk boundaries.
 
     Args:
         content: Full content of the markdown file
         file_path: Path to the file
-        similarity_threshold: Threshold for chunk granularity (0.0-1.0)
+        chunk_granularity: Threshold for chunk granularity (0.0-1.0)
 
     Returns:
         Prompt string for the LLM
     """
-    if similarity_threshold < 0.3:
+    if chunk_granularity < 0.3:
         granularity = "very fine-grained"
         granularity_instruction = (
             "Split aggressively — each distinct claim, metric, or sub-topic gets its own chunk. "
             "A paragraph introducing a concept and a paragraph giving its numeric details "
             "should be separate chunks."
         )
-    elif similarity_threshold < 0.5:
+    elif chunk_granularity < 0.5:
         granularity = "fine-grained"
         granularity_instruction = (
             "Split on clear topic shifts. Each process stage, each table's data, "
             "and each named metric group should be its own chunk."
         )
-    elif similarity_threshold < 0.7:
+    elif chunk_granularity < 0.7:
         granularity = "medium-grained"
         granularity_instruction = (
             "Split on major section changes. Group closely related paragraphs together "
@@ -1258,8 +1258,8 @@ def create_metadata_extraction_prompt(content: str, fields: list[str] | None = N
         "document_file_type": 'document_file_type: File type (string, e.g., "PDF", "DOCX")',
         "document_total_pages": "document_total_pages: Total number of pages (integer)",
         "document_content_type": 'document_content_type: Content type (string, e.g., "mixed", "text", "table")',
-        "location_village": "location_village: Actual village name like 'บ้านป่าสักยาว' (Ban Pa Sak Yao), NOT the หมู่ number. Extract the full village name starting with 'บ้าน' (string)",
-        "location_moo": 'location_moo: หมู่ number (string, e.g., "หมู่ที่ 1") — from the survey report conducted for each หมู่ (village)',
+        "location_village": "location_village: **MANDATORY** Actual village name in format 'Thai_name (English_name)' like 'บ้านป่าสักยาว (Ban Pa Sak Yao)', NOT the หมู่ number. Extract the full village name starting with 'บ้าน' (string)",
+        "location_moo": 'location_moo: **MANDATORY** หมู่ number (string, e.g., "หมู่ที่ 1") — from the survey report conducted for each หมู่ (village)',
         "location_country": "location_country: Country name (string) — from the survey report conducted for each หมู่ (village)",
     }
 
@@ -1287,6 +1287,10 @@ Required fields:
 {example_section}Document content:
 {content}
 
-Return ONLY valid JSON with the above fields. Use empty strings for missing string fields and 0 for missing integer fields.
+IMPORTANT: location_moo and location_village are MANDATORY fields. You MUST find and extract these values from the document.
+- location_moo: Look for patterns like "หมู่ที่ 1", "หมู่ 2", etc.
+- location_village: Look for village names starting with "บ้าน" followed by the name and English translation in parentheses.
+
+Return ONLY valid JSON with the above fields. Use empty strings for missing optional string fields and 0 for missing integer fields.
 """
     return prompt

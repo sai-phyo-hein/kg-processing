@@ -25,9 +25,6 @@ def format_result_to_markdown(result: Dict[str, Any], file_path: str) -> str:
     md_lines.append(
         f"**Processing Model:** {result.get('metadata', {}).get('processing_model', 'unknown')}\n"
     )
-    md_lines.append(
-        f"**Content Type:** {result.get('metadata', {}).get('content_type', 'mixed')}\n"
-    )
     md_lines.append("---\n")
 
     # Start flag for all extracted content

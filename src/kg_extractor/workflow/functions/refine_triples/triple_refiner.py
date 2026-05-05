@@ -20,6 +20,7 @@ class TripleRefiner:
         llm_provider: str = "openai",
         llm_model: str = "gpt-4o-mini",
         registry_info_dir: Optional[str] = None,
+        similarity_threshold: float = 0.85,
     ):
         """Initialize the triple refiner.
 
@@ -29,6 +30,7 @@ class TripleRefiner:
             llm_provider: LLM provider for canonical comparison
             llm_model: Model for LLM analysis
             registry_info_dir: Directory containing registry specification files
+            similarity_threshold: Cosine similarity threshold for entity matching (0.0-1.0)
         """
         import os
         from pathlib import Path
@@ -37,14 +39,13 @@ class TripleRefiner:
         self.qdrant_api_key = qdrant_api_key or os.getenv("QDRANT_API_KEY")
         self.llm_provider = llm_provider
         self.llm_model = llm_model
+        self.similarity_threshold = similarity_threshold
 
         # Set registry info directory
         if registry_info_dir is None:
             # Default to registry_info in the project root
-            project_root = Path(__file__).parent.parent.parent.parent
+            project_root = Path(__file__).parent.parent.parent.parent.parent.parent
             self.registry_info_dir = project_root / "registry_info"
-        else:
-            self.registry_info_dir = Path(registry_info_dir)
 
         # Load registry specifications
         self.registry_specs = self._load_registry_specs()
@@ -78,7 +79,7 @@ class TripleRefiner:
             Dictionary mapping collection names to their specifications
         """
         specs = {}
-        collections = ["entity_registry", "predicate_registry", "ontology_registry"]
+        collections = ["entity_registry", "predicate_registry", "label_registry"]
 
         for collection_name in collections:
             spec_file = self.registry_info_dir / f"{collection_name}.json"
@@ -130,7 +131,7 @@ class TripleRefiner:
         collections = {
             "entity_registry": "Entity registry for subject and object entities",
             "predicate_registry": "Predicate registry for relationship predicates",
-            "ontology_registry": "Ontology registry for entity types",
+            "label_registry": "Ontology registry for entity types",
         }
 
         for collection_name, description in collections.items():
@@ -153,6 +154,17 @@ class TripleRefiner:
                     },
                 )
                 print(f"Created collection: {collection_name}")
+
+            # Ensure payload index exists for is_canonical (required for filtered search)
+            try:
+                self.qdrant_client.create_payload_index(
+                    collection_name=collection_name,
+                    field_name="is_canonical",
+                    field_schema=qdrant_models.PayloadSchemaType.BOOL,
+                )
+                print(f"  Created is_canonical index on {collection_name}")
+            except Exception:
+                pass  # Index already exists
 
     def _generate_uuid(self, name: str) -> str:
         """Generate a deterministic UUID from a name.
@@ -262,98 +274,269 @@ class TripleRefiner:
             print(f"Warning: Failed to query Qdrant: {e}")
             return []
 
-    def _determine_canonical_with_llm(
+    def _query_qdrant_canonical(
         self,
-        current_entity: str,
-        existing_entities: List[Dict[str, Any]],
+        collection_name: str,
+        query_vector: List[float],
+        limit: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Query Qdrant for canonical entities above the similarity threshold.
+
+        Args:
+            collection_name: Name of the collection to query
+            query_vector: Pre-computed embedding vector
+            limit: Maximum number of results to return
+
+        Returns:
+            List of matching canonical points with payloads
+        """
+        try:
+            from qdrant_client.http import models as qdrant_models
+
+            vector_name = self._get_vector_name(collection_name)
+
+            search_results = self.qdrant_client.query_points(
+                collection_name=collection_name,
+                query=query_vector,
+                using=vector_name,
+                limit=limit,
+                with_payload=True,
+                score_threshold=self.similarity_threshold,
+                query_filter=qdrant_models.Filter(
+                    must=[
+                        qdrant_models.FieldCondition(
+                            key="is_canonical",
+                            match=qdrant_models.MatchValue(value=True),
+                        )
+                    ]
+                ),
+            )
+
+            matches = []
+            for result in search_results.points:
+                matches.append({
+                    "id": result.id,
+                    "score": result.score,
+                    "payload": result.payload,
+                })
+
+            return matches
+
+        except Exception as e:
+            print(f"Warning: Failed to query Qdrant for canonicals: {e}")
+            return []
+
+    def _compare_canonical_with_llm(
+        self,
+        new_entity: Dict[str, Any],
+        existing_canonical: Dict[str, Any],
         entity_type: str,
     ) -> Dict[str, Any]:
-        """Use LLM to determine which entity should be canonical.
+        """Use LLM to decide whether the new entity should replace the existing canonical.
 
         Args:
-            current_entity: Current entity name
-            existing_entities: List of existing entities from Qdrant
-            entity_type: Type of entity (subject, predicate, ontology)
+            new_entity: New entity dict (name, name_en, attributes, attributes_en, label)
+            existing_canonical: Qdrant match dict (id, score, payload)
+            entity_type: Type/label of entity
 
         Returns:
-            Dictionary with canonical entity and synonyms
+            {"are_same_entity": bool, "new_is_canonical": bool, "reasoning": str}
         """
-        if not existing_entities:
-            # No existing entities, current one is canonical
-            return {
-                "canonical": current_entity,
-                "synonyms": [],
-                "is_new": True,
-            }
-
-        # Create prompt for LLM
         prompt = self._create_canonical_comparison_prompt(
-            current_entity,
-            existing_entities,
+            new_entity,
+            existing_canonical,
             entity_type,
         )
-
-        # Get LLM response
         response = self._get_llm_response(prompt)
+        return self._parse_canonical_winner(response)
 
-        # Parse response
-        return self._parse_canonical_response(response, current_entity, existing_entities)
-
-    def _create_canonical_comparison_prompt(
+    def _compare_predicate_with_llm(
         self,
-        current_entity: str,
-        existing_entities: List[Dict[str, Any]],
-        entity_type: str,
-    ) -> str:
-        """Create prompt for canonical comparison.
+        new_predicate: str,
+        new_predicate_en: Optional[str],
+        existing_canonical: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Use LLM to decide whether two predicates are semantically equivalent.
+
+        Predicates need a different strategy from entities: "increase", "grow",
+        and "improve" are all semantically equivalent as relationship types even
+        though the words are different.  When they are equivalent the more
+        standard/generic English form should become (or stay) the canonical.
 
         Args:
-            current_entity: Current entity name
-            existing_entities: List of existing entities
-            entity_type: Type of entity
+            new_predicate: Incoming predicate name (may be non-English)
+            new_predicate_en: English translation of the incoming predicate
+            existing_canonical: Qdrant match dict (id, score, payload)
 
         Returns:
-            Prompt string
+            {"are_equivalent": bool, "new_is_canonical": bool, "canonical_form": str, "reasoning": str}
         """
-        existing_list = "\n".join([
-            (
-                f"- {e['payload'].get('name_en', e['payload']['name'])} "
-                f"[{e['payload']['name']}] (ID: {e['id']}, Score: {e['score']:.2f})"
-                if e['payload'].get('name_en')
-                else f"- {e['payload']['name']} (ID: {e['id']}, Score: {e['score']:.2f})"
-            )
-            for e in existing_entities
-        ])
+        old_payload = existing_canonical.get("payload", {})
+        existing_name = old_payload.get("name_en") or old_payload.get("name", "")
+        incoming_name = new_predicate_en or new_predicate
 
-        prompt = f"""You are an expert in entity resolution and ontology management.
+        prompt = f"""You are an expert in knowledge graph schema design and relationship normalisation.
 
-Your task is to determine which entity should be the canonical form among similar entities.
+Two predicates (relationship types) have high vector similarity.  Your task:
 
-**Entity Type:** {entity_type}
+**Step 1 – Semantic equivalence check:** Decide whether these two predicates express the
+*same relationship type* in a knowledge graph.  Synonyms and near-synonyms count as
+equivalent (e.g. "increase" / "grow" / "rise" / "improve" are all equivalent; but
+"increase" and "decrease" are NOT equivalent even though they are related).
 
-**Current Entity:**
-{current_entity}
+**Step 2 – Canonical form selection (only when equivalent):** Choose the most standard,
+concise, and generic English verb form as the canonical predicate.  Prefer:
+- Short, common English verbs over long phrases
+- Active voice, base form (infinitive without "to")
+- Domain-neutral wording when both options work
 
-**Existing Similar Entities:**
-{existing_list}
+**Existing Canonical:**  {existing_name}
+  (original: {old_payload.get("name", "")})
+  ID: {existing_canonical.get("id")}
+  Similarity score: {existing_canonical.get("score", 0):.3f}
 
-**Instructions:**
-1. Analyze the current entity and existing entities
-2. Determine which one should be the canonical form (the most standard, complete, and widely used representation)
-3. Identify which entities are synonyms or variations of the canonical
-4. If the current entity is better than all existing ones, it should become the new canonical
+**Incoming Predicate:**  {incoming_name}
+  (original: {new_predicate})
 
 **Output Format (JSON):**
 ```json
 {{
-  "canonical": "canonical_entity_name",
-  "canonical_id": "existing_id_or_null",
-  "synonyms": ["synonym1", "synonym2"],
-  "reasoning": "brief explanation of the decision"
+  "are_equivalent": true_or_false,
+  "new_is_canonical": true_or_false,
+  "canonical_form": "chosen canonical predicate string",
+  "reasoning": "brief explanation"
 }}
 ```
 
-Analyze the entities and return the canonical form in JSON format:"""
+Rules:
+- If "are_equivalent" is false → set "new_is_canonical" to true so the incoming predicate
+  gets its own canonical entry; "canonical_form" should be {incoming_name!r}.
+- If "are_equivalent" is true → set "new_is_canonical" based on which form is superior;
+  "canonical_form" must be the chosen canonical string.
+
+Return only valid JSON:"""
+
+        response = self._get_llm_response(prompt)
+        return self._parse_predicate_equivalence(response, incoming_name)
+
+    def _parse_predicate_equivalence(
+        self,
+        response: str,
+        fallback_name: str,
+    ) -> Dict[str, Any]:
+        """Parse LLM response for predicate equivalence decision.
+
+        Args:
+            response: LLM response text
+            fallback_name: Name to use if parsing fails
+
+        Returns:
+            {"are_equivalent": bool, "new_is_canonical": bool, "canonical_form": str, "reasoning": str}
+        """
+        try:
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            elif response.startswith("```"):
+                response = response[3:]
+            if response.endswith("```"):
+                response = response[:-3]
+            response = response.strip()
+
+            data = json.loads(response)
+            are_equiv = bool(data.get("are_equivalent", True))
+            new_is_canonical = bool(data.get("new_is_canonical", False)) if are_equiv else True
+            return {
+                "are_equivalent": are_equiv,
+                "new_is_canonical": new_is_canonical,
+                "canonical_form": data.get("canonical_form", fallback_name),
+                "reasoning": data.get("reasoning", ""),
+            }
+        except Exception as e:
+            print(f"Warning: Failed to parse predicate equivalence response: {e}")
+            return {
+                "are_equivalent": True,
+                "new_is_canonical": False,
+                "canonical_form": fallback_name,
+                "reasoning": "parse error",
+            }
+
+    def _create_canonical_comparison_prompt(
+        self,
+        new_entity: Dict[str, Any],
+        existing_canonical: Dict[str, Any],
+        entity_type: str,
+    ) -> str:
+        """Create prompt to decide whether two entities are the same and, if so, which is canonical.
+
+        Args:
+            new_entity: New entity dict
+            existing_canonical: Existing canonical Qdrant match
+            entity_type: Type/label of entity
+
+        Returns:
+            Prompt string
+        """
+        def _format_entity(name: str, name_en: Optional[str], attributes: Dict) -> str:
+            lines = [f"  Name: {name}"]
+            if name_en:
+                lines.append(f"  Name (EN): {name_en}")
+            if attributes:
+                lines.append(f"  Evidence/Attributes: {json.dumps(attributes, ensure_ascii=False)}")
+            return "\n".join(lines)
+
+        old_payload = existing_canonical.get("payload", {})
+        old_text = _format_entity(
+            old_payload.get("name", ""),
+            old_payload.get("name_en"),
+            old_payload.get("attributes") or {},
+        )
+
+        new_text = _format_entity(
+            new_entity.get("name", ""),
+            new_entity.get("name_en"),
+            new_entity.get("attributes") or {},
+        )
+
+        prompt = f"""You are an expert in entity resolution and knowledge graph curation.
+
+Two entities with high vector similarity have been found.  Your task has two steps:
+
+**Step 1 – Identity check:** Decide whether these two entities refer to the *same real-world
+concept* (i.e. they are aliases, abbreviations, or surface variants of the same thing).
+Set "are_same_entity": true ONLY when both names clearly denote the identical concept.
+If one is a specific attribute, metric, sub-component, or related-but-distinct concept of the
+other (e.g. "Thai E-Commerce Market" vs "Thai E-Commerce Market Annual Value"), they are
+DIFFERENT entities — set "are_same_entity": false.
+
+**Step 2 – Canonical selection (only when are_same_entity is true):** Decide which form should
+be the canonical entry.  The existing canonical keeps its status UNLESS the new entity is clearly
+superior (more specific name, better evidence, more complete information).
+
+**Entity Type:** {entity_type}
+
+**Existing Canonical (currently registered):**
+{old_text}
+  ID: {existing_canonical.get("id")}
+  Similarity score: {existing_canonical.get("score", 0):.3f}
+
+**New Entity (incoming):**
+{new_text}
+
+**Output Format (JSON):**
+```json
+{{
+  "are_same_entity": true_or_false,
+  "new_is_canonical": true_or_false,
+  "reasoning": "brief explanation"
+}}
+```
+
+Rules:
+- If "are_same_entity" is false, set "new_is_canonical" to true (the new entity needs its own canonical entry).
+- If "are_same_entity" is true, set "new_is_canonical" based on which form is superior.
+
+Return only valid JSON:"""
 
         return prompt
 
@@ -416,24 +599,19 @@ Analyze the entities and return the canonical form in JSON format:"""
             print(f"Warning: Failed to get LLM response: {e}")
             return '{"canonical": null, "canonical_id": null, "synonyms": [], "reasoning": "LLM error"}'
 
-    def _parse_canonical_response(
+    def _parse_canonical_winner(
         self,
         response: str,
-        current_entity: str,
-        existing_entities: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        """Parse LLM response for canonical comparison.
+        """Parse LLM response for canonical winner decision.
 
         Args:
             response: LLM response text
-            current_entity: Current entity name
-            existing_entities: List of existing entities
 
         Returns:
-            Dictionary with canonical entity and synonyms
+            {"are_same_entity": bool, "new_is_canonical": bool, "reasoning": str}
         """
         try:
-            # Remove markdown code blocks if present
             response = response.strip()
             if response.startswith("```json"):
                 response = response[7:]
@@ -443,67 +621,20 @@ Analyze the entities and return the canonical form in JSON format:"""
                 response = response[:-3]
             response = response.strip()
 
-            # Parse JSON
             data = json.loads(response)
-
-            canonical = data.get("canonical")
-            canonical_id = data.get("canonical_id")
-            synonyms = data.get("synonyms", [])
-
-            # Handle string "None" vs actual None
-            if canonical_id == "None":
-                canonical_id = None
-
-            # If no canonical determined, use current entity
-            if not canonical:
-                canonical = current_entity
-                canonical_id = None
-                synonyms = [e["payload"]["name"] for e in existing_entities]
-
-            # If canonical_id is None but canonical matches an existing entity,
-            # use its ID — check both 'name' and 'name_en' in the payload.
-            if canonical_id is None and canonical:
-                for existing_entity in existing_entities:
-                    payload = existing_entity.get("payload", {})
-                    if (
-                        payload.get("name") == canonical
-                        or payload.get("name_en") == canonical
-                    ):
-                        canonical_id = existing_entity["id"]
-                        break
-
+            are_same = bool(data.get("are_same_entity", True))
+            # When entities are distinct, the new entity must become its own canonical
+            new_is_canonical = bool(data.get("new_is_canonical", False)) if are_same else True
             return {
-                "canonical": canonical,
-                "canonical_id": canonical_id,
-                "synonyms": synonyms,
-                "is_new": canonical_id is None,
+                "are_same_entity": are_same,
+                "new_is_canonical": new_is_canonical,
+                "reasoning": data.get("reasoning", ""),
             }
 
-        except json.JSONDecodeError:
-            # Fallback: current entity is canonical
-            return {
-                "canonical": current_entity,
-                "canonical_id": None,
-                "synonyms": [e["payload"]["name"] for e in existing_entities],
-                "is_new": True,
-            }
-        except KeyError as e:
-            print(f"Warning: Missing key in LLM response: {e}")
-            # Fallback: current entity is canonical
-            return {
-                "canonical": current_entity,
-                "canonical_id": None,
-                "synonyms": [],
-                "is_new": True,
-            }
         except Exception as e:
-            print(f"Warning: Failed to parse LLM response: {e}")
-            return {
-                "canonical": current_entity,
-                "canonical_id": None,
-                "synonyms": [],
-                "is_new": True,
-            }
+            print(f"Warning: Failed to parse canonical winner response: {e}")
+            # Fallback: keep existing canonical, assume same entity
+            return {"are_same_entity": True, "new_is_canonical": False, "reasoning": "parse error"}
 
     def _cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
         """Calculate cosine similarity between two vectors.
@@ -631,8 +762,11 @@ Analyze the entities and return the canonical form in JSON format:"""
                 payload: Dict[str, Any] = {
                     "name": entity["name"],
                     "is_canonical": entity.get("is_canonical", True),
-                    "synonyms": entity.get("synonyms", []),
                 }
+
+                # Link to canonical when this entity is not canonical itself
+                if entity.get("canonical_id") is not None:
+                    payload["canonical_id"] = entity["canonical_id"]
 
                 # English translation — enables bilingual search
                 if entity.get("name_en"):
@@ -681,20 +815,20 @@ Analyze the entities and return the canonical form in JSON format:"""
         name: str,
         entity_type: str,
         is_canonical: bool,
-        synonyms: List[str],
+        canonical_id: Optional[str] = None,
         name_en: Optional[str] = None,
         label: Optional[str] = None,
         attributes: Optional[Dict[str, Any]] = None,
         attributes_en: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """Upsert a single entity to Qdrant (for backward compatibility).
+        """Upsert a single entity to Qdrant.
 
         Args:
             collection_name: Name of the collection
             name: Entity name (original language)
             entity_type: Type/label of entity
             is_canonical: Whether this is the canonical form
-            synonyms: List of synonyms
+            canonical_id: ID of the canonical entity (when is_canonical is False)
             name_en: English translation of the name (enables bilingual search)
             label: Semantic PascalCase label (replaces entity_type when provided)
             attributes: Unbounded attribute dict (original language)
@@ -707,8 +841,9 @@ Analyze the entities and return the canonical form in JSON format:"""
             "type": entity_type,
             "label": label or entity_type,
             "is_canonical": is_canonical,
-            "synonyms": synonyms,
         }
+        if canonical_id is not None:
+            entity["canonical_id"] = canonical_id
         if name_en:
             entity["name_en"] = name_en
         if attributes:
@@ -735,34 +870,84 @@ Analyze the entities and return the canonical form in JSON format:"""
         Returns:
             Dictionary with refined entity information
         """
-        # Query Qdrant for similar entities
-        matches = self._query_qdrant(collection_name, entity_name, limit=5)
+        embedding = self._get_embedding(entity_name)
+        canonical_matches = self._query_qdrant_canonical(collection_name, embedding, limit=1)
 
-        # Determine canonical with LLM
-        canonical_info = self._determine_canonical_with_llm(
-            entity_name,
-            matches,
-            entity_type,
-        )
-
-        # Upsert canonical entity if it's new
-        upserted_id = None
-        if canonical_info["is_new"]:
+        if not canonical_matches:
             upserted_id = self._upsert_entity(
                 collection_name=collection_name,
-                name=canonical_info["canonical"],
+                name=entity_name,
                 entity_type=entity_type,
                 is_canonical=True,
-                synonyms=canonical_info["synonyms"],
             )
+            return {
+                "original": entity_name,
+                "canonical": entity_name,
+                "canonical_id": upserted_id,
+                "is_new": True,
+                "is_canonical": True,
+            }
 
-        return {
-            "original": entity_name,
-            "canonical": canonical_info["canonical"],
-            "canonical_id": upserted_id if upserted_id else canonical_info.get("canonical_id"),
-            "synonyms": canonical_info["synonyms"],
-            "is_new": canonical_info["is_new"],
-        }
+        existing_canonical = canonical_matches[0]
+        winner = self._compare_canonical_with_llm(
+            new_entity={"name": entity_name, "label": entity_type},
+            existing_canonical=existing_canonical,
+            entity_type=entity_type,
+        )
+
+        if not winner.get("are_same_entity", True):
+            # Distinct entities — create a new canonical
+            upserted_id = self._upsert_entity(
+                collection_name=collection_name,
+                name=entity_name,
+                entity_type=entity_type,
+                is_canonical=True,
+            )
+            return {
+                "original": entity_name,
+                "canonical": entity_name,
+                "canonical_id": upserted_id,
+                "is_new": True,
+                "is_canonical": True,
+            }
+        elif not winner["new_is_canonical"]:
+            upserted_id = self._upsert_entity(
+                collection_name=collection_name,
+                name=entity_name,
+                entity_type=entity_type,
+                is_canonical=False,
+                canonical_id=existing_canonical["id"],
+            )
+            return {
+                "original": entity_name,
+                "canonical": existing_canonical["payload"].get("name", entity_name),
+                "canonical_id": existing_canonical["id"],
+                "is_new": False,
+                "is_canonical": False,
+            }
+        else:
+            upserted_id = self._upsert_entity(
+                collection_name=collection_name,
+                name=entity_name,
+                entity_type=entity_type,
+                is_canonical=True,
+            )
+            old_id = existing_canonical["id"]
+            try:
+                self.qdrant_client.set_payload(
+                    collection_name=collection_name,
+                    payload={"is_canonical": False, "canonical_id": upserted_id},
+                    points=[old_id],
+                )
+            except Exception as e:
+                print(f"  Warning: Failed to demote old canonical: {e}")
+            return {
+                "original": entity_name,
+                "canonical": entity_name,
+                "canonical_id": upserted_id,
+                "is_new": True,
+                "is_canonical": True,
+            }
 
     def refine_triples(
         self,
@@ -798,7 +983,7 @@ Analyze the entities and return the canonical form in JSON format:"""
         # multiple triples.
         entity_registry_items: Dict[str, Dict[str, Any]] = {}
         predicate_registry_items: Dict[str, Dict[str, Any]] = {}
-        ontology_registry_items: Dict[str, Dict[str, Any]] = {}
+        label_registry_items: Dict[str, Dict[str, Any]] = {}
 
         for chunk_data in triples_data.get("chunks", []):
             for triple in chunk_data.get("triples", []):
@@ -838,22 +1023,24 @@ Analyze the entities and return the canonical form in JSON format:"""
                         "attributes_en": obj.get("attributes_en", {}),
                     }
 
-                # Labels → ontology_registry (labels are already English PascalCase)
+                # Labels → label_registry (labels are already English PascalCase)
                 for lbl in (subj.get("label", ""), obj.get("label", "")):
-                    if lbl and lbl not in ontology_registry_items:
-                        ontology_registry_items[lbl] = {
+                    if lbl and lbl not in label_registry_items:
+                        label_registry_items[lbl] = {
                             "name": lbl,
                             "name_en": lbl,  # already English
                             "label": "label",
                         }
 
-        # ── Process each registry collection in batch ─────────────────────────
+        # ── Process each registry collection ──────────────────────────────────
         entity_cache: Dict[tuple, Dict[str, Any]] = {}
+        # Log of canonical changes: old_canonical_id → new_canonical_id
+        canonical_change_log: List[Dict[str, Any]] = []
 
         collections = {
             "entity_registry": list(entity_registry_items.values()),
             "predicate_registry": list(predicate_registry_items.values()),
-            "ontology_registry": list(ontology_registry_items.values()),
+            "label_registry": list(label_registry_items.values()),
         }
 
         for collection_name, entity_list in collections.items():
@@ -862,154 +1049,284 @@ Analyze the entities and return the canonical form in JSON format:"""
 
             print(f"Processing {len(entity_list)} entities in {collection_name}...")
 
-            # Embed using the English name when present (bilingual search guarantee)
             embed_texts = [e.get("name_en") or e["name"] for e in entity_list]
-
             print(f"  Getting embeddings for {len(embed_texts)} entities...")
             embeddings = self._get_embeddings_batch(embed_texts)
 
-            print(f"  Grouping entities by similarity...")
-            processed_canonicals: set = set()
-
-            for i, (entity, embedding) in enumerate(zip(entity_list, embeddings)):
-                if entity["name"] in processed_canonicals:
-                    continue
-
-                # Query Qdrant — the stored vector is the English embedding, so
-                # searching with either Thai or English text will find the same point.
-                matches = self._query_qdrant_with_embedding(
+            for entity, embedding in zip(entity_list, embeddings):
+                # Query Qdrant for existing canonicals at >= similarity_threshold
+                canonical_matches = self._query_qdrant_canonical(
                     collection_name,
                     embedding,
-                    limit=5,
+                    limit=1,
                 )
 
-                # Find similar entities in the current batch
-                similar_entities = []
-                for j, (other_entity, other_embedding) in enumerate(zip(entity_list, embeddings)):
-                    if i == j:
-                        continue
-                    similarity = self._cosine_similarity(embedding, other_embedding)
-                    if similarity > 0.75:
-                        similar_entities.append({
-                            "id": None,
-                            "score": similarity,
-                            "payload": {
-                                "name": other_entity["name"],
-                                "label": other_entity.get("label", ""),
-                            },
-                        })
-
-                all_matches = matches + similar_entities
-
-                if all_matches:
-                    canonical_info = self._determine_canonical_with_llm(
-                        entity["name"],
-                        all_matches,
-                        entity.get("label", ""),
-                    )
-                else:
-                    canonical_info = {
-                        "canonical": entity["name"],
-                        "canonical_id": None,
-                        "synonyms": [],
-                        "is_new": True,
-                    }
-
-                # Cache the result for the main entity
-                entity_cache[(collection_name, entity["name"])] = {
-                    "original": entity["name"],
-                    "canonical": canonical_info["canonical"],
-                    "canonical_id": canonical_info.get("canonical_id"),
-                    "synonyms": canonical_info["synonyms"],
-                    "is_new": canonical_info["is_new"],
-                    "label": entity.get("label", ""),
-                    "name_en": entity.get("name_en"),
-                    "attributes": entity.get("attributes", {}),
-                    "attributes_en": entity.get("attributes_en", {}),
-                }
-
-                processed_canonicals.add(entity["name"])
-
-                # Cache similar entities that share the same canonical
-                for similar_entity in similar_entities:
-                    similar_name = similar_entity["payload"]["name"]
-                    if similar_name not in processed_canonicals:
-                        # Retrieve full info from the source dicts
-                        if collection_name == "entity_registry":
-                            similar_info = entity_registry_items.get(similar_name, {})
-                        elif collection_name == "predicate_registry":
-                            similar_info = predicate_registry_items.get(similar_name, {})
-                        else:
-                            similar_info = ontology_registry_items.get(similar_name, {})
-
-                        entity_cache[(collection_name, similar_name)] = {
-                            "original": similar_name,
-                            "canonical": canonical_info["canonical"],
-                            "canonical_id": None,
-                            "synonyms": canonical_info["synonyms"],
-                            "is_new": False,
-                            "label": similar_info.get("label", ""),
-                            "name_en": similar_info.get("name_en"),
-                            "attributes": similar_info.get("attributes", {}),
-                            "attributes_en": similar_info.get("attributes_en", {}),
-                        }
-                        processed_canonicals.add(similar_name)
-
-                # Upsert new canonical entities immediately
-                if canonical_info["is_new"]:
-                    # Use English name when the canonical happens to be the current entity
-                    canonical_name_en = (
-                        entity.get("name_en")
-                        if canonical_info["canonical"] == entity["name"]
-                        else None
-                    )
-                    upserted_id = self._batch_upsert_entities(
+                if not canonical_matches:
+                    # No canonical exists → this entity becomes canonical
+                    upserted_ids = self._batch_upsert_entities(
                         [{
-                            "name": canonical_info["canonical"],
-                            "name_en": canonical_name_en,
+                            "name": entity["name"],
+                            "name_en": entity.get("name_en"),
                             "label": entity.get("label", ""),
                             "attributes": entity.get("attributes", {}),
                             "attributes_en": entity.get("attributes_en", {}),
                             "is_canonical": True,
-                            "synonyms": canonical_info["synonyms"],
                         }],
                         collection_name,
                     )
-                    canonical_id = upserted_id.get(canonical_info["canonical"]) if upserted_id else None
-                    if canonical_id:
-                        # Update all cached entries that point to this canonical
-                        for cache_key, cached_entity in entity_cache.items():
-                            if (
-                                cache_key[0] == collection_name
-                                and cached_entity["canonical"] == canonical_info["canonical"]
-                            ):
-                                cached_entity["canonical_id"] = canonical_id
+                    canonical_id = upserted_ids.get(entity["name"])
+                    print(f"  New canonical: '{entity['name']}' ({canonical_id})")
+                    entity_cache[(collection_name, entity["name"])] = {
+                        "original": entity["name"],
+                        "canonical": entity["name"],
+                        "canonical_id": canonical_id,
+                        "is_new": True,
+                        "is_canonical": True,
+                        "label": entity.get("label", ""),
+                        "name_en": entity.get("name_en"),
+                        "attributes": entity.get("attributes", {}),
+                        "attributes_en": entity.get("attributes_en", {}),
+                    }
 
-                elif canonical_info.get("canonical_id"):
-                    for cache_key, cached_entity in entity_cache.items():
-                        if (
-                            cache_key[0] == collection_name
-                            and cached_entity["canonical"] == canonical_info["canonical"]
-                        ):
-                            cached_entity["canonical_id"] = canonical_info["canonical_id"]
+                else:
+                    existing_canonical = canonical_matches[0]
 
-                    # Mark existing entity as canonical if it wasn't already
-                    for match in matches:
-                        if match["id"] == canonical_info["canonical_id"]:
-                            if not match["payload"].get("is_canonical", False):
-                                try:
-                                    self.qdrant_client.set_payload(
-                                        collection_name=collection_name,
-                                        payload={
-                                            "is_canonical": True,
-                                            "synonyms": canonical_info["synonyms"],
-                                        },
-                                        points=[canonical_info["canonical_id"]],
-                                    )
-                                    print(f"  Updated entity '{canonical_info['canonical']}' to canonical")
-                                except Exception as e:
-                                    print(f"  Warning: Failed to update entity to canonical: {e}")
-                            break
+                    if collection_name == "predicate_registry":
+                        # ── Predicate-specific semantic equivalence check ──────
+                        winner = self._compare_predicate_with_llm(
+                            new_predicate=entity["name"],
+                            new_predicate_en=entity.get("name_en"),
+                            existing_canonical=existing_canonical,
+                        )
+
+                        if not winner["are_equivalent"]:
+                            # Distinct predicate — create its own canonical entry
+                            upserted_ids = self._batch_upsert_entities(
+                                [{
+                                    "name": entity["name"],
+                                    "name_en": entity.get("name_en"),
+                                    "label": entity.get("label", "predicate"),
+                                    "is_canonical": True,
+                                }],
+                                collection_name,
+                            )
+                            canonical_id = upserted_ids.get(entity["name"])
+                            print(
+                                f"  New predicate canonical (distinct from "
+                                f"'{existing_canonical['payload'].get('name')}'): "
+                                f"'{entity['name']}' ({canonical_id})"
+                            )
+                            entity_cache[(collection_name, entity["name"])] = {
+                                "original": entity["name"],
+                                "canonical": entity["name"],
+                                "canonical_id": canonical_id,
+                                "is_new": True,
+                                "is_canonical": True,
+                                "label": "predicate",
+                                "name_en": entity.get("name_en"),
+                                "attributes": {},
+                                "attributes_en": {},
+                            }
+
+                        elif not winner["new_is_canonical"]:
+                            # Equivalent — existing stays canonical; map incoming to it
+                            upserted_ids = self._batch_upsert_entities(
+                                [{
+                                    "name": entity["name"],
+                                    "name_en": entity.get("name_en"),
+                                    "label": "predicate",
+                                    "is_canonical": False,
+                                    "canonical_id": existing_canonical["id"],
+                                }],
+                                collection_name,
+                            )
+                            canonical_name = existing_canonical["payload"].get("name_en") \
+                                or existing_canonical["payload"].get("name", entity["name"])
+                            print(
+                                f"  Predicate '{entity['name']}' merged into canonical "
+                                f"'{canonical_name}'"
+                            )
+                            entity_cache[(collection_name, entity["name"])] = {
+                                "original": entity["name"],
+                                "canonical": canonical_name,
+                                "canonical_id": existing_canonical["id"],
+                                "is_new": False,
+                                "is_canonical": False,
+                                "label": "predicate",
+                                "name_en": entity.get("name_en"),
+                                "attributes": {},
+                                "attributes_en": {},
+                            }
+
+                        else:
+                            # Equivalent — new predicate is the better canonical form
+                            canonical_form = winner.get("canonical_form") or entity.get("name_en") or entity["name"]
+                            upserted_ids = self._batch_upsert_entities(
+                                [{
+                                    "name": entity["name"],
+                                    "name_en": entity.get("name_en"),
+                                    "label": "predicate",
+                                    "is_canonical": True,
+                                }],
+                                collection_name,
+                            )
+                            new_id = upserted_ids.get(entity["name"])
+                            old_id = existing_canonical["id"]
+
+                            # Demote old canonical
+                            try:
+                                self.qdrant_client.set_payload(
+                                    collection_name=collection_name,
+                                    payload={"is_canonical": False, "canonical_id": new_id},
+                                    points=[old_id],
+                                )
+                            except Exception as e:
+                                print(f"  Warning: Failed to demote old predicate canonical: {e}")
+
+                            canonical_change_log.append({
+                                "collection": collection_name,
+                                "old_canonical_id": old_id,
+                                "old_canonical_name": existing_canonical["payload"].get("name"),
+                                "new_canonical_id": new_id,
+                                "new_canonical_name": entity["name"],
+                                "reasoning": winner.get("reasoning", ""),
+                            })
+                            print(
+                                f"  Predicate canonical replaced: "
+                                f"'{existing_canonical['payload'].get('name')}' "
+                                f"({old_id}) → '{entity['name']}' ({new_id})"
+                            )
+                            entity_cache[(collection_name, entity["name"])] = {
+                                "original": entity["name"],
+                                "canonical": canonical_form,
+                                "canonical_id": new_id,
+                                "is_new": True,
+                                "is_canonical": True,
+                                "label": "predicate",
+                                "name_en": entity.get("name_en"),
+                                "attributes": {},
+                                "attributes_en": {},
+                            }
+
+                    else:
+                        # ── Entity / label registry: identity-first check ──────
+                        winner = self._compare_canonical_with_llm(
+                            new_entity=entity,
+                            existing_canonical=existing_canonical,
+                            entity_type=entity.get("label", collection_name),
+                        )
+
+                        if not winner.get("are_same_entity", True):
+                            # Distinct entities — create a new canonical for the incoming entity
+                            upserted_ids = self._batch_upsert_entities(
+                                [{
+                                    "name": entity["name"],
+                                    "name_en": entity.get("name_en"),
+                                    "label": entity.get("label", ""),
+                                    "attributes": entity.get("attributes", {}),
+                                    "attributes_en": entity.get("attributes_en", {}),
+                                    "is_canonical": True,
+                                }],
+                                collection_name,
+                            )
+                            canonical_id = upserted_ids.get(entity["name"])
+                            print(
+                                f"  New canonical (distinct from '{existing_canonical['payload'].get('name')}'): "
+                                f"'{entity['name']}' ({canonical_id})"
+                            )
+                            entity_cache[(collection_name, entity["name"])] = {
+                                "original": entity["name"],
+                                "canonical": entity["name"],
+                                "canonical_id": canonical_id,
+                                "is_new": True,
+                                "is_canonical": True,
+                                "label": entity.get("label", ""),
+                                "name_en": entity.get("name_en"),
+                                "attributes": entity.get("attributes", {}),
+                                "attributes_en": entity.get("attributes_en", {}),
+                            }
+
+                        elif not winner["new_is_canonical"]:
+                            # Same entity — old stays canonical → register new as non-canonical
+                            upserted_ids = self._batch_upsert_entities(
+                                [{
+                                    "name": entity["name"],
+                                    "name_en": entity.get("name_en"),
+                                    "label": entity.get("label", ""),
+                                    "attributes": entity.get("attributes", {}),
+                                    "attributes_en": entity.get("attributes_en", {}),
+                                    "is_canonical": False,
+                                    "canonical_id": existing_canonical["id"],
+                                }],
+                                collection_name,
+                            )
+                            print(
+                                f"  '{entity['name']}' registered under existing canonical "
+                                f"'{existing_canonical['payload'].get('name')}'"
+                            )
+                            entity_cache[(collection_name, entity["name"])] = {
+                                "original": entity["name"],
+                                "canonical": existing_canonical["payload"].get("name", entity["name"]),
+                                "canonical_id": existing_canonical["id"],
+                                "is_new": False,
+                                "is_canonical": False,
+                                "label": entity.get("label", ""),
+                                "name_en": entity.get("name_en"),
+                                "attributes": entity.get("attributes", {}),
+                                "attributes_en": entity.get("attributes_en", {}),
+                            }
+
+                        else:
+                            # Same entity — new entity becomes canonical
+                            upserted_ids = self._batch_upsert_entities(
+                                [{
+                                    "name": entity["name"],
+                                    "name_en": entity.get("name_en"),
+                                    "label": entity.get("label", ""),
+                                    "attributes": entity.get("attributes", {}),
+                                    "attributes_en": entity.get("attributes_en", {}),
+                                    "is_canonical": True,
+                                }],
+                                collection_name,
+                            )
+                            new_id = upserted_ids.get(entity["name"])
+                            old_id = existing_canonical["id"]
+
+                            # Demote old canonical
+                            try:
+                                self.qdrant_client.set_payload(
+                                    collection_name=collection_name,
+                                    payload={"is_canonical": False, "canonical_id": new_id},
+                                    points=[old_id],
+                                )
+                            except Exception as e:
+                                print(f"  Warning: Failed to demote old canonical: {e}")
+
+                            # Log the change for later refinement
+                            canonical_change_log.append({
+                                "collection": collection_name,
+                                "old_canonical_id": old_id,
+                                "old_canonical_name": existing_canonical["payload"].get("name"),
+                                "new_canonical_id": new_id,
+                                "new_canonical_name": entity["name"],
+                                "reasoning": winner.get("reasoning", ""),
+                            })
+                            print(
+                                f"  Canonical replaced: '{existing_canonical['payload'].get('name')}' "
+                                f"({old_id}) → '{entity['name']}' ({new_id})"
+                            )
+
+                            entity_cache[(collection_name, entity["name"])] = {
+                                "original": entity["name"],
+                                "canonical": entity["name"],
+                                "canonical_id": new_id,
+                                "is_new": True,
+                                "is_canonical": True,
+                                "label": entity.get("label", ""),
+                                "name_en": entity.get("name_en"),
+                                "attributes": entity.get("attributes", {}),
+                                "attributes_en": entity.get("attributes_en", {}),
+                            }
 
         # ── Build refined triples ──────────────────────────────────────────────
         refined_chunks = []
@@ -1028,7 +1345,6 @@ Analyze the entities and return the canonical form in JSON format:"""
                     "original": subj_raw["name"],
                     "canonical": subj_raw["name"],
                     "canonical_id": None,
-                    "synonyms": [],
                     "is_new": True,
                     "label": subj_raw.get("label", ""),
                     "name_en": subj_raw.get("name_en"),
@@ -1042,7 +1358,6 @@ Analyze the entities and return the canonical form in JSON format:"""
                     "original": triple["predicate"],
                     "canonical": triple["predicate"],
                     "canonical_id": None,
-                    "synonyms": [],
                     "is_new": True,
                     "label": "predicate",
                     "name_en": triple.get("predicate_en"),
@@ -1054,7 +1369,6 @@ Analyze the entities and return the canonical form in JSON format:"""
                     "original": obj_raw["name"],
                     "canonical": obj_raw["name"],
                     "canonical_id": None,
-                    "synonyms": [],
                     "is_new": True,
                     "label": obj_raw.get("label", ""),
                     "name_en": obj_raw.get("name_en"),
@@ -1064,12 +1378,11 @@ Analyze the entities and return the canonical form in JSON format:"""
 
                 # Refined object label (ontology registry)
                 obj_label_raw = obj_raw.get("label", "")
-                object_label_key = ("ontology_registry", obj_label_raw)
+                object_label_key = ("label_registry", obj_label_raw)
                 refined_object_label = entity_cache.get(object_label_key, {
                     "original": obj_label_raw,
                     "canonical": obj_label_raw,
                     "canonical_id": None,
-                    "synonyms": [],
                     "is_new": True,
                     "label": "label",
                 })
@@ -1147,6 +1460,7 @@ Analyze the entities and return the canonical form in JSON format:"""
             "llm_provider": self.llm_provider,
             "llm_model": self.llm_model,
             "refinement_applied": True,
+            "canonical_change_log": canonical_change_log,
             "chunks": refined_chunks,
         }
 
@@ -1185,6 +1499,7 @@ def refine_triples_from_file(
     qdrant_api_key: Optional[str] = None,
     llm_provider: str = "openai",
     llm_model: str = "gpt-4o-mini",
+    similarity_threshold: float = 0.85,
 ) -> str:
     """Refine triples from a JSON file using Qdrant.
 
@@ -1195,6 +1510,7 @@ def refine_triples_from_file(
         qdrant_api_key: Qdrant API key
         llm_provider: LLM provider for canonical comparison
         llm_model: Model for LLM analysis
+        similarity_threshold: Cosine similarity threshold for entity matching (0.0-1.0)
 
     Returns:
         Path to saved refined triples file
@@ -1211,6 +1527,7 @@ def refine_triples_from_file(
         qdrant_api_key=qdrant_api_key,
         llm_provider=llm_provider,
         llm_model=llm_model,
+        similarity_threshold=similarity_threshold,
     )
 
     # Refine triples

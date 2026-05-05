@@ -51,7 +51,7 @@ class SemanticChunker:
 
     def __init__(
         self,
-        similarity_threshold: float = 0.5,
+        chunk_granularity: float = 0.5,
         llm_provider: str = "openai",
         llm_model: str = "gpt-4o-mini",
         max_retries: int = 3,
@@ -60,13 +60,13 @@ class SemanticChunker:
         """Initialize the semantic chunker.
 
         Args:
-            similarity_threshold: Threshold for detecting topic changes (0.0-1.0)
+            chunk_granularity: Threshold for detecting topic changes (0.0-1.0)
             llm_provider: LLM provider to use (openai, groq, nvidia, openrouter)
             llm_model: Model to use for LLM analysis
             max_retries: Maximum number of retry attempts for API calls
             enable_fallback: Enable fallback to simple chunking if LLM fails
         """
-        self.similarity_threshold = similarity_threshold
+        self.chunk_granularity = chunk_granularity
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.max_retries = max_retries
@@ -458,7 +458,7 @@ class SemanticChunker:
         base_prompt = create_chunking_prompt(
             content=content,
             file_path=file_path,
-            similarity_threshold=self.similarity_threshold,
+            chunk_granularity=self.chunk_granularity,
         )
 
         # Add context and section information
@@ -795,7 +795,7 @@ class SemanticChunker:
             "total_chunks": len(chunks),
             "processing_metadata": {
                 "method": "sliding_window",
-                "similarity_threshold": self.similarity_threshold,
+                "chunk_granularity": self.chunk_granularity,
                 "llm_provider": self.llm_provider,
                 "llm_model": self.llm_model,
                 "context_limit": self.context_limit,
@@ -826,7 +826,7 @@ class SemanticChunker:
 
 def chunk_markdown_file(
     file_path: str,
-    similarity_threshold: float = 0.5,
+    chunk_granularity: float = 0.5,
     llm_provider: str = "openai",
     llm_model: str = "gpt-4o-mini",
     output_dir: str = None,
@@ -837,7 +837,7 @@ def chunk_markdown_file(
 
     Args:
         file_path: Path to the markdown file to chunk
-        similarity_threshold: Threshold for detecting topic changes (0.0-1.0)
+        chunk_granularity: Threshold for detecting topic changes (0.0-1.0)
         llm_provider: LLM provider to use
         llm_model: Model to use for LLM analysis
         output_dir: Directory to save chunks (default: project root/output)
@@ -858,7 +858,7 @@ def chunk_markdown_file(
 
     # Create chunker with enhanced configuration
     chunker = SemanticChunker(
-        similarity_threshold=similarity_threshold,
+        chunk_granularity=chunk_granularity,
         llm_provider=llm_provider,
         llm_model=llm_model,
         max_retries=max_retries,
