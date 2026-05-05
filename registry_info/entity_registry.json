@@ -1,6 +1,7 @@
 {
-  "collection_name": "entity_registry",
+  "collection_name": "ci_entity_registry",
   "description": "Entity registry for subject and object entities",
+  "triple_role": "entity",
   "vector_name": "entity",
   "vector_name_en": "entity_en",
   "vector_name_th": "entity_th",

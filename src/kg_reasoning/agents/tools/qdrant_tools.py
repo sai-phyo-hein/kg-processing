@@ -39,9 +39,32 @@ class QdrantToolsManager:
             api_key=self.qdrant_api_key,
         )
 
-        # Load registry specs
+        # Load registry specs from JSON files
         project_root = Path(__file__).parent.parent.parent.parent.parent
         self.registry_info_dir = project_root / "registry_info"
+        self._registry_specs = self._load_registry_specs()
+
+    def _load_registry_specs(self) -> Dict[str, Dict[str, Any]]:
+        """Load collection names and vector names from registry_info JSON files.
+
+        Returns:
+            Dict mapping registry key to its spec (collection_name, vector_names).
+        """
+        specs = {}
+        for registry_key in ("entity_registry", "predicate_registry", "metadata_registry"):
+            spec_file = self.registry_info_dir / f"{registry_key}.json"
+            with open(spec_file) as f:
+                data = json.load(f)
+            vector_names = [
+                data[key]
+                for key in ("vector_name", "vector_name_en", "vector_name_th")
+                if data.get(key)
+            ]
+            specs[registry_key] = {
+                "collection_name": data["collection_name"],
+                "vector_names": vector_names,
+            }
+        return specs
 
     def _get_embeddings(self, texts: List[str]) -> List[List[float]]:
         """Get embeddings for texts using OpenAI.
@@ -89,24 +112,33 @@ class QdrantToolsManager:
 
         for entity_name, embedding in zip(entity_names, embeddings):
             try:
-                # Query Qdrant
-                search_results = self.client.query_points(
-                    collection_name="entity_registry",
-                    query=embedding,
-                    using="entity",
-                    limit=limit,
-                    with_payload=True,
-                )
+                spec = self._registry_specs["entity_registry"]
+                seen: Dict[str, float] = {}  # canonical_id -> best score
+                points_by_id: Dict[str, Any] = {}
 
-                for point in search_results.points:
-                    if point.score >= threshold:
-                        results.append({
-                            "query": entity_name,
-                            "canonical_id": point.payload.get("canonical_id"),
-                            "name": point.payload.get("name"),
-                            "score": point.score,
-                            "metadata": point.payload,
-                        })
+                for vector_name in spec["vector_names"]:
+                    search_results = self.client.query_points(
+                        collection_name=spec["collection_name"],
+                        query=embedding,
+                        using=vector_name,
+                        limit=limit,
+                        with_payload=True,
+                    )
+                    for point in search_results.points:
+                        if point.score >= threshold:
+                            cid = point.payload.get("canonical_id") or str(point.id)
+                            if cid not in seen or point.score > seen[cid]:
+                                seen[cid] = point.score
+                                points_by_id[cid] = point
+
+                for point in points_by_id.values():
+                    results.append({
+                        "query": entity_name,
+                        "canonical_id": point.payload.get("canonical_id") or str(point.id),
+                        "name": point.payload.get("name"),
+                        "score": point.score,
+                        "metadata": point.payload,
+                    })
             except Exception as e:
                 print(f"Warning: Failed to query entity '{entity_name}': {e}")
 
@@ -135,24 +167,33 @@ class QdrantToolsManager:
 
         for predicate_name, embedding in zip(predicate_names, embeddings):
             try:
-                # Query Qdrant
-                search_results = self.client.query_points(
-                    collection_name="predicate_registry",
-                    query=embedding,
-                    using="predicate",
-                    limit=limit,
-                    with_payload=True,
-                )
+                spec = self._registry_specs["predicate_registry"]
+                seen: Dict[str, float] = {}  # canonical_id -> best score
+                points_by_id: Dict[str, Any] = {}
 
-                for point in search_results.points:
-                    if point.score >= threshold:
-                        results.append({
-                            "query": predicate_name,
-                            "canonical_id": point.payload.get("canonical_id"),
-                            "name": point.payload.get("name"),
-                            "score": point.score,
-                            "metadata": point.payload,
-                        })
+                for vector_name in spec["vector_names"]:
+                    search_results = self.client.query_points(
+                        collection_name=spec["collection_name"],
+                        query=embedding,
+                        using=vector_name,
+                        limit=limit,
+                        with_payload=True,
+                    )
+                    for point in search_results.points:
+                        if point.score >= threshold:
+                            cid = point.payload.get("canonical_id") or str(point.id)
+                            if cid not in seen or point.score > seen[cid]:
+                                seen[cid] = point.score
+                                points_by_id[cid] = point
+
+                for point in points_by_id.values():
+                    results.append({
+                        "query": predicate_name,
+                        "canonical_id": point.payload.get("canonical_id") or str(point.id),
+                        "name": point.payload.get("name"),
+                        "score": point.score,
+                        "metadata": point.payload,
+                    })
             except Exception as e:
                 print(f"Warning: Failed to query predicate '{predicate_name}': {e}")
 
@@ -171,14 +212,14 @@ class QdrantToolsManager:
             List of community metadata entries
         """
         try:
+            spec = self._registry_specs["metadata_registry"]
             if community_ids:
-                # Scroll through collection and filter by community_id
                 results = []
                 offset = None
 
                 while True:
                     scroll_result = self.client.scroll(
-                        collection_name="metadata_registry",
+                        collection_name=spec["collection_name"],
                         limit=100,
                         offset=offset,
                         with_payload=True,
@@ -201,13 +242,12 @@ class QdrantToolsManager:
 
                 return results
             else:
-                # Get all metadata entries
                 results = []
                 offset = None
 
                 while len(results) < limit:
                     scroll_result = self.client.scroll(
-                        collection_name="metadata_registry",
+                        collection_name=spec["collection_name"],
                         limit=min(100, limit - len(results)),
                         offset=offset,
                         with_payload=True,

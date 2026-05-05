@@ -84,7 +84,7 @@ class MarkdownToolsManager:
             for i, result in enumerate(results, 1):
                 lines.append(f"### Result {i}\n")
                 lines.append("```json")
-                lines.append(json.dumps(result, indent=2))
+                lines.append(json.dumps(result, indent=2, ensure_ascii=False))
                 lines.append("```\n")
 
         # Write to file
@@ -93,11 +93,18 @@ class MarkdownToolsManager:
 
         return str(filepath)
 
-    def read_query_results(self, filepath: Optional[str] = None) -> str:
+    def read_query_results(
+        self,
+        filepath: Optional[str] = None,
+        max_chars_per_file: int = 8000,
+        max_total_chars: int = 40000,
+    ) -> str:
         """Read query results from markdown file(s).
 
         Args:
             filepath: Optional specific file path to read (if None, reads all recent files)
+            max_chars_per_file: Maximum characters to read per file (avoids oversized context)
+            max_total_chars: Maximum total characters across all files
 
         Returns:
             Markdown content from file(s)
@@ -109,7 +116,10 @@ class MarkdownToolsManager:
                 return f"Error: File not found: {filepath}"
 
             with open(path, "r", encoding="utf-8") as f:
-                return f.read()
+                content = f.read()
+            if len(content) > max_chars_per_file:
+                content = content[:max_chars_per_file] + "\n\n*[Content truncated for length]*"
+            return content
         else:
             # Read all markdown files in output directory
             md_files = sorted(self.output_dir.glob("*.md"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -117,12 +127,23 @@ class MarkdownToolsManager:
             if not md_files:
                 return "No query result files found."
 
-            # Combine recent files (up to 10)
+            # Combine recent files (up to 10), respecting size limits
             combined = []
+            total_chars = 0
             for md_file in md_files[:10]:
-                combined.append(f"\n---\n## File: {md_file.name}\n---\n")
+                if total_chars >= max_total_chars:
+                    combined.append(f"\n*[Remaining files omitted — size limit reached]*\n")
+                    break
+                header = f"\n---\n## File: {md_file.name}\n---\n"
                 with open(md_file, "r", encoding="utf-8") as f:
-                    combined.append(f.read())
+                    content = f.read()
+                if len(content) > max_chars_per_file:
+                    content = content[:max_chars_per_file] + "\n\n*[Content truncated for length]*"
+                remaining = max_total_chars - total_chars
+                if len(content) > remaining:
+                    content = content[:remaining] + "\n\n*[Content truncated for length]*"
+                combined.append(header + content)
+                total_chars += len(header) + len(content)
 
             return "\n".join(combined)
 

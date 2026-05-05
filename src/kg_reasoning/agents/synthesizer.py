@@ -37,7 +37,11 @@ SYNTHESIZER_SYSTEM_PROMPT = """You are a Knowledge Answer Synthesizer. Your job 
 - **Answer**: A thorough paragraph (3–5 sentences) that directly and fully answers the question — not just a summary statement, but an explanation of the underlying drivers, relationships, and significance.
 - **Details**: Supporting facts and context in natural prose or a simple bullet list.
 
-Do not include sections titled "Limitations", "Data Sources", "Strategies", "Confidence Level", or any other technical meta-section."""
+Do not include sections titled "Limitations", "Data Sources", "Strategies", "Confidence Level", or any other technical meta-section.
+
+## Language Rule
+
+**Always respond in the same language as the user's question.** If the question is in Thai, answer entirely in Thai. If in English, answer in English. Do not switch languages."""
 
 
 class SynthesizerAgent:

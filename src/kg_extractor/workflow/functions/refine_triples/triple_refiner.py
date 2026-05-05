@@ -1,45 +1,33 @@
 """Triple refinement module for entity resolution using Qdrant.
 
-Bilingual architecture
------------------------
-Every point in Qdrant carries **two named dense vectors** whose names are
+Single-vector architecture
+--------------------------
+Every point in Qdrant carries **one named dense vector** whose name is
 derived from the collection's ``vector_name`` field in its registry spec JSON:
 
-  • ``{vector_name}_en``  – OpenAI embedding of the English form (``name_en``
-                            when present, otherwise ``name``).  This is the
-                            *canonical* vector used for all graph operations.
-  • ``{vector_name}_th``  – OpenAI embedding of the original Thai form
-                            (``name``). Only stored when the source text is
-                            actually Thai, i.e. ``name_en`` is present and
-                            differs from ``name``.
+  • ``{vector_name}``  – OpenAI embedding of the entity label (English).
 
 Per-collection vector names (from registry spec JSON files):
-  entity_registry    → entity_en  / entity_th    (sparse: entity_vector)
-  predicate_registry → predicate_en / predicate_th (sparse: predicate_vector)
-  label_registry     → label_en   / label_th     (sparse: label_vector)
-  metadata_registry  → metadata_en / metadata_th  (sparse: metadata_vector)
+  entity_registry    → entity    (sparse: entity_vector)
+  predicate_registry → predicate (sparse: predicate_vector)
+  label_registry     → label     (sparse: label_vector)
 
-All Qdrant *queries* that drive entity resolution use the ``_en`` vector so
-the knowledge graph stays fully English.  ``_th`` is stored for provenance
-and Thai-language lookup from application layers.
+All labels, entity names, and predicates are in English.  Qdrant queries
+use the single vector per collection for entity resolution.
 
 Point UUID
 ----------
-Derived deterministically from the **English** label (``name_en or name``)
-so that the same real-world concept always maps to the same Qdrant point,
-regardless of how many Thai surface forms refer to it.
+Derived deterministically from the entity name so that the same real-world
+concept always maps to the same Qdrant point.
 
 Payload schema
 --------------
-    name         – original surface form (Thai or English)
-    name_en      – English canonical label (when translation is present)
+    name         – entity label / surface form (English)
     label        – semantic PascalCase ontology label
     type         – alias for label (backward-compat)
     is_canonical – bool; True  = this point IS the canonical entry
     canonical_id – UUID of the canonical point (when is_canonical=False)
-    has_thai     – bool; True  = the _th vector is populated
-    attributes   – free-form dict, original language
-    attributes_en– free-form dict, English
+    attributes   – free-form dict
 """
 
 import json
@@ -47,14 +35,13 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Suffix convention – appended to each collection's own vector_name
+# Constants
 # ---------------------------------------------------------------------------
-_EN_SUFFIX = "_en"   # e.g. "entity_en", "predicate_en", "label_en"
-_TH_SUFFIX = "_th"   # e.g. "entity_th", "predicate_th", "label_th"
 VECTOR_SIZE = 1536
 
 
@@ -127,49 +114,63 @@ class TripleRefiner:
     # ------------------------------------------------------------------
 
     def _load_registry_specs(self) -> Dict[str, Dict[str, Any]]:
-        """Load registry specifications from JSON files.
+        """Load registry specifications by scanning the registry_info directory.
+
+        Every ``*.json`` file in the directory defines one registry.  The file
+        stem (e.g. ``entity_registry``) becomes the internal *spec key* used
+        throughout the code; the ``collection_name`` field inside the file is
+        the actual Qdrant collection name.
 
         Recognised spec fields (all defined in the registry JSON files):
+          collection_name    – actual Qdrant collection name (defaults to file stem)
+          triple_role        – which part of a triple this registry handles:
+                               ``"entity"``, ``"predicate"``, ``"label"``, or ``"metadata"``
           vector_name        – base name; ``_en`` / ``_th`` suffixes are added
                                to form the two named dense vectors per collection
           sparse_vector_name – name of the sparse vector index (kept as-is)
           vector_config      – size, distance, hnsw_config, datatype, on_disk
         """
-        collections = [
-            "entity_registry",
-            "predicate_registry",
-            "label_registry",
-            "metadata_registry",
-        ]
-        # Per-collection defaults when no spec file is found
-        _defaults: Dict[str, Dict[str, str]] = {
-            "entity_registry":    {"vector_name": "entity",    "sparse_vector_name": "entity_vector"},
-            "predicate_registry": {"vector_name": "predicate", "sparse_vector_name": "predicate_vector"},
-            "label_registry":     {"vector_name": "label",     "sparse_vector_name": "label_vector"},
-            "metadata_registry":  {"vector_name": "metadata",  "sparse_vector_name": "metadata_vector"},
-        }
-
         specs: Dict[str, Dict[str, Any]] = {}
-        for collection_name in collections:
-            spec_file = self.registry_info_dir / f"{collection_name}.json"
-            if spec_file.exists():
-                with open(spec_file, "r") as f:
-                    specs[collection_name] = json.load(f)
-            else:
-                print(f"Warning: Specification file not found: {spec_file}")
-                dfl = _defaults.get(collection_name, {})
-                specs[collection_name] = {
-                    "collection_name": collection_name,
-                    "vector_name": dfl.get("vector_name", "entity"),
-                    "sparse_vector_name": dfl.get("sparse_vector_name", "entity_vector"),
-                    "vector_config": {"size": VECTOR_SIZE, "distance": "Cosine"},
-                }
+        self._role_to_spec_key: Dict[str, str] = {}
+
+        spec_files = sorted(self.registry_info_dir.glob("*.json"))
+        if not spec_files:
+            print(f"Warning: No registry spec files found in {self.registry_info_dir}")
+
+        for spec_file in spec_files:
+            spec_key = spec_file.stem  # e.g. "entity_registry"
+            with open(spec_file, "r") as f:
+                spec = json.load(f)
+            # Ensure collection_name falls back to the file stem
+            spec.setdefault("collection_name", spec_key)
+            specs[spec_key] = spec
+
+            role = spec.get("triple_role")
+            if role:
+                self._role_to_spec_key[role] = spec_key
+                print(f"Registry '{spec_key}' → role '{role}' → Qdrant '{spec['collection_name']}'")
 
         return specs
 
     # ------------------------------------------------------------------
     # Per-collection vector name helpers
     # ------------------------------------------------------------------
+
+    def _qdrant_name(self, spec_key: str) -> str:
+        """Return the actual Qdrant collection name for a spec key.
+
+        Reads ``collection_name`` from the spec JSON; falls back to the file
+        stem (spec key) itself so existing deployments keep working even if
+        the field is absent.
+
+        Args:
+            spec_key: Internal registry key, i.e. the JSON file stem
+                      (e.g. ``"entity_registry"``).
+
+        Returns:
+            Qdrant collection name (e.g. ``"ci_entity_registry"``).
+        """
+        return self.registry_specs.get(spec_key, {}).get("collection_name", spec_key)
 
     def _vector_names(self, collection_name: str) -> Tuple[str, str]:
         """Return ``(en_vector_name, th_vector_name)`` for a collection.
@@ -180,7 +181,6 @@ class TripleRefiner:
           entity_registry    → ("entity_en",    "entity_th")
           predicate_registry → ("predicate_en", "predicate_th")
           label_registry     → ("label_en",     "label_th")
-          metadata_registry  → ("metadata_en",  "metadata_th")
         """
         base = self.registry_specs.get(collection_name, {}).get("vector_name", "entity")
         return base + _EN_SUFFIX, base + _TH_SUFFIX
@@ -231,39 +231,35 @@ class TripleRefiner:
         (e.g. ``"entity"`` only), it is automatically migrated to the new
         ``"entity_en"`` / ``"entity_th"`` layout without data loss.
         """
-        collections = [
-            "entity_registry",
-            "predicate_registry",
-            "label_registry",
-            "metadata_registry",
-        ]
+        collections = list(self.registry_specs.keys())
 
-        for collection_name in collections:
-            vec_en, vec_th = self._vector_names(collection_name)
-            dual_config = self._build_dual_vector_config(collection_name)
+        for spec_key in collections:
+            qdrant_name = self._qdrant_name(spec_key)
+            vec_en, vec_th = self._vector_names(spec_key)
+            dual_config = self._build_dual_vector_config(spec_key)
 
             try:
-                info = self.qdrant_client.get_collection(collection_name)
+                info = self.qdrant_client.get_collection(qdrant_name)
                 existing_vectors = set(info.config.params.vectors.keys())
 
                 if vec_en in existing_vectors and vec_th in existing_vectors:
-                    print(f"Collection OK (dual-vector): {collection_name}  [{vec_en}, {vec_th}]")
+                    print(f"Collection OK (dual-vector): {qdrant_name}  [{vec_en}, {vec_th}]")
                 else:
                     print(
-                        f"Collection '{collection_name}' has old vector config "
+                        f"Collection '{qdrant_name}' has old vector config "
                         f"{existing_vectors} → migrating to [{vec_en}, {vec_th}]…"
                     )
-                    self._migrate_collection(collection_name, dual_config, vec_en)
+                    self._migrate_collection(qdrant_name, dual_config, vec_en)
 
             except Exception:
                 self.qdrant_client.create_collection(
-                    collection_name=collection_name,
+                    collection_name=qdrant_name,
                     vectors_config=dual_config,
                     on_disk_payload=True,
                 )
-                print(f"Created collection (dual-vector): {collection_name}  [{vec_en}, {vec_th}]")
+                print(f"Created collection (dual-vector): {qdrant_name}  [{vec_en}, {vec_th}]")
 
-            self._ensure_payload_indexes(collection_name)
+            self._ensure_payload_indexes(qdrant_name)
 
     def _migrate_collection(
         self,
@@ -342,7 +338,7 @@ class TripleRefiner:
 
         batch_size = 100
         for i in range(0, len(migrated), batch_size):
-            self.qdrant_client.upsert(
+            self._qdrant_upsert_with_retry(
                 collection_name=collection_name,
                 points=migrated[i : i + batch_size],
             )
@@ -383,44 +379,52 @@ class TripleRefiner:
     # Embedding helpers
     # ------------------------------------------------------------------
 
+    @retry(
+        retry=retry_if_exception_type(Exception),
+        wait=wait_fixed(10),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    )
     def _get_embedding(self, text: str) -> List[float]:
         """Get embedding for a single text string."""
-        try:
-            import os
-            from openai import OpenAI
+        import os
+        from openai import OpenAI
 
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            response = client.embeddings.create(
-                model="text-embedding-3-small",
-                input=text,
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            print(f"Warning: Failed to get embedding: {e}")
-            import random
-            return [random.random() for _ in range(VECTOR_SIZE)]
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text,
+        )
+        return response.data[0].embedding
 
     def _get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """Get embeddings for multiple texts in batch (max 100 per OpenAI call)."""
-        try:
-            import os
-            from openai import OpenAI
+        import os
+        from openai import OpenAI
 
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-            batch_size = 100
-            all_embeddings = []
-            for i in range(0, len(texts), batch_size):
-                batch = texts[i : i + batch_size]
-                response = client.embeddings.create(
-                    model="text-embedding-3-small",
-                    input=batch,
-                )
-                all_embeddings.extend(item.embedding for item in response.data)
-            return all_embeddings
-        except Exception as e:
-            print(f"Warning: Failed to get batch embeddings: {e}")
-            import random
-            return [[random.random() for _ in range(VECTOR_SIZE)] for _ in texts]
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        batch_size = 100
+        all_embeddings = []
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            all_embeddings.extend(
+                self._get_embeddings_batch_chunk(client, batch)
+            )
+        return all_embeddings
+
+    @retry(
+        retry=retry_if_exception_type(Exception),
+        wait=wait_fixed(10),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    )
+    def _get_embeddings_batch_chunk(self, client: Any, batch: List[str]) -> List[List[float]]:
+        """Fetch embeddings for a single chunk of up to 100 texts, with retry."""
+        response = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=batch,
+        )
+        return [item.embedding for item in response.data]
 
     # ------------------------------------------------------------------
     # Qdrant query helpers
@@ -451,7 +455,7 @@ class TripleRefiner:
             vec_en, _ = self._vector_names(collection_name)  # e.g. "entity_en"
 
             search_results = self.qdrant_client.query_points(
-                collection_name=collection_name,
+                collection_name=self._qdrant_name(collection_name),
                 query=query_vector,
                 using=vec_en,             # always search in English space
                 limit=limit,
@@ -500,7 +504,7 @@ class TripleRefiner:
             vector_name = vec_en if lang == "en" else vec_th
 
             search_results = self.qdrant_client.query_points(
-                collection_name=collection_name,
+                collection_name=self._qdrant_name(collection_name),
                 query=query_vector,
                 using=vector_name,
                 limit=limit,
@@ -519,6 +523,16 @@ class TripleRefiner:
     # ------------------------------------------------------------------
     # Upsert helpers
     # ------------------------------------------------------------------
+
+    @retry(
+        retry=retry_if_exception_type(Exception),
+        wait=wait_fixed(10),
+        stop=stop_after_attempt(3),
+        reraise=True,
+    )
+    def _qdrant_upsert_with_retry(self, collection_name: str, points: list) -> None:
+        """Upsert points to Qdrant with automatic retry on transient errors."""
+        self.qdrant_client.upsert(collection_name=collection_name, points=points)
 
     def _batch_upsert_entities(
         self,
@@ -589,16 +603,23 @@ class TripleRefiner:
 
                 # Payload
                 label = entity.get("label") or entity.get("type", "")
+                is_canonical = entity.get("is_canonical", True)
                 payload: Dict[str, Any] = {
                     "name": name,
-                    "is_canonical": entity.get("is_canonical", True),
+                    "is_canonical": is_canonical,
                     "has_thai": has_thai,
                     "label": label,
                     "type": label,       # backward-compat alias
                 }
                 if name_en:
                     payload["name_en"] = name_en
-                if entity.get("canonical_id") is not None:
+                if has_thai:
+                    payload["name_th"] = name
+                # Canonical entities store their own point_id as canonical_id so
+                # every point always has a non-null canonical_id in the payload.
+                if is_canonical:
+                    payload["canonical_id"] = str(point_id)
+                elif entity.get("canonical_id") is not None:
                     payload["canonical_id"] = entity["canonical_id"]
                 if entity.get("attributes"):
                     payload["attributes"] = entity["attributes"]
@@ -609,8 +630,8 @@ class TripleRefiner:
                     qm.PointStruct(id=point_id, vector=vectors, payload=payload)
                 )
 
-            self.qdrant_client.upsert(
-                collection_name=collection_name,
+            self._qdrant_upsert_with_retry(
+                collection_name=self._qdrant_name(collection_name),
                 points=points,
             )
 
@@ -621,7 +642,7 @@ class TripleRefiner:
             }
 
         except Exception as e:
-            print(f"Error: Failed to batch upsert to '{collection_name}': {e}")
+            print(f"Error: Failed to batch upsert to '{collection_name}' after retries: {e}")
             print(f"  Entities: {[e['name'] for e in entities]}")
             raise
 
@@ -949,9 +970,16 @@ Return only valid JSON:"""
         self._ensure_collections_exist()
 
         # ── Collect unique entities preserving full metadata ──────────────────
-        entity_registry_items: Dict[str, Dict[str, Any]] = {}
-        predicate_registry_items: Dict[str, Dict[str, Any]] = {}
-        label_registry_items: Dict[str, Dict[str, Any]] = {}
+        # Buckets are keyed by spec_key, driven by triple_role in registry JSON.
+        entity_spec     = self._role_to_spec_key.get("entity",    "entity_registry")
+        predicate_spec  = self._role_to_spec_key.get("predicate", "predicate_registry")
+        label_spec      = self._role_to_spec_key.get("label",     "label_registry")
+
+        registry_items: Dict[str, Dict[str, Dict[str, Any]]] = {
+            entity_spec:    {},
+            predicate_spec: {},
+            label_spec:     {},
+        }
 
         for chunk_data in triples_data.get("chunks", []):
             for triple in chunk_data.get("triples", []):
@@ -960,8 +988,8 @@ Return only valid JSON:"""
 
                 # Subject
                 subj_name = subj["name"]
-                if subj_name not in entity_registry_items:
-                    entity_registry_items[subj_name] = {
+                if subj_name not in registry_items[entity_spec]:
+                    registry_items[entity_spec][subj_name] = {
                         "name": subj_name,
                         "name_en": subj.get("name_en"),
                         "label": subj.get("label", ""),
@@ -972,8 +1000,8 @@ Return only valid JSON:"""
                 # Predicate
                 pred = triple["predicate"]
                 pred_en = triple.get("predicate_en")
-                if pred not in predicate_registry_items:
-                    predicate_registry_items[pred] = {
+                if pred not in registry_items[predicate_spec]:
+                    registry_items[predicate_spec][pred] = {
                         "name": pred,
                         "name_en": pred_en,
                         "label": "predicate",
@@ -981,8 +1009,8 @@ Return only valid JSON:"""
 
                 # Object
                 obj_name = obj["name"]
-                if obj_name not in entity_registry_items:
-                    entity_registry_items[obj_name] = {
+                if obj_name not in registry_items[entity_spec]:
+                    registry_items[entity_spec][obj_name] = {
                         "name": obj_name,
                         "name_en": obj.get("name_en"),
                         "label": obj.get("label", ""),
@@ -992,8 +1020,8 @@ Return only valid JSON:"""
 
                 # Ontology labels (already English PascalCase)
                 for lbl in (subj.get("label", ""), obj.get("label", "")):
-                    if lbl and lbl not in label_registry_items:
-                        label_registry_items[lbl] = {
+                    if lbl and lbl not in registry_items[label_spec]:
+                        registry_items[label_spec][lbl] = {
                             "name": lbl,
                             "name_en": lbl,
                             "label": "label",
@@ -1004,9 +1032,8 @@ Return only valid JSON:"""
         canonical_change_log: List[Dict[str, Any]] = []
 
         collections = {
-            "entity_registry": list(entity_registry_items.values()),
-            "predicate_registry": list(predicate_registry_items.values()),
-            "label_registry": list(label_registry_items.values()),
+            spec_key: list(items.values())
+            for spec_key, items in registry_items.items()
         }
 
         for collection_name, entity_list in collections.items():
@@ -1053,7 +1080,7 @@ Return only valid JSON:"""
                 else:
                     existing_canonical = canonical_matches[0]
 
-                    if collection_name == "predicate_registry":
+                    if collection_name == predicate_spec:
                         self._handle_predicate_match(
                             entity, existing_canonical,
                             collection_name, entity_cache, canonical_change_log,
@@ -1326,7 +1353,11 @@ Return only valid JSON:"""
                 obj_raw = triple["object"]
 
                 # Pull from cache; fall back to raw values if a cache miss occurs
-                subject_key = ("entity_registry", subj_raw["name"])
+                _entity_spec    = self._role_to_spec_key.get("entity",    "entity_registry")
+                _predicate_spec = self._role_to_spec_key.get("predicate", "predicate_registry")
+                _label_spec     = self._role_to_spec_key.get("label",     "label_registry")
+
+                subject_key = (_entity_spec, subj_raw["name"])
                 refined_subject = entity_cache.get(subject_key, {
                     "original": subj_raw["name"],
                     "canonical": subj_raw.get("name_en") or subj_raw["name"],
@@ -1338,7 +1369,7 @@ Return only valid JSON:"""
                     "attributes_en": subj_raw.get("attributes_en", {}),
                 })
 
-                predicate_key = ("predicate_registry", triple["predicate"])
+                predicate_key = (_predicate_spec, triple["predicate"])
                 refined_predicate = entity_cache.get(predicate_key, {
                     "original": triple["predicate"],
                     "canonical": triple.get("predicate_en") or triple["predicate"],
@@ -1348,7 +1379,7 @@ Return only valid JSON:"""
                     "name_en": triple.get("predicate_en"),
                 })
 
-                object_key = ("entity_registry", obj_raw["name"])
+                object_key = (_entity_spec, obj_raw["name"])
                 refined_object = entity_cache.get(object_key, {
                     "original": obj_raw["name"],
                     "canonical": obj_raw.get("name_en") or obj_raw["name"],
@@ -1361,7 +1392,7 @@ Return only valid JSON:"""
                 })
 
                 obj_label_raw = obj_raw.get("label", "")
-                object_label_key = ("label_registry", obj_label_raw)
+                object_label_key = (_label_spec, obj_label_raw)
                 refined_object_label = entity_cache.get(object_label_key, {
                     "original": obj_label_raw,
                     "canonical": obj_label_raw,

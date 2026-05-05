@@ -1,6 +1,7 @@
 {
-  "collection_name": "metadata_registry",
+  "collection_name": "ci_metadata_registry",
   "description": "Metadata registry for document metadata storage and retrieval",
+  "triple_role": "metadata",
   "sparse_vector_name": "metadata_vector",
   "vector_config": {
     "datatype": "float32",

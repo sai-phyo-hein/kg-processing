@@ -56,6 +56,7 @@ def orchestrator_node(state: MultiAgentState) -> MultiAgentState:
         print(f"   - Entities found: {len(state['entities_found'])}")
         print(f"   - Predicates found: {len(state['predicates_found'])}")
         print(f"   - Communities identified: {len(state['communities_identified'])}")
+        print(f"   - Resolution method: {state.get('resolution_method', 'unknown')}")
         print(f"   - Strategies planned: {len(state['strategies'])}")
 
         for i, strategy in enumerate(state["strategies"], 1):
@@ -325,7 +326,7 @@ def run_multi_agent_workflow(
     print("📊 WORKFLOW SUMMARY")
     print("=" * 60)
     print(f"Status: {final_state.get('status', 'unknown')}")
-    print(f"Execution time: {final_state.get('execution_time_seconds', 0):.2f}s")
+    print(f"Execution time: {final_state.get('execution_time_seconds') or 0:.2f}s")
     print(f"Strategies executed: {len(final_state.get('strategies', []))}")
     print(f"Total results: {final_state.get('total_results_count', 0)}")
     print(f"Markdown files created: {len(final_state.get('markdown_files', []))}")

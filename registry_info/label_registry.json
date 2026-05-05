@@ -1,9 +1,8 @@
 {
-  "collection_name": "label_registry",
+  "collection_name": "ci_label_registry",
   "description": "Label registry for entity types",
+  "triple_role": "label",
   "vector_name": "label",
-  "vector_name_en": "label_en",
-  "vector_name_th": "label_th",
   "sparse_vector_name": "label_vector",
   "vector_config": {
     "datatype": "float32",

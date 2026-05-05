@@ -155,39 +155,81 @@ Output your final plan in this JSON format:
         messages = [HumanMessage(content=enhanced_query)]
         result = self.agent.invoke({"messages": messages})
 
-        # Extract output from messages
-        output = ""
-        intermediate_steps = []
-        
-        if "messages" in result:
-            for msg in result["messages"]:
-                if hasattr(msg, "content"):
-                    output += msg.content + "\n"
-                # Track tool calls as intermediate steps
-                if hasattr(msg, "tool_calls") and msg.tool_calls:
-                    for tool_call in msg.tool_calls:
-                        intermediate_steps.append((tool_call, None))
-
-        # Try to parse JSON from output
+        # Extract output from messages, capturing tool calls AND tool results
         import json
         import re
+        from langchain_core.messages import AIMessage, ToolMessage
 
-        # Find JSON in output
-        json_match = re.search(r'\{.*\}', output, re.DOTALL)
+        output = ""
+        intermediate_steps = []
+        pending_tool_calls: dict = {}  # tool_call_id -> tool_call
+
+        print("\n[Orchestrator Debug] ── Message trace ──────────────────────────")
+        if "messages" in result:
+            for msg in result["messages"]:
+                msg_type = type(msg).__name__
+
+                # Accumulate final text output
+                if hasattr(msg, "content") and msg.content:
+                    output += msg.content + "\n"
+
+                # AIMessage: may contain tool calls
+                if isinstance(msg, AIMessage):
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            pending_tool_calls[tc["id"]] = tc
+                            print(f"  [tool_call] {tc['name']}  args={tc['args']}")
+                    elif msg.content:
+                        # Final text response from the LLM
+                        preview = msg.content[:300].replace("\n", " ")
+                        print(f"  [ai_response] {preview}{'...' if len(msg.content) > 300 else ''}")
+
+                # ToolMessage: result returned by a tool
+                elif isinstance(msg, ToolMessage):
+                    tc = pending_tool_calls.pop(msg.tool_call_id, None)
+                    tool_name = tc["name"] if tc else msg.name or "unknown_tool"
+                    try:
+                        tool_result = json.loads(msg.content)
+                        result_count = len(tool_result) if isinstance(tool_result, list) else "non-list"
+                        print(f"  [tool_result] {tool_name} → {result_count} results")
+                        if isinstance(tool_result, list) and tool_result:
+                            for item in tool_result[:3]:
+                                print(f"    • canonical_id={item.get('canonical_id')} name={item.get('name')} score={item.get('score')}")
+                            if len(tool_result) > 3:
+                                print(f"    … and {len(tool_result) - 3} more")
+                        elif isinstance(tool_result, list):
+                            print(f"    (empty list — no matches above threshold)")
+                    except (json.JSONDecodeError, TypeError):
+                        preview = str(msg.content)[:200]
+                        print(f"  [tool_result] {tool_name} → (raw) {preview}")
+                    if tc:
+                        intermediate_steps.append((tc, msg.content))
+        print("[Orchestrator Debug] ────────────────────────────────────────────\n")
+
+        # Try to parse JSON from output
+        # Find JSON in output — handle markdown code fences (```json ... ```) first
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', output, re.DOTALL)
+        if not json_match:
+            # Fallback: bare JSON object without fences
+            json_match = re.search(r'(\{.*\})', output, re.DOTALL)
         if json_match:
             try:
-                plan = json.loads(json_match.group())
-            except json.JSONDecodeError:
-                # Fallback: create an exploratory plan seeded by top connected nodes
+                plan = json.loads(json_match.group(1))
+                plan["resolution_method"] = "matched"
+                print(f"[Orchestrator Debug] JSON parsed OK — resolution_method=matched")
+            except json.JSONDecodeError as e:
+                print(f"[Orchestrator Debug] JSON parse failed: {e} — falling back to top-connected")
                 plan = self._create_connectivity_fallback_plan()
         else:
-            # No JSON found, create basic plan from tool outputs
+            print(f"[Orchestrator Debug] No JSON block found in LLM output — using partial_match from tool steps")
             plan = self._create_basic_plan_from_steps(intermediate_steps)
 
         # Ensure we have strategies
         if "strategies" not in plan or not plan["strategies"]:
+            print(f"[Orchestrator Debug] Plan has no strategies — overriding with top-connected fallback")
             fallback = self._create_connectivity_fallback_plan()
             plan["strategies"] = fallback["strategies"]
+            plan.setdefault("resolution_method", "fallback_top_connected")
 
         # Limit to 5 strategies
         plan["strategies"] = plan["strategies"][:5]
@@ -228,6 +270,7 @@ Output your final plan in this JSON format:
             "entities_found": top_ids,
             "predicates_found": [],
             "communities_identified": [],
+            "resolution_method": "fallback_top_connected",
             "strategies": [
                 {
                     "name": "top_connected_expansion",
@@ -293,6 +336,7 @@ Output your final plan in this JSON format:
             "entities_found": list(set(entities)),
             "predicates_found": list(set(predicates)),
             "communities_identified": list(set(communities)),
+            "resolution_method": "partial_match",
             "strategies": [{
                 "name": "entity_based_query",
                 "description": "Query based on found entities and predicates",

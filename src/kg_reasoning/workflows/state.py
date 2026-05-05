@@ -39,6 +39,7 @@ class MultiAgentState(TypedDict, total=False):
     communities_identified: List[str]  # List of community IDs
     strategies: List[Dict[str, Any]]  # List of query strategies (max 5)
     orchestrator_raw_output: str  # Raw output from orchestrator
+    resolution_method: str  # How entities/predicates were resolved: "matched", "partial_match", "fallback_top_connected"
 
     # ===== Worker Outputs =====
     worker_results: List[Dict[str, Any]]  # Results from each worker
@@ -114,6 +115,7 @@ def create_initial_state(
         communities_identified=[],
         strategies=[],
         orchestrator_raw_output="",
+        resolution_method="",
         worker_results=[],
         markdown_files=[],
         total_results_count=0,
@@ -152,6 +154,7 @@ def update_state_from_orchestrator(
     state["communities_identified"] = orchestrator_output.get("communities_identified", [])
     state["strategies"] = orchestrator_output.get("strategies", [])
     state["orchestrator_raw_output"] = orchestrator_output.get("raw_output", "")
+    state["resolution_method"] = orchestrator_output.get("resolution_method", "unknown")
     state["current_step"] = "orchestrator_complete"
 
     return state

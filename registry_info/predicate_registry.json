@@ -1,6 +1,7 @@
 {
-  "collection_name": "predicate_registry",
+  "collection_name": "ci_predicate_registry",
   "description": "Predicate registry for relationship predicates",
+  "triple_role": "predicate",
   "vector_name": "predicate",
   "vector_name_en": "predicate_en",
   "vector_name_th": "predicate_th",
