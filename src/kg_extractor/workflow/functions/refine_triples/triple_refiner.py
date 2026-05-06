@@ -35,7 +35,9 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
+from kg_extractor.utils.model_setup import OPENAI_EMBEDDING_MODEL, REFINEMENT_PROVIDER, REFINEMENT_MODEL, get_embedding_client
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
 
 load_dotenv()
 
@@ -43,6 +45,10 @@ load_dotenv()
 # Constants
 # ---------------------------------------------------------------------------
 VECTOR_SIZE = 1536
+_EN_SUFFIX = "_en"
+_TH_SUFFIX = "_th"
+HIGH_CONFIDENCE_THRESHOLD = 0.95
+QUERY_BATCH_SIZE = 50
 
 
 class TripleRefiner:
@@ -52,10 +58,10 @@ class TripleRefiner:
         self,
         qdrant_url: Optional[str] = None,
         qdrant_api_key: Optional[str] = None,
-        llm_provider: str = "openai",
-        llm_model: str = "gpt-4o-mini",
+        llm_provider: str = REFINEMENT_PROVIDER,
+        llm_model: str = REFINEMENT_MODEL,
         registry_info_dir: Optional[str] = None,
-        similarity_threshold: float = 0.85,
+        similarity_threshold: float = 0.95,
     ):
         """Initialise the triple refiner.
 
@@ -79,8 +85,10 @@ class TripleRefiner:
         if registry_info_dir is None:
             project_root = Path(__file__).parent.parent.parent.parent.parent.parent
             self.registry_info_dir = project_root / "registry_info"
+            self.label_group_config_path = project_root / "configs" / "label_group_config.yaml"
         else:
             self.registry_info_dir = Path(registry_info_dir)
+            self.label_group_config_path = Path(registry_info_dir).parent / "configs" / "label_group_config.yaml"
 
         self.registry_specs = self._load_registry_specs()
 
@@ -153,218 +161,66 @@ class TripleRefiner:
         return specs
 
     # ------------------------------------------------------------------
-    # Per-collection vector name helpers
-    # ------------------------------------------------------------------
-
-    def _qdrant_name(self, spec_key: str) -> str:
-        """Return the actual Qdrant collection name for a spec key.
-
-        Reads ``collection_name`` from the spec JSON; falls back to the file
-        stem (spec key) itself so existing deployments keep working even if
-        the field is absent.
-
-        Args:
-            spec_key: Internal registry key, i.e. the JSON file stem
-                      (e.g. ``"entity_registry"``).
-
-        Returns:
-            Qdrant collection name (e.g. ``"ci_entity_registry"``).
-        """
-        return self.registry_specs.get(spec_key, {}).get("collection_name", spec_key)
-
-    def _vector_names(self, collection_name: str) -> Tuple[str, str]:
-        """Return ``(en_vector_name, th_vector_name)`` for a collection.
-
-        Derives names by appending ``_en`` / ``_th`` to the collection's
-        ``vector_name`` from its spec JSON, e.g.:
-
-          entity_registry    → ("entity_en",    "entity_th")
-          predicate_registry → ("predicate_en", "predicate_th")
-          label_registry     → ("label_en",     "label_th")
-        """
-        base = self.registry_specs.get(collection_name, {}).get("vector_name", "entity")
-        return base + _EN_SUFFIX, base + _TH_SUFFIX
-
-    def _sparse_vector_name(self, collection_name: str) -> Optional[str]:
-        """Return the sparse vector name for a collection, or None if unset."""
-        return self.registry_specs.get(collection_name, {}).get("sparse_vector_name")
-
-    # ------------------------------------------------------------------
     # Collection management
     # ------------------------------------------------------------------
 
-    def _build_dual_vector_config(
-        self,
-        collection_name: str,
-    ) -> Dict[str, Any]:
-        """Build the Qdrant vectors_config dict for a collection.
+    def _qdrant_name(self, spec_key: str) -> str:
+        """Get the Qdrant collection name for a given spec key.
+        
+        Args:
+            spec_key: The registry spec key (e.g., 'entity_registry')
+            
+        Returns:
+            The Qdrant collection name from the spec's collection_name field
+        """
+        return self.registry_specs[spec_key]["collection_name"]
+    
+    def _ensure_collections_exist(self):
+        """Ensure all required collections exist and have the required payload index.
 
-        Reads HNSW / datatype / on_disk settings from the collection's spec
-        file so each registry keeps its own tuning (e.g. entity_registry can
-        have m=24 while a future metadata_registry uses m=16).
+        Qdrant requires a payload index on any field used in a filter.
+        'is_canonical' is filtered on every canonical query, so we create a
+        bool index for it if one does not already exist.
+
+        For the label registry, we also ensure an index on ``group`` so label
+        grouping filters remain fast.
         """
         from qdrant_client.http import models as qm
 
-        spec = self.registry_specs.get(collection_name, {})
-        vcfg = spec.get("vector_config", {})
-        hnsw_raw = vcfg.get("hnsw_config", {})
-
-        vec_params = qm.VectorParams(
-            size=vcfg.get("size", VECTOR_SIZE),
-            distance=qm.Distance.COSINE,
-            hnsw_config=qm.HnswConfigDiff(
-                m=hnsw_raw.get("m", 24),
-                ef_construct=hnsw_raw.get("ef_construct", 256),
-                payload_m=hnsw_raw.get("payload_m", 24),
-            ),
-            on_disk=vcfg.get("on_disk", False),
-            datatype=qm.Datatype.FLOAT32,
-        )
-
-        vec_en, vec_th = self._vector_names(collection_name)
-        return {vec_en: vec_params, vec_th: vec_params}
-
-    def _ensure_collections_exist(self):
-        """Ensure all required collections exist in Qdrant with dual-vector config.
-
-        If a collection already exists with the old single-vector layout
-        (e.g. ``"entity"`` only), it is automatically migrated to the new
-        ``"entity_en"`` / ``"entity_th"`` layout without data loss.
-        """
         collections = list(self.registry_specs.keys())
+        label_spec = self._role_to_spec_key.get("label", "label_registry")
 
         for spec_key in collections:
             qdrant_name = self._qdrant_name(spec_key)
-            vec_en, vec_th = self._vector_names(spec_key)
-            dual_config = self._build_dual_vector_config(spec_key)
 
             try:
-                info = self.qdrant_client.get_collection(qdrant_name)
-                existing_vectors = set(info.config.params.vectors.keys())
+                self.qdrant_client.get_collection(qdrant_name)
+                print(f"Collection '{qdrant_name}' already exists.")
+            except Exception as e:
+                raise e
 
-                if vec_en in existing_vectors and vec_th in existing_vectors:
-                    print(f"Collection OK (dual-vector): {qdrant_name}  [{vec_en}, {vec_th}]")
-                else:
-                    print(
-                        f"Collection '{qdrant_name}' has old vector config "
-                        f"{existing_vectors} → migrating to [{vec_en}, {vec_th}]…"
-                    )
-                    self._migrate_collection(qdrant_name, dual_config, vec_en)
-
-            except Exception:
-                self.qdrant_client.create_collection(
-                    collection_name=qdrant_name,
-                    vectors_config=dual_config,
-                    on_disk_payload=True,
-                )
-                print(f"Created collection (dual-vector): {qdrant_name}  [{vec_en}, {vec_th}]")
-
-            self._ensure_payload_indexes(qdrant_name)
-
-    def _migrate_collection(
-        self,
-        collection_name: str,
-        dual_vector_config: Dict,
-        vec_en: str,
-    ):
-        """Migrate a single-vector collection to the dual-vector layout.
-
-        Existing points are scrolled, the collection is recreated with the
-        new dual-vector schema, and every point is re-inserted with its old
-        vector promoted to ``vec_en``.  The ``_th`` vector is intentionally
-        omitted and ``has_thai=False`` marks the point for future backfill.
-
-        Args:
-            collection_name:    Qdrant collection to migrate
-            dual_vector_config: New vectors_config dict (from _build_dual_vector_config)
-            vec_en:             Name of the English vector slot (e.g. ``"entity_en"``)
-        """
-        from qdrant_client.http import models as qm
-
-        print(f"  Fetching existing points from '{collection_name}'…")
-        all_points: List[Any] = []
-        offset = None
-        while True:
-            result, next_offset = self.qdrant_client.scroll(
-                collection_name=collection_name,
-                with_vectors=True,
-                with_payload=True,
-                limit=250,
-                offset=offset,
-            )
-            all_points.extend(result)
-            if next_offset is None:
-                break
-            offset = next_offset
-
-        print(f"  Fetched {len(all_points)} points. Recreating collection…")
-
-        self.qdrant_client.recreate_collection(
-            collection_name=collection_name,
-            vectors_config=dual_vector_config,
-            on_disk_payload=True,
-        )
-
-        if not all_points:
-            return
-
-        migrated: List[qm.PointStruct] = []
-        for pt in all_points:
-            # pt.vector may be a dict (named vectors) or a plain list (legacy unnamed)
-            if isinstance(pt.vector, dict):
-                # Try the new EN name first, then any existing named vector, then fallback
-                old_vec = (
-                    pt.vector.get(vec_en)
-                    or next(
-                        (v for k, v in pt.vector.items() if not k.endswith(_TH_SUFFIX)),
-                        None,
-                    )
-                )
-            else:
-                old_vec = pt.vector  # plain list
-
-            vectors: Dict[str, Any] = {}
-            if old_vec:
-                vectors[vec_en] = old_vec
-            # _th vector intentionally omitted — will be set on next real upsert
-
-            migrated.append(
-                qm.PointStruct(
-                    id=pt.id,
-                    vector=vectors,
-                    payload={**(pt.payload or {}), "has_thai": False},
-                )
-            )
-
-        batch_size = 100
-        for i in range(0, len(migrated), batch_size):
-            self._qdrant_upsert_with_retry(
-                collection_name=collection_name,
-                points=migrated[i : i + batch_size],
-            )
-
-        print(f"  Migration complete: {len(migrated)} points re-inserted.")
-
-    def _ensure_payload_indexes(self, collection_name: str):
-        """Create payload indexes required for filtered searches."""
-        from qdrant_client.http import models as qm
-
-        indexes = [
-            ("is_canonical", qm.PayloadSchemaType.BOOL),
-            ("has_thai",     qm.PayloadSchemaType.BOOL),
-            ("name",         qm.PayloadSchemaType.KEYWORD),
-            ("name_en",      qm.PayloadSchemaType.KEYWORD),
-            ("label",        qm.PayloadSchemaType.KEYWORD),
-        ]
-        for field_name, schema_type in indexes:
+            # Ensure payload index on is_canonical exists.
+            # create_payload_index is idempotent — safe to call every run.
             try:
                 self.qdrant_client.create_payload_index(
-                    collection_name=collection_name,
-                    field_name=field_name,
-                    field_schema=schema_type,
+                    collection_name=qdrant_name,
+                    field_name="is_canonical",
+                    field_schema=qm.PayloadSchemaType.BOOL,
                 )
-            except Exception:
-                pass  # index already exists
+                print(f"  Payload index on 'is_canonical' ensured for '{qdrant_name}'.")
+            except Exception as e:
+                print(f"  Warning: Could not create payload index on 'is_canonical' for '{qdrant_name}': {e}")
+
+            if spec_key == label_spec:
+                try:
+                    self.qdrant_client.create_payload_index(
+                        collection_name=qdrant_name,
+                        field_name="group",
+                        field_schema=qm.PayloadSchemaType.KEYWORD,
+                    )
+                    print(f"  Payload index on 'group' ensured for '{qdrant_name}'.")
+                except Exception as e:
+                    print(f"  Warning: Could not create payload index on 'group' for '{qdrant_name}': {e}")
 
     # ------------------------------------------------------------------
     # UUID helpers
@@ -375,34 +231,54 @@ class TripleRefiner:
         namespace = uuid.UUID("00000000-0000-0000-0000-000000000000")
         return str(uuid.uuid5(namespace, name))
 
+    def _vector_names(self, spec_key: str) -> Tuple[str, str]:
+        """Return the (en_vector_name, th_vector_name) for a registry spec.
+
+        Priority for the English vector name:
+          1. vector_name_en explicitly set in spec JSON
+          2. {vector_name}_en — for bilingual/dual-vector collections
+          3. vector_name base as-is — for single-vector collections (e.g. label)
+
+        A collection is single-vector when bilingual=False/absent and
+        vector_name_en is not explicitly set.
+        """
+        spec = self.registry_specs[spec_key]
+        base = spec.get("vector_name", spec_key)
+        bilingual = spec.get("bilingual", False)
+
+        if "vector_name_en" in spec:
+            vec_en = spec["vector_name_en"]
+        elif bilingual:
+            vec_en = f"{base}{_EN_SUFFIX}"
+        else:
+            # Single-vector collection: use base name as stored (e.g. "label" not "label_en")
+            vec_en = base
+
+        vec_th = spec.get("vector_name_th", f"{base}{_TH_SUFFIX}")
+        return vec_en, vec_th
+
     # ------------------------------------------------------------------
     # Embedding helpers
     # ------------------------------------------------------------------
 
     @retry(
         retry=retry_if_exception_type(Exception),
-        wait=wait_fixed(10),
-        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        stop=stop_after_attempt(5),
         reraise=True,
     )
     def _get_embedding(self, text: str) -> List[float]:
         """Get embedding for a single text string."""
-        import os
-        from openai import OpenAI
-
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = get_embedding_client()
         response = client.embeddings.create(
-            model="text-embedding-3-small",
+            model=OPENAI_EMBEDDING_MODEL,
             input=text,
         )
         return response.data[0].embedding
 
     def _get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """Get embeddings for multiple texts in batch (max 100 per OpenAI call)."""
-        import os
-        from openai import OpenAI
-
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = get_embedding_client()
         batch_size = 100
         all_embeddings = []
         for i in range(0, len(texts), batch_size):
@@ -414,14 +290,14 @@ class TripleRefiner:
 
     @retry(
         retry=retry_if_exception_type(Exception),
-        wait=wait_fixed(10),
-        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        stop=stop_after_attempt(5),
         reraise=True,
     )
     def _get_embeddings_batch_chunk(self, client: Any, batch: List[str]) -> List[List[float]]:
         """Fetch embeddings for a single chunk of up to 100 texts, with retry."""
         response = client.embeddings.create(
-            model="text-embedding-3-small",
+            model=OPENAI_EMBEDDING_MODEL,
             input=batch,
         )
         return [item.embedding for item in response.data]
@@ -480,6 +356,77 @@ class TripleRefiner:
             print(f"Warning: Failed to query Qdrant for canonicals: {e}")
             return []
 
+    def _query_qdrant_canonical_batch(
+        self,
+        collection_name: str,
+        query_vectors: List[List[float]],
+        limit: int = 1,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Batch query for canonical entities in chunks.
+
+        Args:
+            collection_name: Qdrant collection to search
+            query_vectors: List of embedding vectors
+            limit: Maximum results per query
+
+        Returns:
+            Dict mapping query_vector index to list of matches [{"id", "score", "payload"}, ...]
+        """
+        from qdrant_client.http import models as qm
+        
+        results: Dict[int, List[Dict[str, Any]]] = {}
+        vec_en, _ = self._vector_names(collection_name)
+
+        canonical_filter = qm.Filter(
+            must=[
+                qm.FieldCondition(
+                    key="is_canonical",
+                    match=qm.MatchValue(value=True),
+                )
+            ]
+        )
+
+        for i in range(0, len(query_vectors), QUERY_BATCH_SIZE):
+            chunk_end = min(i + QUERY_BATCH_SIZE, len(query_vectors))
+            chunk = query_vectors[i:chunk_end]
+
+            requests = [
+                qm.QueryRequest(
+                    query=qm.NearestQuery(nearest=vec),
+                    limit=limit,
+                    with_payload=True,
+                    score_threshold=self.similarity_threshold,
+                    filter=canonical_filter,
+                    using=vec_en,
+                )
+                for vec in chunk
+            ]
+
+            max_attempts = 4
+            wait = 5
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    self._init_qdrant_client()
+                    batch_results = self.qdrant_client.query_batch_points(
+                        collection_name=self._qdrant_name(collection_name),
+                        requests=requests,
+                    )
+                    for idx, query_response in enumerate(batch_results):
+                        results[i + idx] = [
+                            {"id": r.id, "score": r.score, "payload": r.payload}
+                            for r in query_response.points
+                        ]
+                    break
+                except Exception as e:
+                    if attempt < max_attempts:
+                        print(f"Warning: Query chunk {i // QUERY_BATCH_SIZE + 1} attempt {attempt}/{max_attempts} failed: {e}. Retrying in {wait}s...")
+                        import time; time.sleep(wait)
+                        wait = min(wait * 2, 60)
+                    else:
+                        print(f"Warning: Query chunk {i // QUERY_BATCH_SIZE + 1} failed after {max_attempts} attempts: {e}. Skipping chunk.")
+
+        return results
+
     def _query_qdrant(
         self,
         collection_name: str,
@@ -524,15 +471,42 @@ class TripleRefiner:
     # Upsert helpers
     # ------------------------------------------------------------------
 
-    @retry(
-        retry=retry_if_exception_type(Exception),
-        wait=wait_fixed(10),
-        stop=stop_after_attempt(3),
-        reraise=True,
-    )
+    def _upsert_chunk_with_retry(self, collection_name: str, chunk: list, chunk_label: str) -> None:
+        """Upsert a single chunk with per-chunk retry logic."""
+        import time
+        max_attempts = 5
+        wait = 5
+        for attempt in range(1, max_attempts + 1):
+            self._init_qdrant_client()
+            try:
+                self.qdrant_client.upload_points(collection_name=collection_name, points=chunk, wait=True)
+                return
+            except Exception as e:
+                print(f"  ⚠️  {chunk_label} failed (attempt {attempt}/{max_attempts}): {e}")
+                if attempt == max_attempts:
+                    raise
+                print(f"  ⏳ Retrying in {wait}s...")
+                time.sleep(wait)
+                wait = min(wait * 2, 60)
+
     def _qdrant_upsert_with_retry(self, collection_name: str, points: list) -> None:
-        """Upsert points to Qdrant with automatic retry on transient errors."""
-        self.qdrant_client.upsert(collection_name=collection_name, points=points)
+        """Upsert points to Qdrant in chunks with per-chunk retry.
+
+        wait=True blocks until Qdrant finishes indexing each point before returning.
+        Without this, HNSW index updates are async — a query fired immediately after
+        will not find the new point, making it appear as a new canonical on every
+        re-run of the same data.
+        """
+        import time
+        print(f"Upserting {len(points)} points to collection '{collection_name}'...")
+        chunk_size = 50
+        chunks = [points[i:i + chunk_size] for i in range(0, len(points), chunk_size)]
+        for idx, chunk in enumerate(chunks):
+            chunk_label = f"Chunk {idx + 1}/{len(chunks)} ({len(chunk)} points)"
+            print(f"  Upserting {chunk_label}...")
+            self._upsert_chunk_with_retry(collection_name, chunk, chunk_label)
+            if idx < len(chunks) - 1:
+                time.sleep(10)
 
     def _batch_upsert_entities(
         self,
@@ -550,7 +524,7 @@ class TripleRefiner:
 
         Args:
             entities: List of entity dicts.  Recognised keys:
-                        name, name_en, label, type, is_canonical, canonical_id,
+                        name, name_en, label, type, group, is_canonical, canonical_id,
                         attributes, attributes_en
             collection_name: Target Qdrant collection
 
@@ -562,6 +536,9 @@ class TripleRefiner:
 
         try:
             from qdrant_client.http import models as qm
+
+            label_spec = self._role_to_spec_key.get("label", "label_registry")
+            is_label_collection = collection_name == label_spec
 
             # ── Compute which texts need embedding ────────────────────────────
             # We always need the English embedding.
@@ -611,6 +588,8 @@ class TripleRefiner:
                     "label": label,
                     "type": label,       # backward-compat alias
                 }
+                if is_label_collection:
+                    payload["group"] = entity.get("group", "")
                 if name_en:
                     payload["name_en"] = name_en
                 if has_thai:
@@ -630,9 +609,33 @@ class TripleRefiner:
                     qm.PointStruct(id=point_id, vector=vectors, payload=payload)
                 )
 
+            # ── Skip points whose payload is already identical in Qdrant ──────
+            qdrant_name = self._qdrant_name(collection_name)
+            try:
+                existing = self.qdrant_client.retrieve(
+                    collection_name=qdrant_name,
+                    ids=[p.id for p in points],
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                existing_payloads = {r.id: r.payload for r in existing}
+            except Exception:
+                existing_payloads = {}
+
+            new_points = [
+                p for p in points
+                if p.id not in existing_payloads or existing_payloads[p.id] != p.payload
+            ]
+
+            if not new_points:
+                return {
+                    entity["name"]: self._generate_uuid(entity.get("name_en") or entity["name"])
+                    for entity in entities
+                }
+
             self._qdrant_upsert_with_retry(
-                collection_name=self._qdrant_name(collection_name),
-                points=points,
+                collection_name=qdrant_name,
+                points=new_points,
             )
 
             # Return name → point_id mapping
@@ -794,6 +797,104 @@ Return only valid JSON:"""
         response = self._get_llm_response(prompt)
         return self._parse_predicate_equivalence(response, incoming_name)
 
+    def _compare_batch_with_llm(
+        self,
+        pairs: List[Tuple[Dict[str, Any], Dict[str, Any], str]],
+        is_predicate: bool = False,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch LLM comparison for multiple entity-canonical pairs.
+
+        Args:
+            pairs: List of (entity, existing_canonical, entity_type) tuples
+            is_predicate: True for predicates, False for entities/labels
+
+        Returns:
+            Dict mapping entity["name"] → decision dict
+        """
+        results: Dict[str, Dict[str, Any]] = {}
+        
+        if not pairs:
+            return results
+
+        if is_predicate:
+            # For predicates: batch by prompts + single call
+            prompts = []
+            pair_indices = []
+            for entity, canonical, _ in pairs:
+                entity_name = entity["name"]
+                old_payload = canonical.get("payload", {})
+                existing_name = old_payload.get("name_en") or old_payload.get("name", "")
+                incoming_name = entity.get("name_en") or entity["name"]
+
+                prompt = f"""You are an expert in knowledge graph schema design and relationship normalisation.
+
+Two predicates (relationship types) have high vector similarity.  Your task:
+
+**Step 1 – Semantic equivalence check:** Decide whether these two predicates express the
+*same relationship type* in a knowledge graph.  Synonyms and near-synonyms count as
+equivalent (e.g. "increase" / "grow" / "rise" / "improve" are all equivalent; but
+"increase" and "decrease" are NOT equivalent even though they are related).
+
+**Step 2 – Canonical form selection (only when equivalent):** Choose the most standard,
+concise, and generic English verb form as the canonical predicate.  Prefer:
+- Short, common English verbs over long phrases
+- Active voice, base form (infinitive without "to")
+- Domain-neutral wording when both options work
+
+**Existing Canonical:**  {existing_name}
+  (original: {old_payload.get("name", "")})
+  ID: {canonical.get("id")}
+  Similarity score: {canonical.get("score", 0):.3f}
+
+**Incoming Predicate:**  {incoming_name}
+  (original: {entity["name"]})
+
+**Output Format (JSON):**
+```json
+{{
+  "are_equivalent": true_or_false,
+  "new_is_canonical": true_or_false,
+  "canonical_form": "chosen canonical predicate string",
+  "reasoning": "brief explanation"
+}}
+```
+
+Rules:
+- If "are_equivalent" is false → set "new_is_canonical" to true so the incoming predicate
+  gets its own canonical entry; "canonical_form" should be {incoming_name!r}.
+- If "are_equivalent" is true → set "new_is_canonical" based on which form is superior;
+  "canonical_form" must be the chosen canonical string.
+
+Return only valid JSON:"""
+
+                prompts.append(prompt)
+                pair_indices.append(entity_name)
+
+            # Batch all LLM calls
+            for entity_name, prompt in zip(pair_indices, prompts):
+                response = self._get_llm_response(prompt)
+                entity_dict = next(e for e, _, _ in pairs if e["name"] == entity_name)
+                incoming_name = entity_dict.get("name_en") or entity_dict["name"]
+                results[entity_name] = self._parse_predicate_equivalence(response, incoming_name)
+        else:
+            # For entities/labels: batch by prompts + single call
+            prompts = []
+            pair_indices = []
+            for entity, canonical, entity_type in pairs:
+                entity_name = entity["name"]
+                prompt = self._create_canonical_comparison_prompt(
+                    entity, canonical, entity_type
+                )
+                prompts.append(prompt)
+                pair_indices.append(entity_name)
+
+            # Batch all LLM calls
+            for entity_name, prompt in zip(pair_indices, prompts):
+                response = self._get_llm_response(prompt)
+                results[entity_name] = self._parse_canonical_winner(response)
+
+        return results
+
     def _parse_predicate_equivalence(
         self,
         response: str,
@@ -944,37 +1045,570 @@ Return only valid JSON:"""
             return dot / (m1 * m2) if m1 and m2 else 0.0
 
     # ------------------------------------------------------------------
-    # Core refinement pipeline
+    # Label group assignment
     # ------------------------------------------------------------------
+
+    def _load_label_group_config(self) -> Dict[str, str]:
+        """Load label group configuration from YAML file.
+        
+        Returns:
+            Dict mapping group_name → description
+        """
+        try:
+            import yaml
+            
+            if not self.label_group_config_path.exists():
+                print(f"Warning: Label group config not found at {self.label_group_config_path}")
+                return {}
+            
+            with open(self.label_group_config_path, 'r', encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            
+            return config if config else {}
+        except Exception as e:
+            print(f"Warning: Failed to load label group config: {e}")
+            return {}
+
+    def _update_label_group_config(self, new_groups: Dict[str, str]) -> None:
+        """Update label group configuration YAML file with new groups.
+        
+        Args:
+            new_groups: Dict mapping group_name → description for new groups
+        """
+        try:
+            import yaml
+            
+            print(f"📝 Updating label group config at: {self.label_group_config_path}")
+            print(f"   Adding {len(new_groups)} new group(s): {list(new_groups.keys())}")
+            
+            # Load existing config
+            existing_groups = self._load_label_group_config()
+            print(f"   Loaded {len(existing_groups)} existing groups")
+            
+            # Merge with new groups
+            existing_groups.update(new_groups)
+            print(f"   Total groups after merge: {len(existing_groups)}")
+            
+            # Write back to file
+            with open(self.label_group_config_path, 'w', encoding='utf-8') as f:
+                yaml.dump(existing_groups, f, default_flow_style=False, allow_unicode=True, sort_keys=True)
+            
+            print(f"✅ Successfully updated label group config file")
+            
+        except Exception as e:
+            import traceback
+            print(f"❌ Failed to update label group config: {e}")
+            print(f"   Traceback: {traceback.format_exc()}")
+
+    def _assign_label_groups_with_llm(self, labels: List[Dict[str, Any]]) -> Dict[str, str]:
+        """Use LLM to assign groups to labels that don't have one.
+        
+        Args:
+            labels: List of label entities (dicts with 'name' field)
+        
+        Returns:
+            Dict mapping label name → assigned group_name
+        """
+        if not labels:
+            return {}
+        
+        # Load current group config
+        group_config = self._load_label_group_config()
+        
+        if not group_config:
+            print("Warning: No label group configuration found, skipping group assignment")
+            return {label["name"]: "" for label in labels}
+        
+        # Format group config for prompt
+        group_list = "\n".join([
+            f"  - {group_name}: {description}"
+            for group_name, description in sorted(group_config.items())
+        ])
+        
+        # Format labels for prompt
+        label_list = "\n".join([f"  - {label['name']}" for label in labels])
+        
+        prompt = f"""You are an expert in knowledge graph ontology design and entity classification.
+
+You are given a list of entity labels that need to be assigned to semantic groups.
+Each group represents a high-level category in a community knowledge graph.
+
+**Available Groups:**
+{group_list}
+
+**Labels to Classify:**
+{label_list}
+
+**Task:**
+1. For each label, assign it to the most appropriate EXISTING group from the available groups above.
+2. IMPORTANT: You MUST use ONLY the existing groups listed above - DO NOT create new groups.
+3. If a label doesn't fit well into any category, assign it to 'Others'.
+4. The purpose of grouping is to CLUSTER multiple similar labels together, NOT to create unique tags.
+5. Use the BROADEST matching group - avoid trying to create more specific subcategories.
+
+**Output Format (JSON):**
+```json
+{{
+  "assignments": {{
+    "LabelName": "GroupName",
+    "AnotherLabel": "GroupName"
+  }}
+}}
+```
+
+**Critical Rules:**
+- Use ONLY the existing groups listed above
+- Every group name in "assignments" MUST be from the available groups list
+- Use the closest semantic match from existing groups
+- If uncertain, use 'Others'
+- Every label must have an assignment
+- Do NOT include a "new_groups" field - it will be ignored
+
+Return only valid JSON:"""
+        
+        try:
+            response = self._get_llm_response(prompt)
+            return self._parse_label_group_assignments(response, labels, group_config)
+        except Exception as e:
+            print(f"Warning: LLM group assignment failed: {e}")
+            # Fallback: return empty groups
+            return {label["name"]: "" for label in labels}
+
+    def _parse_label_group_assignments(
+        self,
+        response: str,
+        labels: List[Dict[str, Any]],
+        existing_groups: Dict[str, str],
+    ) -> Dict[str, str]:
+        """Parse LLM response for label group assignments.
+        
+        Args:
+            response: LLM JSON response
+            labels: Original label list
+            existing_groups: Existing group config
+        
+        Returns:
+            Dict mapping label name → group_name
+        """
+        try:
+            response = response.strip()
+            if response.startswith("```json"):
+                response = response[7:]
+            elif response.startswith("```"):
+                response = response[3:]
+            if response.endswith("```"):
+                response = response[:-3]
+            response = response.strip()
+            
+            data = json.loads(response)
+            assignments = data.get("assignments", {})
+            new_groups = data.get("new_groups", {})
+            
+            # Detect undeclared new groups: groups used in assignments but not in existing config or new_groups
+            all_existing_groups = set(existing_groups.keys())
+            all_declared_new = set(new_groups.keys())
+            groups_in_use = set(assignments.values())
+            
+            # Find groups that are used but not declared
+            undeclared_groups = groups_in_use - all_existing_groups - all_declared_new
+            
+            if undeclared_groups:
+                print(f"⚠️  LLM used {len(undeclared_groups)} undeclared group(s): {sorted(undeclared_groups)}")
+                print("   These groups were assigned but not declared in 'new_groups' field")
+                
+                # Count labels per undeclared group
+                undeclared_counts = {g: 0 for g in undeclared_groups}
+                for group in assignments.values():
+                    if group in undeclared_groups:
+                        undeclared_counts[group] += 1
+                
+                # Add undeclared groups to new_groups with auto-generated descriptions
+                for group_name in undeclared_groups:
+                    count = undeclared_counts[group_name]
+                    new_groups[group_name] = f"Auto-generated group for {count} label(s)"
+                    print(f"   → {group_name}: {count} label(s)")
+            
+            # Validate new groups: each should have multiple labels (clustering purpose)
+            if new_groups:
+                # Count how many labels are assigned to each new group
+                new_group_counts = {group: 0 for group in new_groups.keys()}
+                for label_name, group in assignments.items():
+                    if group in new_group_counts:
+                        new_group_counts[group] += 1
+                
+                # Filter out singleton/doubleton groups (defeats purpose of grouping)
+                MIN_GROUP_SIZE = 3
+                valid_new_groups = {}
+                rejected_groups = {}
+                
+                for group_name, description in new_groups.items():
+                    count = new_group_counts.get(group_name, 0)
+                    if count >= MIN_GROUP_SIZE:
+                        valid_new_groups[group_name] = description
+                    else:
+                        rejected_groups[group_name] = count
+                        print(f"⚠️  Rejected new group '{group_name}' (only {count} label{'s' if count != 1 else ''}) - groups should cluster multiple labels")
+                
+                # Reassign labels from rejected groups to 'Others' fallback
+                if rejected_groups:
+                    print(f"🔄 Reassigning labels from {len(rejected_groups)} rejected group(s) to 'Others'...")
+                    
+                    # Fallback to 'Others' group for rejected labels
+                    reassignment_count = 0
+                    for label_name, assigned_group in list(assignments.items()):
+                        if assigned_group in rejected_groups:
+                            assignments[label_name] = "Others"
+                            reassignment_count += 1
+                            if reassignment_count <= 5:  # Show first 5 examples
+                                print(f"   - {label_name}: '{assigned_group}' → 'Others'")
+                    
+                    if reassignment_count > 5:
+                        print(f"   ... and {reassignment_count - 5} more reassignments")
+                
+                # Update config file only with valid new groups
+                if valid_new_groups:
+                    print(f"✅ Accepting {len(valid_new_groups)} new group(s): {list(valid_new_groups.keys())}")
+                    self._update_label_group_config(valid_new_groups)
+                else:
+                    print("ℹ️  No valid new groups to add (all had too few labels)")
+            
+            # Validate all labels have assignments
+            result = {}
+            for label in labels:
+                label_name = label["name"]
+                if label_name in assignments:
+                    result[label_name] = assignments[label_name]
+                else:
+                    print(f"Warning: No group assignment for label '{label_name}', using empty string")
+                    result[label_name] = ""
+            
+            return result
+            
+        except Exception as e:
+            print(f"Warning: Failed to parse label group assignments: {e}")
+            # Fallback: return empty groups
+            return {label["name"]: "" for label in labels}
+
+    def _dedup_within_batch(
+        self,
+        entities: List[Dict[str, Any]],
+        embeddings: List[List[float]],
+        is_predicate: bool = False,
+    ) -> Tuple[List[int], List[Tuple[int, int, float]]]:
+        """Greedy within-batch deduplication using cosine similarity.
+
+        Newly extracted entities are compared against each other *before*
+        querying Qdrant.  Without this step, two similar entities that are
+        both absent from Qdrant would each be stored as a new canonical,
+        missing an intra-batch duplicate.
+
+        Algorithm (greedy, O(n²)):
+          Iterate through entities in order.  For each entity, compute cosine
+          similarity against every already-chosen representative.  If the best
+          match exceeds ``self.similarity_threshold``, the entity becomes an
+          alias of that representative; otherwise it becomes a new representative.
+
+        Args:
+            entities:    Entity dicts in the current batch.
+            embeddings:  Corresponding English embeddings (parallel to entities).
+            is_predicate: Reserved for future LLM routing; unused today.
+
+        Returns:
+            rep_indices:  Indices (into ``entities``) of cluster representatives.
+                          Only these are sent to Qdrant.
+            alias_pairs:  List of ``(alias_idx, rep_idx, score)`` tuples for
+                          entities that are sufficiently similar to a representative
+                          and will inherit its resolved canonical.
+        """
+        n = len(entities)
+        if n <= 1:
+            return list(range(n)), []
+
+        rep_indices: List[int] = []
+        alias_pairs: List[Tuple[int, int, float]] = []
+
+        for i in range(n):
+            best_rep_idx: Optional[int] = None
+            best_score = 0.0
+            for rep_idx in rep_indices:
+                score = self._cosine_similarity(embeddings[i], embeddings[rep_idx])
+                if score >= self.similarity_threshold and score > best_score:
+                    best_score = score
+                    best_rep_idx = rep_idx
+
+            if best_rep_idx is None:
+                rep_indices.append(i)
+            else:
+                alias_pairs.append((i, best_rep_idx, best_score))
+
+        return rep_indices, alias_pairs
+
+    def _process_collection(
+        self,
+        collection_name: str,
+        entity_list: List[Dict[str, Any]],
+        is_predicate: bool,
+        is_label: bool,
+        entity_cache: Dict,
+        canonical_change_log: List,
+    ) -> None:
+        """Embed → within-batch dedup → batch-query → classify → upsert for one registry collection.
+
+        Labels are English-only (single vector).
+        Entities and predicates are bilingual (dual vector stored, English queried).
+
+        Progress is printed as a one-line summary per phase rather than per entity.
+        """
+        kind = "label" if is_label else ("predicate" if is_predicate else "entity")
+        n    = len(entity_list)
+        print(f"[{collection_name}] Processing {n} {kind}s")
+
+        # ── Step 0: Assign groups to labels without group field ──────────────
+        if is_label:
+            labels_without_group = [e for e in entity_list if not e.get("group")]
+            if labels_without_group:
+                print(f"[{collection_name}]   Found {len(labels_without_group)} labels without group, calling LLM...")
+                group_assignments = self._assign_label_groups_with_llm(labels_without_group)
+                # Update entity_list with assigned groups
+                for entity in entity_list:
+                    if entity["name"] in group_assignments:
+                        entity["group"] = group_assignments[entity["name"]]
+                print(f"[{collection_name}]   Assigned groups to {len(group_assignments)} labels")
+
+        # ── Step 1: Embed ─────────────────────────────────────────────────────
+        # Labels use name directly (already English). Entities/predicates use name_en.
+        embed_texts = [
+            e["name"] if is_label else (e.get("name_en") or e["name"])
+            for e in entity_list
+        ]
+        en_embeddings = self._get_embeddings_batch(embed_texts)
+        print(f"[{collection_name}]   Embedded {n} texts")
+
+        # ── Step 1.5: Within-batch deduplication ─────────────────────────────
+        # Compare newly extracted entities against each other so that two
+        # similar entities absent from Qdrant don't both become new canonicals.
+        rep_indices, alias_pairs = self._dedup_within_batch(
+            entity_list, en_embeddings, is_predicate
+        )
+        rep_entities   = [entity_list[i]   for i in rep_indices]
+        rep_embeddings = [en_embeddings[i] for i in rep_indices]
+        if alias_pairs:
+            alias_names = [entity_list[a]["name"] for a, _, _ in alias_pairs]
+            rep_names   = [entity_list[r]["name"] for _, r, _ in alias_pairs]
+            print(
+                f"[{collection_name}]   Within-batch dedup: "
+                f"{len(alias_pairs)} alias(es) → "
+                f"{len(rep_entities)} representative(s)"
+            )
+            for alias_idx, rep_idx, score in alias_pairs:
+                print(
+                    f"    '{entity_list[alias_idx]['name']}' "
+                    f"→ '{entity_list[rep_idx]['name']}' (score={score:.3f})"
+                )
+
+        # ── Step 2: Batch query Qdrant (representatives only) ─────────────────
+        all_matches = self._query_qdrant_canonical_batch(
+            collection_name, rep_embeddings, limit=1
+        )
+        print(f"[{collection_name}]   Queried Qdrant ({len(all_matches)} matches found)")
+
+        # ── Step 3: Classify each representative ─────────────────────────────
+        unmatched     = []          # no Qdrant match → new canonical
+        high_conf     = []          # score >= HIGH_CONFIDENCE_THRESHOLD → auto-merge
+        uncertain     = []          # ambiguous → LLM decides
+        # predicates always go to LLM regardless of score
+
+        for q_idx, entity in enumerate(rep_entities):
+            matches = all_matches.get(q_idx, [])
+            if not matches:
+                unmatched.append(entity)
+                continue
+
+            canonical_match = matches[0]
+            score = canonical_match.get("score", 0.0)
+
+            if is_predicate or score < HIGH_CONFIDENCE_THRESHOLD:
+                uncertain.append((entity, canonical_match))
+            else:
+                high_conf.append((entity, canonical_match))
+
+        print(
+            f"[{collection_name}]   Classified: "
+            f"{len(unmatched)} new | "
+            f"{len(high_conf)} auto-merge | "
+            f"{len(uncertain)} LLM"
+        )
+
+        # ── Step 4a: Upsert new canonicals (no Qdrant match) ─────────────────
+        if unmatched:
+            new_entities = [{**e, "is_canonical": True} for e in unmatched]
+            upserted_ids = self._batch_upsert_entities(new_entities, collection_name)
+            for entity in unmatched:
+                canonical_id   = upserted_ids.get(entity["name"])
+                canonical_name = entity.get("name_en") or entity["name"]
+                cache_entry    = {
+                    "original":     entity["name"],
+                    "canonical":    canonical_name,
+                    "canonical_id": canonical_id,
+                    "is_new":       True,
+                    "is_canonical": True,
+                }
+                if is_label:
+                    cache_entry["label"] = "label"
+                    cache_entry["group"] = entity.get("group", "")
+                else:
+                    cache_entry.update({
+                        "label":         "predicate" if is_predicate else entity.get("label", ""),
+                        "name_en":       entity.get("name_en"),
+                        "attributes":    {} if is_predicate else entity.get("attributes", {}),
+                        "attributes_en": {} if is_predicate else entity.get("attributes_en", {}),
+                    })
+                entity_cache[(collection_name, entity["name"])] = cache_entry
+            print(f"[{collection_name}]   Upserted {len(unmatched)} new canonicals")
+
+        # ── Step 4b: Auto-merge high-confidence matches ───────────────────────
+        if high_conf:
+            merge_entities = [
+                {**entity, "is_canonical": False, "canonical_id": canonical["id"]}
+                for entity, canonical in high_conf
+            ]
+            self._batch_upsert_entities(merge_entities, collection_name)
+            for entity, canonical in high_conf:
+                old_payload    = canonical.get("payload", {})
+                canonical_name = old_payload.get("name_en") or old_payload.get("name", entity["name"])
+                canonical_id   = old_payload.get("canonical_id", canonical["id"])
+                cache_entry    = {
+                    "original":     entity["name"],
+                    "canonical":    canonical_name,
+                    "canonical_id": canonical_id,
+                    "is_new":       False,
+                    "is_canonical": False,
+                }
+                if is_label:
+                    cache_entry["label"] = "label"
+                    cache_entry["group"] = old_payload.get("group", "")
+                else:
+                    cache_entry.update({
+                        "label":         "predicate" if is_predicate else entity.get("label", ""),
+                        "name_en":       entity.get("name_en"),
+                        "attributes":    {} if is_predicate else entity.get("attributes", {}),
+                        "attributes_en": {} if is_predicate else entity.get("attributes_en", {}),
+                    })
+                entity_cache[(collection_name, entity["name"])] = cache_entry
+            print(f"[{collection_name}]   Auto-merged {len(high_conf)} high-confidence matches")
+
+        # ── Step 4c: LLM decisions for uncertain matches ──────────────────────
+        if uncertain:
+            # Build pairs list in the format _compare_batch_with_llm expects:
+            # [(entity, canonical, entity_type_str), ...]
+            pairs = [
+                (entity, canonical, "predicate" if is_predicate else entity.get("label", ""))
+                for entity, canonical in uncertain
+            ]
+            llm_results = self._compare_batch_with_llm(pairs, is_predicate=is_predicate)
+
+            counts: Dict[str, int] = {"new": 0, "merged": 0, "replaced": 0}
+            for entity, canonical, _ in pairs:
+                decision = llm_results.get(entity["name"], {})
+                outcome  = self._apply_match_decision(
+                    entity, canonical, collection_name,
+                    entity_cache, canonical_change_log, decision,
+                    is_predicate=is_predicate,
+                    is_label=is_label,
+                )
+                counts[outcome] = counts.get(outcome, 0) + 1
+
+            print(
+                f"[{collection_name}]   LLM decisions: "
+                f"{counts['new']} new | {counts['merged']} merged | {counts['replaced']} replaced"
+            )
+
+        # ── Step 4d: Upsert within-batch aliases ──────────────────────────────
+        # All representatives have now been processed and are in entity_cache.
+        # Aliases inherit the resolved canonical of their representative.
+        if alias_pairs:
+            alias_points: List[Dict[str, Any]] = []
+            for alias_idx, rep_idx, _score in alias_pairs:
+                alias_entity = entity_list[alias_idx]
+                rep_entity   = entity_list[rep_idx]
+                rep_cache    = entity_cache.get((collection_name, rep_entity["name"]))
+                if rep_cache:
+                    canonical_id   = rep_cache["canonical_id"]
+                    canonical_name = rep_cache["canonical"]
+                    alias_points.append(
+                        {**alias_entity, "is_canonical": False, "canonical_id": canonical_id}
+                    )
+                    cache_entry: Dict[str, Any] = {
+                        "original":     alias_entity["name"],
+                        "canonical":    canonical_name,
+                        "canonical_id": canonical_id,
+                        "is_new":       False,
+                        "is_canonical": False,
+                    }
+                    if is_label:
+                        cache_entry["label"] = "label"
+                        cache_entry["group"] = rep_cache.get("group", "")
+                    else:
+                        cache_entry.update({
+                            "label":         "predicate" if is_predicate else alias_entity.get("label", ""),
+                            "name_en":       alias_entity.get("name_en"),
+                            "attributes":    {} if is_predicate else alias_entity.get("attributes", {}),
+                            "attributes_en": {} if is_predicate else alias_entity.get("attributes_en", {}),
+                        })
+                    entity_cache[(collection_name, alias_entity["name"])] = cache_entry
+                else:
+                    # Unexpected: representative not resolved; fall back to standalone canonical
+                    print(
+                        f"  Warning: representative '{rep_entity['name']}' not in cache; "
+                        f"treating '{alias_entity['name']}' as a new canonical"
+                    )
+                    fallback_ids = self._batch_upsert_entities(
+                        [{**alias_entity, "is_canonical": True}], collection_name
+                    )
+                    fallback_id   = fallback_ids.get(alias_entity["name"])
+                    fallback_name = alias_entity.get("name_en") or alias_entity["name"]
+                    fallback_entry: Dict[str, Any] = {
+                        "original":     alias_entity["name"],
+                        "canonical":    fallback_name,
+                        "canonical_id": fallback_id,
+                        "is_new":       True,
+                        "is_canonical": True,
+                    }
+                    if is_label:
+                        fallback_entry["label"] = "label"
+                        fallback_entry["group"] = alias_entity.get("group", "")
+                    else:
+                        fallback_entry.update({
+                            "label":         "predicate" if is_predicate else alias_entity.get("label", ""),
+                            "name_en":       alias_entity.get("name_en"),
+                            "attributes":    {} if is_predicate else alias_entity.get("attributes", {}),
+                            "attributes_en": {} if is_predicate else alias_entity.get("attributes_en", {}),
+                        })
+                    entity_cache[(collection_name, alias_entity["name"])] = fallback_entry
+
+            if alias_points:
+                self._batch_upsert_entities(alias_points, collection_name)
+            print(f"[{collection_name}]   Upserted {len(alias_pairs)} within-batch alias(es)")
 
     def refine_triples(self, triples_data: Dict[str, Any]) -> Dict[str, Any]:
         """Refine all triples using Qdrant for entity resolution.
 
         Bilingual strategy
         ------------------
-        When a triple carries ``name_en`` / ``predicate_en``, the **English**
-        embedding is used for Qdrant similarity search so entity resolution
-        always happens in English space.  Both ``entity_en`` and ``entity_th``
-        vectors are stored on the resulting Qdrant point so downstream layers
-        can do language-aware lookup without touching the KG structure.
+        Entity resolution always happens in English embedding space.
+        Entities and predicates store dual vectors (en + th) in Qdrant.
+        Labels are English-only (single vector).
 
-        The KG itself (subjects, predicates, objects) is always populated with
-        the English canonical form — Thai is stored only in Qdrant payloads.
-
-        Args:
-            triples_data: Raw triples dict (output of the extractor)
-
-        Returns:
-            Refined triples dict with canonical English entities
+        The KG output uses English canonical forms throughout.
+        Thai forms are stored only in Qdrant payloads for downstream lookup.
         """
         self._ensure_collections_exist()
 
-        # ── Collect unique entities preserving full metadata ──────────────────
-        # Buckets are keyed by spec_key, driven by triple_role in registry JSON.
-        entity_spec     = self._role_to_spec_key.get("entity",    "entity_registry")
-        predicate_spec  = self._role_to_spec_key.get("predicate", "predicate_registry")
-        label_spec      = self._role_to_spec_key.get("label",     "label_registry")
+        entity_spec    = self._role_to_spec_key.get("entity",    "entity_registry")
+        predicate_spec = self._role_to_spec_key.get("predicate", "predicate_registry")
+        label_spec     = self._role_to_spec_key.get("label",     "label_registry")
 
+        # ── Collect unique items per registry ─────────────────────────────────
         registry_items: Dict[str, Dict[str, Dict[str, Any]]] = {
             entity_spec:    {},
             predicate_spec: {},
@@ -984,348 +1618,188 @@ Return only valid JSON:"""
         for chunk_data in triples_data.get("chunks", []):
             for triple in chunk_data.get("triples", []):
                 subj = triple["subject"]
-                obj = triple["object"]
+                obj  = triple["object"]
 
-                # Subject
-                subj_name = subj["name"]
-                if subj_name not in registry_items[entity_spec]:
-                    registry_items[entity_spec][subj_name] = {
-                        "name": subj_name,
-                        "name_en": subj.get("name_en"),
-                        "label": subj.get("label", ""),
-                        "attributes": subj.get("attributes", {}),
-                        "attributes_en": subj.get("attributes_en", {}),
-                    }
+                for name_key, node in [("subject", subj), ("object", obj)]:
+                    name = node["name"]
+                    if name not in registry_items[entity_spec]:
+                        registry_items[entity_spec][name] = {
+                            "name":          name,
+                            "name_en":       node.get("name_en"),
+                            "label":         node.get("label", ""),
+                            "attributes":    node.get("attributes", {}),
+                            "attributes_en": node.get("attributes_en", {}),
+                        }
 
-                # Predicate
-                pred = triple["predicate"]
+                pred    = triple["predicate"]
                 pred_en = triple.get("predicate_en")
                 if pred not in registry_items[predicate_spec]:
                     registry_items[predicate_spec][pred] = {
-                        "name": pred,
+                        "name":    pred,
                         "name_en": pred_en,
-                        "label": "predicate",
                     }
 
-                # Object
-                obj_name = obj["name"]
-                if obj_name not in registry_items[entity_spec]:
-                    registry_items[entity_spec][obj_name] = {
-                        "name": obj_name,
-                        "name_en": obj.get("name_en"),
-                        "label": obj.get("label", ""),
-                        "attributes": obj.get("attributes", {}),
-                        "attributes_en": obj.get("attributes_en", {}),
-                    }
-
-                # Ontology labels (already English PascalCase)
                 for lbl in (subj.get("label", ""), obj.get("label", "")):
                     if lbl and lbl not in registry_items[label_spec]:
-                        registry_items[label_spec][lbl] = {
-                            "name": lbl,
-                            "name_en": lbl,
-                            "label": "label",
-                        }
+                        registry_items[label_spec][lbl] = {"name": lbl}
+
+        total_items = sum(len(v) for v in registry_items.values())
+        print(f"Collected {total_items} unique items across {len(registry_items)} registries")
 
         # ── Process each registry ─────────────────────────────────────────────
-        entity_cache: Dict[tuple, Dict[str, Any]] = {}
-        canonical_change_log: List[Dict[str, Any]] = []
+        entity_cache:        Dict[tuple, Dict[str, Any]] = {}
+        canonical_change_log: List[Dict[str, Any]]       = []
 
-        collections = {
-            spec_key: list(items.values())
-            for spec_key, items in registry_items.items()
-        }
-
-        for collection_name, entity_list in collections.items():
-            if not entity_list:
+        for collection_name, items in registry_items.items():
+            if not items:
                 continue
+            entity_list  = list(items.values())
+            is_pred      = collection_name == predicate_spec
+            is_lbl       = collection_name == label_spec
+            self._process_collection(
+                collection_name, entity_list,
+                is_predicate=is_pred,
+                is_label=is_lbl,
+                entity_cache=entity_cache,
+                canonical_change_log=canonical_change_log,
+            )
+            print(f"[{collection_name}] Cooling down 30s before next collection...")
+            import time; time.sleep(30)
 
-            print(f"Processing {len(entity_list)} items in {collection_name}…")
+        if canonical_change_log:
+            print(f"Canonical replacements this run: {len(canonical_change_log)}")
 
-            # ── Embed all English forms in one batch ──────────────────────────
-            # Resolution always uses entity_en, so we embed name_en (or name).
-            en_embed_texts = [e.get("name_en") or e["name"] for e in entity_list]
-            print(f"  Getting {len(en_embed_texts)} English embeddings…")
-            en_embeddings = self._get_embeddings_batch(en_embed_texts)
-
-            for entity, en_embedding in zip(entity_list, en_embeddings):
-                # ── Query canonical registry (English space) ──────────────────
-                canonical_matches = self._query_qdrant_canonical(
-                    collection_name, en_embedding, limit=1
-                )
-
-                if not canonical_matches:
-                    # ── New canonical ─────────────────────────────────────────
-                    upserted_ids = self._batch_upsert_entities(
-                        [{
-                            **entity,
-                            "is_canonical": True,
-                        }],
-                        collection_name,
-                    )
-                    canonical_id = upserted_ids.get(entity["name"])
-                    print(f"  New canonical: '{entity['name']}' ({canonical_id})")
-                    entity_cache[(collection_name, entity["name"])] = {
-                        "original": entity["name"],
-                        "canonical": entity.get("name_en") or entity["name"],
-                        "canonical_id": canonical_id,
-                        "is_new": True,
-                        "is_canonical": True,
-                        "label": entity.get("label", ""),
-                        "name_en": entity.get("name_en"),
-                        "attributes": entity.get("attributes", {}),
-                        "attributes_en": entity.get("attributes_en", {}),
-                    }
-
-                else:
-                    existing_canonical = canonical_matches[0]
-
-                    if collection_name == predicate_spec:
-                        self._handle_predicate_match(
-                            entity, existing_canonical,
-                            collection_name, entity_cache, canonical_change_log,
-                        )
-                    else:
-                        self._handle_entity_match(
-                            entity, existing_canonical,
-                            collection_name, entity_cache, canonical_change_log,
-                        )
-
-        # ── Build refined triples (English canonical names in graph) ──────────
-        return self._build_refined_output(
-            triples_data, entity_cache, canonical_change_log
-        )
+        return self._build_refined_output(triples_data, entity_cache, canonical_change_log)
 
     # ------------------------------------------------------------------
-    # Match-handling sub-routines (reduce refine_triples complexity)
+    # Unified match-decision handler
     # ------------------------------------------------------------------
 
-    def _handle_predicate_match(
+    def _apply_match_decision(
         self,
         entity: Dict[str, Any],
         existing_canonical: Dict[str, Any],
         collection_name: str,
         entity_cache: Dict,
         canonical_change_log: List,
-    ):
-        """Handle a predicate that matched an existing canonical."""
-        winner = self._compare_predicate_with_llm(
-            new_predicate=entity["name"],
-            new_predicate_en=entity.get("name_en"),
-            existing_canonical=existing_canonical,
-        )
+        decision: Dict[str, Any],
+        is_predicate: bool = False,
+        is_label: bool = False,
+    ) -> str:
+        """Apply an LLM match decision and update entity_cache + Qdrant.
 
-        if not winner["are_equivalent"]:
-            # Distinct predicate → own canonical
+        Handles all three outcomes uniformly for entities, predicates, and labels:
+          - new canonical  (not same / not equivalent)
+          - existing stays (same, existing is canonical)
+          - replace        (same, incoming is the better canonical)
+
+        Returns a short outcome string for progress tracking:
+          "new" | "merged" | "replaced"
+        """
+        # ── Normalise decision keys across entity vs predicate responses ─────
+        # Entity:    are_same_entity  / new_is_canonical
+        # Predicate: are_equivalent   / new_is_canonical
+        is_same = decision.get("are_same_entity", decision.get("are_equivalent", True))
+        new_is_canon = decision.get("new_is_canonical", False)
+
+        old_payload = existing_canonical.get("payload", {})
+        existing_name = (
+            old_payload.get("name_en") or old_payload.get("name", "")
+        )
+        incoming_name = entity.get("name_en") or entity["name"]
+
+        # ── Shared cache entry builder ────────────────────────────────────────
+        def _cache_entry(
+            canonical: str,
+            canonical_id: str,
+            is_new: bool,
+            is_canon: bool,
+            group_value: Optional[str] = None,
+        ) -> Dict:
+            base = {
+                "original":     entity["name"],
+                "canonical":    canonical,
+                "canonical_id": canonical_id,
+                "is_new":       is_new,
+                "is_canonical": is_canon,
+            }
+            if is_label:
+                base["label"] = "label"
+                base["group"] = group_value or ""
+            else:
+                base.update({
+                    "label":         "predicate" if is_predicate else entity.get("label", ""),
+                    "name_en":       entity.get("name_en"),
+                    "attributes":    {} if is_predicate else entity.get("attributes", {}),
+                    "attributes_en": {} if is_predicate else entity.get("attributes_en", {}),
+                })
+            return base
+
+        # ── Outcome A: not the same → new canonical ───────────────────────────
+        if not is_same:
             upserted_ids = self._batch_upsert_entities(
-                [{**entity, "is_canonical": True}],
-                collection_name,
+                [{**entity, "is_canonical": True}], collection_name
             )
             canonical_id = upserted_ids.get(entity["name"])
-            print(
-                f"  New predicate canonical (distinct from "
-                f"'{existing_canonical['payload'].get('name')}'): "
-                f"'{entity['name']}' ({canonical_id})"
+            entity_cache[(collection_name, entity["name"])] = _cache_entry(
+                incoming_name, canonical_id, is_new=True, is_canon=True
             )
-            entity_cache[(collection_name, entity["name"])] = {
-                "original": entity["name"],
-                "canonical": entity.get("name_en") or entity["name"],
-                "canonical_id": canonical_id,
-                "is_new": True,
-                "is_canonical": True,
-                "label": "predicate",
-                "name_en": entity.get("name_en"),
-                "attributes": {},
-                "attributes_en": {},
-            }
+            return "new"
 
-        elif not winner["new_is_canonical"]:
-            # Equivalent → existing stays canonical
-            upserted_ids = self._batch_upsert_entities(
-                [{
-                    **entity,
-                    "is_canonical": False,
-                    "canonical_id": existing_canonical["id"],
-                }],
+        # ── Outcome B: same, existing stays canonical ─────────────────────────
+        if not new_is_canon:
+            self._batch_upsert_entities(
+                [{**entity, "is_canonical": False, "canonical_id": existing_canonical["id"]}],
                 collection_name,
             )
-            canonical_name = (
-                existing_canonical["payload"].get("name_en")
-                or existing_canonical["payload"].get("name", entity["name"])
+            canonical_id = existing_canonical["payload"].get(
+                "canonical_id", existing_canonical["id"]
             )
-            print(
-                f"  Predicate '{entity['name']}' merged into canonical '{canonical_name}'"
+            merged_group = old_payload.get("group", "")
+            entity_cache[(collection_name, entity["name"])] = _cache_entry(
+                existing_name,
+                canonical_id,
+                is_new=False,
+                is_canon=False,
+                group_value=merged_group,
             )
-            entity_cache[(collection_name, entity["name"])] = {
-                "original": entity["name"],
-                "canonical": canonical_name,
-                "canonical_id": existing_canonical["id"],
-                "is_new": False,
-                "is_canonical": False,
-                "label": "predicate",
-                "name_en": entity.get("name_en"),
-                "attributes": {},
-                "attributes_en": {},
-            }
+            return "merged"
 
-        else:
-            # Equivalent → new predicate is the better canonical
-            canonical_form = (
-                winner.get("canonical_form")
-                or entity.get("name_en")
-                or entity["name"]
-            )
-            upserted_ids = self._batch_upsert_entities(
-                [{**entity, "is_canonical": True}],
-                collection_name,
-            )
-            new_id = upserted_ids.get(entity["name"])
-            old_id = existing_canonical["id"]
-
-            try:
-                self.qdrant_client.set_payload(
-                    collection_name=collection_name,
-                    payload={"is_canonical": False, "canonical_id": new_id},
-                    points=[old_id],
-                )
-            except Exception as e:
-                print(f"  Warning: Failed to demote old predicate canonical: {e}")
-
-            canonical_change_log.append({
-                "collection": collection_name,
-                "old_canonical_id": old_id,
-                "old_canonical_name": existing_canonical["payload"].get("name"),
-                "new_canonical_id": new_id,
-                "new_canonical_name": entity["name"],
-                "reasoning": winner.get("reasoning", ""),
-            })
-            print(
-                f"  Predicate canonical replaced: "
-                f"'{existing_canonical['payload'].get('name')}' ({old_id}) "
-                f"→ '{entity['name']}' ({new_id})"
-            )
-            entity_cache[(collection_name, entity["name"])] = {
-                "original": entity["name"],
-                "canonical": canonical_form,
-                "canonical_id": new_id,
-                "is_new": True,
-                "is_canonical": True,
-                "label": "predicate",
-                "name_en": entity.get("name_en"),
-                "attributes": {},
-                "attributes_en": {},
-            }
-
-    def _handle_entity_match(
-        self,
-        entity: Dict[str, Any],
-        existing_canonical: Dict[str, Any],
-        collection_name: str,
-        entity_cache: Dict,
-        canonical_change_log: List,
-    ):
-        """Handle an entity / label that matched an existing canonical."""
-        winner = self._compare_canonical_with_llm(
-            new_entity=entity,
-            existing_canonical=existing_canonical,
-            entity_type=entity.get("label", collection_name),
+        # ── Outcome C: same, incoming is the better canonical ─────────────────
+        canonical_form = (
+            decision.get("canonical_form") or incoming_name
         )
+        upserted_ids = self._batch_upsert_entities(
+            [{**entity, "is_canonical": True}], collection_name
+        )
+        new_id  = upserted_ids.get(entity["name"])
+        old_id  = existing_canonical["id"]
 
-        if not winner.get("are_same_entity", True):
-            # Distinct entity → new canonical
-            upserted_ids = self._batch_upsert_entities(
-                [{**entity, "is_canonical": True}],
-                collection_name,
+        try:
+            self.qdrant_client.set_payload(
+                collection_name=self._qdrant_name(collection_name),
+                payload={"is_canonical": False, "canonical_id": new_id},
+                points=[old_id],
             )
-            canonical_id = upserted_ids.get(entity["name"])
-            print(
-                f"  New canonical (distinct from "
-                f"'{existing_canonical['payload'].get('name')}'): "
-                f"'{entity['name']}' ({canonical_id})"
-            )
-            entity_cache[(collection_name, entity["name"])] = {
-                "original": entity["name"],
-                "canonical": entity.get("name_en") or entity["name"],
-                "canonical_id": canonical_id,
-                "is_new": True,
-                "is_canonical": True,
-                "label": entity.get("label", ""),
-                "name_en": entity.get("name_en"),
-                "attributes": entity.get("attributes", {}),
-                "attributes_en": entity.get("attributes_en", {}),
-            }
+        except Exception as e:
+            print(f"  Warning: Failed to demote old canonical '{existing_name}': {e}")
 
-        elif not winner["new_is_canonical"]:
-            # Same entity → existing stays canonical
-            upserted_ids = self._batch_upsert_entities(
-                [{
-                    **entity,
-                    "is_canonical": False,
-                    "canonical_id": existing_canonical["id"],
-                }],
-                collection_name,
-            )
-            print(
-                f"  '{entity['name']}' registered under existing canonical "
-                f"'{existing_canonical['payload'].get('name')}'"
-            )
-            entity_cache[(collection_name, entity["name"])] = {
-                "original": entity["name"],
-                "canonical": (
-                    existing_canonical["payload"].get("name_en")
-                    or existing_canonical["payload"].get("name", entity["name"])
-                ),
-                "canonical_id": existing_canonical["id"],
-                "is_new": False,
-                "is_canonical": False,
-                "label": entity.get("label", ""),
-                "name_en": entity.get("name_en"),
-                "attributes": entity.get("attributes", {}),
-                "attributes_en": entity.get("attributes_en", {}),
-            }
+        canonical_change_log.append({
+            "collection":         collection_name,
+            "old_canonical_id":   old_id,
+            "old_canonical_name": old_payload.get("name"),
+            "new_canonical_id":   new_id,
+            "new_canonical_name": entity["name"],
+            "reasoning":          decision.get("reasoning", ""),
+        })
+        entity_cache[(collection_name, entity["name"])] = _cache_entry(
+            canonical_form, new_id, is_new=True, is_canon=True
+        )
+        return "replaced"
 
-        else:
-            # Same entity → new entity becomes canonical
-            upserted_ids = self._batch_upsert_entities(
-                [{**entity, "is_canonical": True}],
-                collection_name,
-            )
-            new_id = upserted_ids.get(entity["name"])
-            old_id = existing_canonical["id"]
-
-            try:
-                self.qdrant_client.set_payload(
-                    collection_name=collection_name,
-                    payload={"is_canonical": False, "canonical_id": new_id},
-                    points=[old_id],
-                )
-            except Exception as e:
-                print(f"  Warning: Failed to demote old canonical: {e}")
-
-            canonical_change_log.append({
-                "collection": collection_name,
-                "old_canonical_id": old_id,
-                "old_canonical_name": existing_canonical["payload"].get("name"),
-                "new_canonical_id": new_id,
-                "new_canonical_name": entity["name"],
-                "reasoning": winner.get("reasoning", ""),
-            })
-            print(
-                f"  Canonical replaced: '{existing_canonical['payload'].get('name')}' "
-                f"({old_id}) → '{entity['name']}' ({new_id})"
-            )
-            entity_cache[(collection_name, entity["name"])] = {
-                "original": entity["name"],
-                "canonical": entity.get("name_en") or entity["name"],
-                "canonical_id": new_id,
-                "is_new": True,
-                "is_canonical": True,
-                "label": entity.get("label", ""),
-                "name_en": entity.get("name_en"),
-                "attributes": entity.get("attributes", {}),
-                "attributes_en": entity.get("attributes_en", {}),
-            }
-
+    # ------------------------------------------------------------------
+    # Output builder
+    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # Output builder
     # ------------------------------------------------------------------
@@ -1401,11 +1875,7 @@ Return only valid JSON:"""
                     "label": "label",
                 })
 
-                canonical_obj_label = (
-                    refined_object_label["canonical"]
-                    or refined_object.get("label", "")
-                    or obj_label_raw
-                )
+                canonical_obj_label = refined_object_label["canonical"]
 
                 # ── Canonical (English) triple ────────────────────────────────
                 refined_triple: Dict[str, Any] = {
@@ -1414,6 +1884,8 @@ Return only valid JSON:"""
                         "name": refined_subject["canonical"],
                         "original_name": subj_raw["name"],
                         "label": refined_subject.get("label", ""),
+                        # canonical_id is the Qdrant point_id for the resolved canonical entity
+                        "canonical_id": refined_subject.get("canonical_id"),
                     },
                     "predicate": refined_predicate["canonical"],
                     "original_predicate": triple["predicate"],
@@ -1421,16 +1893,11 @@ Return only valid JSON:"""
                         "name": refined_object["canonical"],
                         "original_name": obj_raw["name"],
                         "label": canonical_obj_label,
-                        "original_label": obj_label_raw,
+                        # canonical_id is the Qdrant point_id for the resolved canonical entity
+                        "canonical_id": refined_object.get("canonical_id"),
                     },
                     "properties": triple.get("properties", {}),
                     "chunk_id": chunk_id,
-                    "refinement": {
-                        "subject": refined_subject,
-                        "predicate": refined_predicate,
-                        "object": refined_object,
-                        "object_label": refined_object_label,
-                    },
                 }
 
                 # ── Preserve bilingual metadata for downstream use ────────────
@@ -1504,9 +1971,9 @@ def refine_triples_from_file(
     output_path: Optional[str] = None,
     qdrant_url: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
-    llm_provider: str = "openai",
-    llm_model: str = "gpt-4o-mini",
-    similarity_threshold: float = 0.85,
+    llm_provider: str = REFINEMENT_PROVIDER,
+    llm_model: str = REFINEMENT_MODEL,
+    similarity_threshold: float = 0.95,
 ) -> str:
     """Refine triples from a JSON file and save the result.
 

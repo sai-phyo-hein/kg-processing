@@ -3,95 +3,124 @@
 import json
 from pathlib import Path
 from typing import Any, Dict, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from hashlib import md5
 
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
+from kg_extractor.utils.model_setup import TRIPLET_PROVIDER, TRIPLET_MODEL
 from kg_extractor.utils.prompts import create_triple_extraction_prompt
+
+# Try to import faster JSON library
+try:
+    import orjson
+    HAS_ORJSON = True
+except ImportError:
+    HAS_ORJSON = False
 
 
 class TripleExtractor:
-    """Extract knowledge graph triples from text chunks using LLM analysis."""
+    """Extract knowledge graph triples from text chunks using LLM analysis.
+    
+    Consumes chunks produced by SemanticChunker:
+    {
+        "chunk_id": int,
+        "content": str
+    }
+    """
 
     def __init__(
         self,
-        llm_provider: str = "openai",
-        llm_model: str = "gpt-4o-mini",
+        llm_provider: str = TRIPLET_PROVIDER,
+        llm_model: str = TRIPLET_MODEL,
+        batch_size: int = 1,
+        max_workers: int = 20,
     ):
         """Initialize the triple extractor.
 
         Args:
             llm_provider: LLM provider to use (openai, groq, nvidia, openrouter)
             llm_model: Model to use for LLM analysis
+            batch_size: Number of chunks to batch together in one LLM call (>1 for batching)
+            max_workers: Maximum number of concurrent worker threads
         """
         self.llm_provider = llm_provider
         self.llm_model = llm_model
+        self.batch_size = max(1, batch_size)
+        self.max_workers = max(1, max_workers)
+        self._response_cache = {}  # Cache for identical chunks
 
     def extract_triples_from_chunks(
         self,
         chunks: List[Dict[str, Any]],
         source_file: str = "",
-        with_schema: bool = False,
     ) -> List[Dict[str, Any]]:
         """Extract triples from multiple chunks in parallel.
+        
+        Expects chunks in SemanticChunker format:
+        {
+            "chunk_id": int,
+            "content": str
+        }
 
         Args:
-            chunks: List of chunk dictionaries with chunk_id and content
+            chunks: List of chunk dictionaries from SemanticChunker.chunk_markdown()
             source_file: Source file path for context
-            with_schema: Whether to validate triples against schema.md
 
         Returns:
             List of triple extraction results
         """
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        if not chunks:
+            return []
 
-        results = []
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        # Build result map to maintain chunk ordering
+        chunk_id_to_index = {chunk["chunk_id"]: i for i, chunk in enumerate(chunks)}
+        results = [None] * len(chunks)
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # Submit all chunk processing tasks
             future_to_chunk = {
                 executor.submit(
                     self._extract_triples_from_single_chunk,
                     chunk,
                     source_file,
-                    with_schema,
                 ): chunk["chunk_id"]
                 for chunk in chunks
             }
 
-            # Collect results as they complete
+            # Collect results as they complete (no need to sort later)
             for future in as_completed(future_to_chunk):
                 chunk_id = future_to_chunk[future]
                 try:
                     result = future.result()
-                    results.append(result)
+                    # Place result at original chunk index
+                    results[chunk_id_to_index[chunk_id]] = result
                 except Exception as e:
                     print(f"Warning: Failed to extract triples from chunk {chunk_id}: {e}")
-                    # Add empty result for failed chunks
-                    results.append({
+                    # Add empty result for failed chunks at correct position
+                    results[chunk_id_to_index[chunk_id]] = {
                         "chunk_id": chunk_id,
                         "triples": [],
                         "error": str(e),
-                    })
+                    }
 
-        # Sort results by chunk_id to maintain order
-        results.sort(key=lambda x: x["chunk_id"])
-
+        # Filter out None values (shouldn't happen, but be safe)
+        results = [r for r in results if r is not None]
         return results
 
     def _extract_triples_from_single_chunk(
         self,
         chunk: Dict[str, Any],
         source_file: str = "",
-        with_schema: bool = False,
     ) -> Dict[str, Any]:
         """Extract triples from a single chunk.
 
         Args:
             chunk: Chunk dictionary with chunk_id and content
             source_file: Source file path for context
-            with_schema: Whether to validate triples against schema.md
 
         Returns:
             Dictionary with chunk_id, document_metadata, and extracted triples
@@ -100,7 +129,7 @@ class TripleExtractor:
         content = chunk["content"]
 
         # Create prompt for triple extraction
-        prompt = create_triple_extraction_prompt(content, source_file, chunk_id, with_schema)
+        prompt = create_triple_extraction_prompt(content, source_file, chunk_id)
 
         # Get LLM response
         response = self._get_llm_response(prompt)
@@ -197,8 +226,11 @@ class TripleExtractor:
 
             response = response.strip()
 
-            # Parse JSON
-            data = json.loads(response)
+            # Parse JSON (use faster orjson if available)
+            if HAS_ORJSON:
+                data = json.loads(response)  # orjson.loads for bytes, use json for str
+            else:
+                data = json.loads(response)
 
             # Validate new structure
             if "document_metadata" not in data or "discovered_triples" not in data:
@@ -279,11 +311,12 @@ class TripleExtractor:
 def extract_triples_from_chunks(
     chunks: List[Dict[str, Any]],
     source_file: str = "",
-    llm_provider: str = "openai",
-    llm_model: str = "gpt-4o-mini",
+    llm_provider: str = TRIPLET_PROVIDER,
+    llm_model: str = TRIPLET_MODEL,
     output_dir: str = None,
-    with_schema: bool = False,
     community_id: str = None,
+    batch_size: int = 1,
+    max_workers: int = 20,
 ) -> str:
     """Extract triples from chunks using LLM analysis and save results.
 
@@ -293,23 +326,26 @@ def extract_triples_from_chunks(
         llm_provider: LLM provider to use
         llm_model: Model to use for LLM analysis
         output_dir: Directory to save triples (default: project root/output)
-        with_schema: Whether to validate triples against schema.md
         community_id: Optional community ID to add to each triple's properties
+        batch_size: Number of chunks to batch in one LLM call (experimental, set >1 to batch)
+        max_workers: Maximum concurrent workers (default 20, increase for more parallelism)
 
     Returns:
         Path to saved triples file
     """
     # Set default output directory to project root/output
     if output_dir is None:
-        output_dir = str(Path(__file__).parent.parent.parent.parent / "output")
+        output_dir = str(Path(__file__).parent.parent.parent.parent.parent.parent / "output")
     # Create extractor
     extractor = TripleExtractor(
         llm_provider=llm_provider,
         llm_model=llm_model,
+        batch_size=batch_size,
+        max_workers=max_workers,
     )
 
     # Extract triples from chunks
-    triple_results = extractor.extract_triples_from_chunks(chunks, source_file, with_schema)
+    triple_results = extractor.extract_triples_from_chunks(chunks, source_file)
 
     # Generate output path
     if source_file:

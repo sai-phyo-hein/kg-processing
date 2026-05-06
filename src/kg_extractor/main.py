@@ -5,8 +5,22 @@ import sys
 from typing import List, Optional
 
 from kg_extractor import __version__
+from kg_extractor.utils.model_setup import (
+    PARSING_PROVIDER,
+    PARSING_MODEL,
+    CHUNKING_PROVIDER,
+    CHUNKING_MODEL,
+    TRIPLET_PROVIDER,
+    TRIPLET_MODEL,
+    REFINEMENT_PROVIDER,
+    REFINEMENT_MODEL,
+)
 from kg_extractor.workflow.langgraph_workflow import (
     run_langgraph_workflow,
+    run_parse_document_only,
+    run_extract_metadata_only,
+    run_chunk_document_only,
+    run_extract_triples_only,
     run_refine_triples_only,
     run_build_graph_only,
 )
@@ -63,17 +77,102 @@ def parse_pages_argument(pages_str: str) -> Optional[List[int]]:
 def langgraph_command(args) -> None:
     """Run document processing using LangGraph workflow."""
 
+    # --- Single-node debug mode: --parse-document ---
+    if args.parse_document:
+        print("📄 [Debug] Running ONLY parse-document node...")
+        print(f"📄 Input file: {args.input_file}")
+        print(f"🤖 Parsing provider: {PARSING_PROVIDER}/{PARSING_MODEL}")
+        if args.pages:
+            try:
+                pages_to_process = parse_pages_argument(args.pages)
+                print(f"📄 Processing pages: {', '.join(map(str, pages_to_process))}")
+            except ValueError as e:
+                print(f"❌ Error: {e}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            pages_to_process = None
+        print()
+        result = run_parse_document_only(
+            input_file=args.input_file,
+            pages=pages_to_process,
+        )
+        if result["status"] == "success":
+            print("✅ Parse-document node completed successfully!")
+            print(f"📄 Markdown output: {result['markdown_output']}")
+        else:
+            print(f"❌ Parse-document node failed: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- Single-node debug mode: --extract-metadata ---
+    if args.extract_metadata:
+        print("📊 [Debug] Running ONLY extract-metadata node...")
+        print(f"📄 Input file: {args.input_file}")
+        print(f"🤖 Chunking LLM: {CHUNKING_PROVIDER}/{CHUNKING_MODEL}")
+        if args.location_moo:
+            print(f"📍 Location moo: {args.location_moo}")
+        if args.location_village:
+            print(f"📍 Location village: {args.location_village}")
+        print()
+        result = run_extract_metadata_only(
+            input_file=args.input_file,
+            location_moo=args.location_moo,
+            location_village=args.location_village,
+        )
+        if result["status"] == "success":
+            print("✅ Extract-metadata node completed successfully!")
+            if result["metadata"]:
+                print(f"📊 Metadata extracted: {result['metadata'].get('unique_id')}")
+        else:
+            print(f"❌ Extract-metadata node failed: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- Single-node debug mode: --chunk-document ---
+    if args.chunk_document:
+        print("🧩 [Debug] Running ONLY chunk-document node...")
+        print(f"📄 Input file: {args.input_file}")
+        print(f"🤖 Chunking LLM: {CHUNKING_PROVIDER}/{CHUNKING_MODEL}")
+        print(f"🎯 Chunk granularity: {args.chunk_granularity}")
+        print()
+        result = run_chunk_document_only(
+            input_file=args.input_file,
+            chunk_granularity=args.chunk_granularity,
+        )
+        if result["status"] == "success":
+            print("✅ Chunk-document node completed successfully!")
+            print(f"🧩 Chunks output: {result['chunks_output']}")
+        else:
+            print(f"❌ Chunk-document node failed: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- Single-node debug mode: --extract-triples ---
+    if args.extract_triples:
+        print("🔗 [Debug] Running ONLY extract-triples node...")
+        print(f"📄 Input file: {args.input_file}")
+        print(f"🤖 Triple LLM: {TRIPLET_PROVIDER}/{TRIPLET_MODEL}")
+        print()
+        result = run_extract_triples_only(
+            input_file=args.input_file,
+        )
+        if result["status"] == "success":
+            print("✅ Extract-triples node completed successfully!")
+            print(f"🔗 Triples output: {result['triples_output']}")
+        else:
+            print(f"❌ Extract-triples node failed: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        return
+
     # --- Single-node debug mode: --refine-triples ---
     if args.refine_triples:
         print("🔍 [Debug] Running ONLY refine-triples node...")
         print(f"📄 Input file: {args.input_file}")
-        print(f"🤖 Refinement LLM: {args.refinement_provider}/{args.refinement_model}")
+        print(f"🤖 Refinement LLM: {REFINEMENT_PROVIDER}/{REFINEMENT_MODEL}")
         print(f"🔍 Similarity threshold: {args.similarity_threshold}")
         print()
         result = run_refine_triples_only(
             input_file=args.input_file,
-            refinement_llm_provider=args.refinement_provider,
-            refinement_llm_model=args.refinement_model,
             similarity_threshold=args.similarity_threshold,
         )
         if result["status"] == "success":
@@ -88,11 +187,9 @@ def langgraph_command(args) -> None:
     if args.build_graph:
         print("🕸️ [Debug] Running ONLY build-graph node...")
         print(f"📄 Input file: {args.input_file}")
-        print(f"📋 With schema: {args.with_schema}")
         print()
         result = run_build_graph_only(
             input_file=args.input_file,
-            with_schema=args.with_schema,
         )
         if result["status"] == "success":
             print("✅ Build-graph node completed successfully!")
@@ -111,14 +208,17 @@ def langgraph_command(args) -> None:
     # --- Full pipeline ---
     print("🚀 Starting LangGraph workflow...")
     print(f"📄 Input file: {args.input_file}")
-    print(f"🤖 Parsing provider: {args.parsing_provider}")
-    print(f"🧠 Parsing model: {args.parsing_model}")
+    print(f"🤖 Parsing provider: {PARSING_PROVIDER}")
+    print(f"🧠 Parsing model: {PARSING_MODEL}")
     print(f"🎯 Chunk granularity: {args.chunk_granularity}")
     print(f"🔍 Similarity threshold: {args.similarity_threshold}")
-    print(f"🤖 Chunking LLM: {args.chunking_provider}/{args.chunking_model}")
-    print(f"🔗 Triple LLM: {args.triplet_provider}/{args.triplet_model}")
-    print(f"🤖 Refinement LLM: {args.refinement_provider}/{args.refinement_model}")
-    print(f"📋 With schema: {args.with_schema}")
+    print(f"🤖 Chunking LLM: {CHUNKING_PROVIDER}/{CHUNKING_MODEL}")
+    print(f"🔗 Triple LLM: {TRIPLET_PROVIDER}/{TRIPLET_MODEL}")
+    print(f"🤖 Refinement LLM: {REFINEMENT_PROVIDER}/{REFINEMENT_MODEL}")
+    if args.location_moo:
+        print(f"📍 Location moo: {args.location_moo}")
+    if args.location_village:
+        print(f"📍 Location village: {args.location_village}")
     if args.until:
         print(f"⏹️ Stop after: {args.until}")
 
@@ -136,19 +236,12 @@ def langgraph_command(args) -> None:
 
     result = run_langgraph_workflow(
         input_file=args.input_file,
-        provider=args.parsing_provider,
-        model=args.parsing_model,
         chunk_granularity=args.chunk_granularity,
         similarity_threshold=args.similarity_threshold,
-        chunking_llm_provider=args.chunking_provider,
-        chunking_llm_model=args.chunking_model,
-        triplet_llm_provider=args.triplet_provider,
-        triplet_llm_model=args.triplet_model,
-        refinement_llm_provider=args.refinement_provider,
-        refinement_llm_model=args.refinement_model,
-        with_schema=args.with_schema,
         until_step=args.until,
         pages=pages_to_process,
+        location_moo=args.location_moo,
+        location_village=args.location_village,
     )
 
     if result["status"] == "success":
@@ -180,10 +273,16 @@ def main() -> None:
         epilog="""
 Examples:
   %(prog)s document.pdf --chunk-granularity 0.5
-  %(prog)s document.pdf --similarity-threshold 0.85
-  %(prog)s document.pdf --triplet-provider openai --triplet-model gpt-4o-mini
+  %(prog)s document.pdf --similarity-threshold 0.95
   %(prog)s document.pdf --until triple_extraction
   %(prog)s document.pdf --pages 1,3-5,7
+
+Model configuration is done via environment variables (see .env):
+  PARSING_PROVIDER, PARSING_MODEL
+  CHUNKING_PROVIDER, CHUNKING_MODEL
+  TRIPLET_PROVIDER, TRIPLET_MODEL
+  REFINEMENT_PROVIDER, REFINEMENT_MODEL
+  OPENAI_EMBEDDING_MODEL
         """,
     )
 
@@ -191,20 +290,6 @@ Examples:
         "input_file",
         type=str,
         help="Input document file",
-    )
-    parser.add_argument(
-        "--parsing-provider",
-        type=str,
-        choices=["nvidia", "openrouter", "openai", "google"],
-        default="nvidia",
-        help="API provider for document parsing (default: nvidia)",
-    )
-    parser.add_argument(
-        "--parsing-model",
-        type=str,
-        default="microsoft/phi-4-multimodal-instruct",
-        help="Model for document parsing (default: microsoft/phi-4-multimodal-instruct for nvidia, "
-        "gpt-4o for openai, google/gemini-3.1-flash-lite-preview for google)",
     )
     parser.add_argument(
         "--chunk-granularity",
@@ -215,34 +300,36 @@ Examples:
     parser.add_argument(
         "--similarity-threshold",
         type=float,
-        default=0.85,
-        help="Cosine similarity threshold for entity resolution in triple refiner (0.0-1.0, default: 0.85)",
+        default=0.95,
+        help="Cosine similarity threshold for entity resolution in triple refiner (0.0-1.0, default: 0.95)",
     )
     parser.add_argument(
-        "--chunking-provider",
-        type=str,
-        choices=["openai", "groq", "nvidia", "openrouter"],
-        default="openai",
-        help="LLM provider for chunking analysis (default: openai)",
+        "--parse-document",
+        action="store_true",
+        default=False,
+        help="Debug mode: run ONLY the parse-document node on input_file, then stop. "
+        "Without this flag the full pipeline runs (parsing included).",
     )
     parser.add_argument(
-        "--chunking-model",
-        type=str,
-        default="gpt-4o-mini",
-        help="LLM model for chunking analysis (default: gpt-4o-mini)",
+        "--extract-metadata",
+        action="store_true",
+        default=False,
+        help="Debug mode: run ONLY the extract-metadata node using the existing markdown file "
+        "derived from input_file, then stop. Without this flag the full pipeline runs (metadata included).",
     )
     parser.add_argument(
-        "--triplet-provider",
-        type=str,
-        choices=["openai", "groq", "nvidia", "openrouter"],
-        default="openai",
-        help="LLM provider for triple extraction (default: openai)",
+        "--chunk-document",
+        action="store_true",
+        default=False,
+        help="Debug mode: run ONLY the chunk-document node using the existing markdown file "
+        "derived from input_file, then stop. Without this flag the full pipeline runs (chunking included).",
     )
     parser.add_argument(
-        "--triplet-model",
-        type=str,
-        default="gpt-4o-mini",
-        help="LLM model for triple extraction (default: gpt-4o-mini)",
+        "--extract-triples",
+        action="store_true",
+        default=False,
+        help="Debug mode: run ONLY the extract-triples node using the existing chunks file "
+        "derived from input_file, then stop. Without this flag the full pipeline runs (extraction included).",
     )
     parser.add_argument(
         "--refine-triples",
@@ -252,30 +339,11 @@ Examples:
         "derived from input_file, then stop. Without this flag the full pipeline runs (refine included).",
     )
     parser.add_argument(
-        "--refinement-provider",
-        type=str,
-        choices=["openai", "groq", "nvidia", "openrouter"],
-        default="openai",
-        help="LLM provider for triple refinement (default: openai)",
-    )
-    parser.add_argument(
-        "--refinement-model",
-        type=str,
-        default="gpt-4o-mini",
-        help="LLM model for triple refinement (default: gpt-4o-mini)",
-    )
-    parser.add_argument(
         "--build-graph",
         action="store_true",
         default=False,
         help="Debug mode: run ONLY the build-graph node using the existing refined triples file "
         "derived from input_file, then stop. Without this flag the full pipeline runs (build included).",
-    )
-    parser.add_argument(
-        "--with-schema",
-        action="store_true",
-        default=False,
-        help="Validate triples and graph against schema.md (default: False)",
     )
     parser.add_argument(
         "--until",
@@ -289,6 +357,18 @@ Examples:
         type=str,
         default=None,
         help="Process only specific pages (e.g., '1,2,4,6' or '2-5' or '1,3-5,7')",
+    )
+    parser.add_argument(
+        "--location-moo",
+        type=str,
+        default=None,
+        help="Location moo value (e.g., 'หมู่ 1') to use instead of extracting from document",
+    )
+    parser.add_argument(
+        "--location-village",
+        type=str,
+        default=None,
+        help="Location village value (e.g., 'บ้านสวน') to use instead of extracting from document",
     )
     parser.add_argument(
         "--version",

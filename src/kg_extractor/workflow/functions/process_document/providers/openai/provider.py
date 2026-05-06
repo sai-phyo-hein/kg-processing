@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
-from kg_extractor.utils.api_keys import OpenAIAPIError
+from kg_extractor.utils.model_setup import OpenAIAPIError
 from ...document_processor import DocumentProcessor, get_parsing_prompt
 from ..base import (
     DEFAULT_MAX_TOKENS,
@@ -108,6 +108,19 @@ def _process_single_page_openai(
                 result = response.json()
                 if "choices" in result and len(result["choices"]) > 0:
                     content = result["choices"][0]["message"]["content"]
+
+                    # Handle None content response
+                    if content is None:
+                        return {
+                            "page_number": page_num,
+                            "content": {"text": "[Empty page - no content extracted]"},
+                            "metadata": {
+                                "has_text": False,
+                                "has_diagrams": False,
+                                "has_tables": False,
+                                "content_quality": "low",
+                            },
+                        }
 
                     try:
                         parsed_content = json.loads(content)

@@ -4,6 +4,12 @@ import argparse
 import json
 import sys
 
+from kg_extractor.utils.model_setup import (
+    REASONING_PROVIDER,
+    ORCHESTRATOR_MODEL,
+    WORKER_MODEL,
+    SYNTHESIZER_MODEL,
+)
 from kg_reasoning.workflows.multi_agent_workflow import run_multi_agent_workflow
 
 
@@ -11,10 +17,10 @@ def query_command(args) -> None:
     """Run a query using the multi-agent workflow."""
     print("🚀 Starting Multi-Agent KG Reasoning Workflow...")
     print(f"❓ Query: {args.query}")
-    print(f"🤖 LLM Provider: {args.llm_provider}")
-    print(f"🎯 Orchestrator Model: {args.orchestrator_model}")
-    print(f"⚙️  Worker Model: {args.worker_model}")
-    print(f"📝 Synthesizer Model: {args.synthesizer_model}")
+    print(f"🤖 LLM Provider: {REASONING_PROVIDER}")
+    print(f"🎯 Orchestrator Model: {ORCHESTRATOR_MODEL}")
+    print(f"⚙️  Worker Model: {WORKER_MODEL}")
+    print(f"📝 Synthesizer Model: {SYNTHESIZER_MODEL}")
     print()
 
     try:
@@ -37,10 +43,6 @@ def query_command(args) -> None:
         # Execute multi-agent workflow
         result = run_multi_agent_workflow(
             user_query=args.query,
-            llm_provider=args.llm_provider,
-            llm_model_orchestrator=args.orchestrator_model,
-            llm_model_worker=args.worker_model,
-            llm_model_synthesizer=args.synthesizer_model,
             qdrant_url=qdrant_url,
             qdrant_api_key=qdrant_api_key,
             neo4j_uri=neo4j_uri,
@@ -92,6 +94,10 @@ Examples:
   %(prog)s query "What drives Thailand ecommerce?"
   %(prog)s query "How does debt affect company performance?" --verbose
   %(prog)s query "What are the main causes of market volatility?" --output result.json
+
+Model configuration is done via environment variables (see .env):
+  REASONING_PROVIDER, ORCHESTRATOR_MODEL, WORKER_MODEL, SYNTHESIZER_MODEL
+  OPENAI_EMBEDDING_MODEL
         """,
     )
 
@@ -105,31 +111,6 @@ Examples:
         "query",
         type=str,
         help="Natural language query to process",
-    )
-    query_parser.add_argument(
-        "--llm-provider",
-        type=str,
-        choices=["openai"],
-        default="openai",
-        help="LLM provider (default: openai)",
-    )
-    query_parser.add_argument(
-        "--orchestrator-model",
-        type=str,
-        default="gpt-4o",
-        help="Model for orchestrator agent (default: gpt-4o)",
-    )
-    query_parser.add_argument(
-        "--worker-model",
-        type=str,
-        default="gpt-4o-mini",
-        help="Model for worker agents (default: gpt-4o-mini)",
-    )
-    query_parser.add_argument(
-        "--synthesizer-model",
-        type=str,
-        default="gpt-4o",
-        help="Model for synthesizer agent (default: gpt-4o)",
     )
     query_parser.add_argument(
         "--output",

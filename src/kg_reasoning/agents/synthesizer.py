@@ -6,6 +6,7 @@ based on the user's original question.
 
 from typing import Any, Dict, List, Optional
 
+from kg_extractor.utils.model_setup import REASONING_PROVIDER, SYNTHESIZER_MODEL
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
@@ -49,8 +50,8 @@ class SynthesizerAgent:
 
     def __init__(
         self,
-        llm_provider: str = "openai",
-        llm_model: str = "gpt-4o",
+        llm_provider: str = REASONING_PROVIDER,
+        llm_model: str = SYNTHESIZER_MODEL,
         temperature: float = 0.3,
     ):
         """Initialize the synthesizer agent.

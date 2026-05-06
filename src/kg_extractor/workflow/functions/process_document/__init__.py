@@ -22,7 +22,7 @@ from .document_parser import (
     process_document_with_google,
 )
 # Re-export API key functions for convenience
-from kg_extractor.utils.api_keys import (
+from kg_extractor.utils.model_setup import (
     get_api_key,
     get_openrouter_api_key,
     get_openai_api_key,

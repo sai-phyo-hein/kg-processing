@@ -6,6 +6,7 @@ up to 5 different query strategies for worker agents to execute.
 
 from typing import Any, Dict, List
 
+from kg_extractor.utils.model_setup import REASONING_PROVIDER, ORCHESTRATOR_MODEL
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
@@ -78,8 +79,8 @@ class OrchestratorAgent:
 
     def __init__(
         self,
-        llm_provider: str = "openai",
-        llm_model: str = "gpt-4o",
+        llm_provider: str = REASONING_PROVIDER,
+        llm_model: str = ORCHESTRATOR_MODEL,
         temperature: float = 0.1,
     ):
         """Initialize the orchestrator agent.

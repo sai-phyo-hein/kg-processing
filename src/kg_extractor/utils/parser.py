@@ -5,7 +5,7 @@ New code should import directly from api_keys or process_document.document_parse
 """
 
 # Re-export API exceptions and key getters from api_keys
-from kg_extractor.utils.api_keys import (
+from kg_extractor.utils.model_setup import (
     NVIDIAAPIError,
     ImageEncodingError,
     OpenRouterAPIError,

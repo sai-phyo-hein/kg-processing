@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+from kg_extractor.utils.model_setup import OPENAI_EMBEDDING_MODEL, get_embedding_client
 from langchain_core.tools import tool
 from qdrant_client import QdrantClient
 
@@ -67,20 +68,11 @@ class QdrantToolsManager:
         return specs
 
     def _get_embeddings(self, texts: List[str]) -> List[List[float]]:
-        """Get embeddings for texts using OpenAI.
-
-        Args:
-            texts: List of texts to embed
-
-        Returns:
-            List of embedding vectors
-        """
+        """Get embeddings for texts using the configured EMBEDDING_PROVIDER."""
         try:
-            from openai import OpenAI
-
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+            client = get_embedding_client()
             response = client.embeddings.create(
-                model="text-embedding-3-small",
+                model=OPENAI_EMBEDDING_MODEL,
                 input=texts,
             )
             return [item.embedding for item in response.data]

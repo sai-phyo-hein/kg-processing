@@ -5,6 +5,13 @@ Defines the shared state structure used across orchestrator, worker, and synthes
 
 from typing import Any, Dict, List, Optional, TypedDict
 
+from kg_extractor.utils.model_setup import (
+    REASONING_PROVIDER,
+    ORCHESTRATOR_MODEL,
+    WORKER_MODEL,
+    SYNTHESIZER_MODEL,
+)
+
 
 class MultiAgentState(TypedDict, total=False):
     """State for the multi-agent knowledge graph reasoning workflow.
@@ -67,10 +74,10 @@ class MultiAgentState(TypedDict, total=False):
 
 def create_initial_state(
     user_query: str,
-    llm_provider: str = "openai",
-    llm_model_orchestrator: str = "gpt-4o",
-    llm_model_worker: str = "gpt-4o-mini",
-    llm_model_synthesizer: str = "gpt-4o",
+    llm_provider: str = REASONING_PROVIDER,
+    llm_model_orchestrator: str = ORCHESTRATOR_MODEL,
+    llm_model_worker: str = WORKER_MODEL,
+    llm_model_synthesizer: str = SYNTHESIZER_MODEL,
     qdrant_url: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
     neo4j_uri: Optional[str] = None,

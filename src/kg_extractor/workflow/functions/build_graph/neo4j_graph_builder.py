@@ -1,6 +1,7 @@
 """Neo4j integration module for knowledge graph storage."""
 
 import json
+import uuid
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -19,8 +20,6 @@ class Neo4jGraphBuilder:
         neo4j_uri: Optional[str] = None,
         neo4j_user: Optional[str] = None,
         neo4j_password: Optional[str] = None,
-        with_schema: bool = False,
-        schema_path: Optional[str] = None,
     ):
         """Initialize the Neo4j graph builder.
 
@@ -28,7 +27,6 @@ class Neo4jGraphBuilder:
             neo4j_uri: Neo4j server URI (from env if not provided)
             neo4j_user: Neo4j username (from env if not provided)
             neo4j_password: Neo4j password (from env if not provided)
-            with_schema: Whether to validate against schema (default: False)
             schema_path: Path to schema.md file (default: utils/schema.md)
         """
         import os
@@ -36,12 +34,6 @@ class Neo4jGraphBuilder:
         self.neo4j_uri = neo4j_uri or os.getenv("NEO4J_URI")
         self.neo4j_user = neo4j_user or os.getenv("NEO4J_USER") or os.getenv("NEO4J_USERNAME")
         self.neo4j_password = neo4j_password or os.getenv("NEO4J_PASSWORD")
-        self.with_schema = with_schema
-
-        # Initialize schema parser if with_schema is enabled
-        self.schema_parser = None
-        if self.with_schema:
-            self.schema_parser = get_schema_parser(schema_path)
 
         # Initialize Neo4j driver
         self._init_neo4j_driver()
@@ -68,6 +60,18 @@ class Neo4jGraphBuilder:
         if hasattr(self, 'driver'):
             self.driver.close()
 
+    def _generate_canonical_id(self, name: str) -> str:
+        """Generate a deterministic UUID from an entity name.
+        
+        Args:
+            name: Entity name (preferably the canonical English form)
+            
+        Returns:
+            UUID string
+        """
+        namespace = uuid.UUID("00000000-0000-0000-0000-000000000000")
+        return str(uuid.uuid5(namespace, name))
+
     def _create_constraints(self):
         """Create constraints for unique nodes."""
         constraints = [
@@ -91,25 +95,9 @@ class Neo4jGraphBuilder:
         Returns:
             True if valid, False otherwise
         """
-        if not self.with_schema or self.schema_parser is None:
-            return True
-
-        # Map common entity types to schema node types
-        type_mapping = {
-            "Entity": "Entity",  # Generic entity
-            "SocialCapital": "SocialCapital",
-            "Activity": "Activity",
-            "Impact": "Impact",
-            "TargetGroup": "TargetGroup",
-            "Domain": "Domain",
-            "Tambon": "Tambon",
-            "Village": "Village",
-            "Evidence": "Evidence",
-        }
-
-        # Check if the type is in our mapping or directly valid
-        mapped_type = type_mapping.get(entity_type, entity_type)
-        return self.schema_parser.validate_node_type(mapped_type)
+        # Schema validation is currently disabled - accept all entity types
+        # TODO: Enable schema validation by initializing self.schema_parser in __init__
+        return True
 
     def _validate_relation(
         self,
@@ -127,26 +115,9 @@ class Neo4jGraphBuilder:
         Returns:
             True if valid, False otherwise
         """
-        if not self.with_schema or self.schema_parser is None:
-            return True
-
-        # Map common entity types to schema node types
-        type_mapping = {
-            "Entity": "Entity",  # Generic entity
-            "SocialCapital": "SocialCapital",
-            "Activity": "Activity",
-            "Impact": "Impact",
-            "TargetGroup": "TargetGroup",
-            "Domain": "Domain",
-            "Tambon": "Tambon",
-            "Village": "Village",
-            "Evidence": "Evidence",
-        }
-
-        mapped_subject = type_mapping.get(subject_type, subject_type)
-        mapped_object = type_mapping.get(object_type, object_type)
-
-        return self.schema_parser.validate_relation(mapped_subject, relation, mapped_object)
+        # Schema validation is currently disabled - accept all relations
+        # TODO: Enable schema validation by initializing self.schema_parser in __init__
+        return True
 
     def _batch_create_nodes(
         self,
@@ -269,12 +240,17 @@ class Neo4jGraphBuilder:
 
             for triple in chunk_data.get("triples", []):
                 try:
-                    # Get source entity (subject) with canonical_id
-                    source_refinement = triple["refinement"]["subject"]
-                    source_canonical_id = source_refinement["canonical_id"]
+                    # Get source entity (subject)
+                    # Use canonical_id from refined triple (Qdrant point_id) if present;
+                    # fall back to generating it from the canonical English name.
                     source_name = triple["subject"]["name"]
                     # Support both new "label" field and legacy "type" field
                     source_type = triple["subject"].get("label") or triple["subject"].get("type", "Entity")
+                    source_name_for_id = triple["subject"].get("name_en", source_name)
+                    source_canonical_id = (
+                        triple["subject"].get("canonical_id")
+                        or self._generate_canonical_id(source_name_for_id)
+                    )
 
                     if source_canonical_id and source_canonical_id not in created_entities:
                         created_entities[source_canonical_id] = {
@@ -283,12 +259,15 @@ class Neo4jGraphBuilder:
                             "type": source_type,
                         }
 
-                    # Get target entity (object) with canonical_id
-                    target_refinement = triple["refinement"]["object"]
-                    target_canonical_id = target_refinement["canonical_id"]
+                    # Get target entity (object)
                     target_name = triple["object"]["name"]
                     # Support both new "label" field and legacy "type" field
                     target_type = triple["object"].get("label") or triple["object"].get("type", "Entity")
+                    target_name_for_id = triple["object"].get("name_en", target_name)
+                    target_canonical_id = (
+                        triple["object"].get("canonical_id")
+                        or self._generate_canonical_id(target_name_for_id)
+                    )
 
                     if target_canonical_id and target_canonical_id not in created_entities:
                         created_entities[target_canonical_id] = {
@@ -326,7 +305,7 @@ class Neo4jGraphBuilder:
                         })
 
                 except Exception as e:
-                    error_msg = f"Chunk {chunk_id}, Triple: {e}"
+                    error_msg = f"Chunk {chunk_id}, Triple: {str(e)}"
                     stats["errors"].append(error_msg)
                     print(f"Warning: {error_msg}")
 
@@ -351,8 +330,6 @@ def build_graph_from_file(
     neo4j_uri: Optional[str] = None,
     neo4j_user: Optional[str] = None,
     neo4j_password: Optional[str] = None,
-    with_schema: bool = False,
-    schema_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Build Neo4j graph from refined triples file.
 
@@ -361,8 +338,6 @@ def build_graph_from_file(
         neo4j_uri: Neo4j server URI
         neo4j_user: Neo4j username
         neo4j_password: Neo4j password
-        with_schema: Whether to validate against schema (default: False)
-        schema_path: Path to schema.md file (default: utils/schema.md)
 
     Returns:
         Statistics about the graph building process
@@ -375,9 +350,7 @@ def build_graph_from_file(
     builder = Neo4jGraphBuilder(
         neo4j_uri=neo4j_uri,
         neo4j_user=neo4j_user,
-        neo4j_password=neo4j_password,
-        with_schema=with_schema,
-        schema_path=schema_path,
+        neo4j_password=neo4j_password
     )
 
     try:

@@ -175,7 +175,7 @@ class WorkerAgent:
 def execute_strategy_parallel(
     strategy: Dict[str, Any],
     user_query: Optional[str] = None,
-    llm_model: str = "gpt-4o-mini",
+    llm_model: str = None,
 ) -> Dict[str, Any]:
     """Helper for parallel execution — llm_model unused, kept for API compatibility."""
     return WorkerAgent().execute_strategy(strategy, user_query)

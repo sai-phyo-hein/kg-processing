@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
+from kg_extractor.utils.model_setup import OPENAI_EMBEDDING_MODEL, get_embedding_client
 
 # Load environment variables
 load_dotenv()
@@ -94,11 +95,15 @@ class MetadataUpdater:
         """Get the vector configuration for the collection."""
         return self.registry_spec.get("vector_config", {"size": 1536, "distance": "Cosine"})
 
+    def _get_collection_name(self) -> str:
+        """Get the collection name for metadata storage."""
+        return self.registry_spec.get("collection_name", "metadata_registry")
+
     def _ensure_collection_exists(self):
         """Ensure metadata_registry collection exists in Qdrant."""
         from qdrant_client.http import models as qdrant_models
 
-        collection_name = "metadata_registry"
+        collection_name = self._get_collection_name()
 
         try:
             # Check if collection exists
@@ -156,13 +161,10 @@ class MetadataUpdater:
             Embedding vector
         """
         try:
-            from openai import OpenAI
-
-            openai_api_key = os.getenv("OPENAI_API_KEY")
-            client = OpenAI(api_key=openai_api_key)
+            client = get_embedding_client()
 
             response = client.embeddings.create(
-                model="text-embedding-3-small",
+                model=OPENAI_EMBEDDING_MODEL,
                 input=text,
             )
             return response.data[0].embedding
@@ -200,13 +202,13 @@ class MetadataUpdater:
         if metadata.get("location_country"):
             parts.append(f"Country: {metadata['location_country']}")
         
-        return " | ".join(parts)
+        return " | ".join(parts) if parts else "unknown document"
 
     def _query_similar_metadata(
         self,
         metadata: Dict[str, Any],
         limit: int = 5,
-        score_threshold: float = 0.85,
+        score_threshold: float = 0.95,
     ) -> List[Dict[str, Any]]:
         """Query Qdrant for similar metadata entries.
 
@@ -228,7 +230,7 @@ class MetadataUpdater:
 
             # Search using vector similarity
             search_results = self.qdrant_client.query_points(
-                collection_name="metadata_registry",
+                collection_name=self._get_collection_name(),
                 query=query_vector,
                 using=vector_name,
                 limit=limit,
@@ -270,7 +272,7 @@ class MetadataUpdater:
 
         # Try to query for similar metadata (with fallback if it fails)
         try:
-            similar_metadata = self._query_similar_metadata(metadata, limit=3, score_threshold=0.85)
+            similar_metadata = self._query_similar_metadata(metadata, limit=3, score_threshold=0.95)
 
             if similar_metadata:
                 # Use existing metadata
@@ -321,7 +323,7 @@ class MetadataUpdater:
         # Upsert to Qdrant with retry
         try:
             self.qdrant_client.upsert(
-                collection_name="metadata_registry",
+                collection_name=self._get_collection_name(),
                 points=[point],
                 wait=True,  # Wait for indexing to complete
             )
@@ -343,7 +345,7 @@ class MetadataUpdater:
             point_id = self._generate_uuid(unique_id)
             
             result = self.qdrant_client.retrieve(
-                collection_name="metadata_registry",
+                collection_name=self._get_collection_name(),
                 ids=[point_id],
                 with_payload=True,
             )
@@ -365,7 +367,7 @@ class MetadataUpdater:
         try:
             # Scroll through all points
             scroll_result = self.qdrant_client.scroll(
-                collection_name="metadata_registry",
+                collection_name=self._get_collection_name(),
                 limit=1000,
                 with_payload=True,
             )
@@ -377,7 +379,7 @@ class MetadataUpdater:
             # Continue scrolling if there are more pages
             while next_page:
                 scroll_result = self.qdrant_client.scroll(
-                    collection_name="metadata_registry",
+                    collection_name=self._get_collection_name(),
                     limit=1000,
                     with_payload=True,
                     offset=next_page,
@@ -432,7 +434,7 @@ class MetadataUpdater:
             )
 
             scroll_result = self.qdrant_client.scroll(
-                collection_name="metadata_registry",
+                collection_name=self._get_collection_name(),
                 scroll_filter=search_filter,
                 limit=1000,
                 with_payload=True,
@@ -460,7 +462,7 @@ class MetadataUpdater:
             point_id = self._generate_uuid(unique_id)
             
             self.qdrant_client.delete(
-                collection_name="metadata_registry",
+                collection_name=self._get_collection_name(),
                 points_selector=qdrant_models.PointIdsList(
                     points=[point_id]
                 ),

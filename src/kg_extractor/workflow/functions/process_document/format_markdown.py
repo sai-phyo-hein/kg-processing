@@ -161,7 +161,7 @@ def save_markdown_result(result: Dict[str, Any], file_path: str, output_dir: str
     """
     # Set default output directory to project root/output
     if output_dir is None:
-        output_dir = str(Path(__file__).parent.parent.parent.parent / "output")
+        output_dir = str(Path(__file__).parent.parent.parent.parent.parent.parent / "output")
 
     # Create output directory if it doesn't exist
     output_path = Path(output_dir)
@@ -213,7 +213,7 @@ def save_text_markdown(text: str, file_path: str, output_dir: str = None) -> str
     """
     # Set default output directory to project root/output
     if output_dir is None:
-        output_dir = str(Path(__file__).parent.parent.parent.parent / "output")
+        output_dir = str(Path(__file__).parent.parent.parent.parent.parent.parent / "output")
 
     # Create output directory if it doesn't exist
     output_path = Path(output_dir)

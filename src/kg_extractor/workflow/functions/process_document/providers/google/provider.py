@@ -7,7 +7,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
-from kg_extractor.utils.api_keys import GoogleAPIError
+from kg_extractor.utils.model_setup import GoogleAPIError
 from ...document_processor import DocumentProcessor, get_parsing_prompt
 from ..base import (
     DEFAULT_MAX_TOKENS,

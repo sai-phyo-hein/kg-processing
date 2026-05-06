@@ -40,7 +40,6 @@ def extract_triples_node(state: "WorkflowState") -> "WorkflowState":
             llm_provider=state["triplet_llm_provider"],
             llm_model=state["triplet_llm_model"],
             output_dir=state["output_dir"],
-            with_schema=state["with_schema"],
             community_id=community_id,
         )
 

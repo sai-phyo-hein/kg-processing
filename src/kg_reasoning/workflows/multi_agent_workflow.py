@@ -10,6 +10,12 @@ from typing import Any, Dict, Optional
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 
+from kg_extractor.utils.model_setup import (
+    REASONING_PROVIDER,
+    ORCHESTRATOR_MODEL,
+    WORKER_MODEL,
+    SYNTHESIZER_MODEL,
+)
 from kg_reasoning.agents.orchestrator import OrchestratorAgent
 from kg_reasoning.agents.worker import WorkerAgent, execute_strategy_parallel
 from kg_reasoning.agents.synthesizer import SynthesizerAgent
@@ -268,10 +274,10 @@ def create_workflow() -> StateGraph:
 
 def run_multi_agent_workflow(
     user_query: str,
-    llm_provider: str = "openai",
-    llm_model_orchestrator: str = "gpt-4o",
-    llm_model_worker: str = "gpt-4o-mini",
-    llm_model_synthesizer: str = "gpt-4o",
+    llm_provider: str = REASONING_PROVIDER,
+    llm_model_orchestrator: str = ORCHESTRATOR_MODEL,
+    llm_model_worker: str = WORKER_MODEL,
+    llm_model_synthesizer: str = SYNTHESIZER_MODEL,
     qdrant_url: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
     neo4j_uri: Optional[str] = None,

@@ -6,14 +6,8 @@
 #             These are also used to build unique_id (joined with "_").
 
 fields:
-  - document_title
-  - document_file_name
-  - document_file_type
-  - document_total_pages
-  - document_content_type
   - location_village
   - location_moo
-  - location_country
 
 mandatory:
   - location_moo

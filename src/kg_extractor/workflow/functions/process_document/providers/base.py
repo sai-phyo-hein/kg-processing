@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List
 
-from kg_extractor.utils.api_keys import ImageEncodingError
+from kg_extractor.utils.model_setup import ImageEncodingError
 
 # Shared constants
 DEFAULT_MAX_TOKENS = 2048

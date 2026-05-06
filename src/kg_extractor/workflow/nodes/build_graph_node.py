@@ -36,7 +36,6 @@ def build_graph_node(state: "WorkflowState") -> "WorkflowState":
             neo4j_uri=neo4j_uri,
             neo4j_user=neo4j_user,
             neo4j_password=neo4j_password,
-            with_schema=state["with_schema"],
         )
 
         state["graph_stats"] = stats

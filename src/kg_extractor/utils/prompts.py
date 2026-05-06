@@ -5,59 +5,6 @@ import yaml
 from pathlib import Path
 
 
-def get_schema_content() -> str:
-    """Read and return the schema content from schema.yaml.
-
-    Returns:
-        Schema content as a formatted string for use in prompts
-    """
-    # Get the directory containing schema.yaml
-    current_dir = Path(__file__).resolve()
-    schema_path = current_dir.parent / "schema.yaml"
-
-    if not schema_path.exists():
-        raise FileNotFoundError(f"Schema file not found at {schema_path}")
-
-    with open(schema_path, 'r', encoding='utf-8') as f:
-        schema_data = yaml.safe_load(f)
-
-    # Format the schema content for use in prompts
-    formatted_schema = """
-═══════════════════════════════════════
-SCHEMA VALIDATION RULES
-═══════════════════════════════════════
-
-You MUST extract triples that conform to the RECAP schema. Only use the following
-node types and relations:
-
-VALID NODE TYPES:
-"""
-
-    # Add node types
-    for node_type in schema_data['node_types']:
-        formatted_schema += f"- {node_type}\n"
-
-    # Add relations
-    formatted_schema += "\nVALID RELATIONS:\n"
-    for relation in schema_data['relations']:
-        formatted_schema += f"- {relation}\n"
-
-    # Add enum values
-    formatted_schema += "\nENUM VALUES:\n"
-    for enum_name, values in schema_data['enum_values'].items():
-        formatted_schema += f"- {enum_name}: {', '.join(values)}\n"
-
-    formatted_schema += """
-CRITICAL: Do NOT extract triples with node types or relations that are not in the
-above lists. If the text describes entities or relationships that don't match the
-schema, either:
-1. Map them to the closest valid schema type/relation, OR
-2. Skip that triple entirely
-
-"""
-    return formatted_schema
-
-
 def get_parsing_prompt() -> str:
     """Get the system prompt for content extraction.
 
@@ -291,10 +238,14 @@ def create_chunking_prompt(
     file_path: str,
     chunk_granularity: float,
 ) -> str:
-    """Create a prompt for the LLM to analyze content and determine chunk boundaries.
+    """Create a prompt for the LLM to identify chunk boundary line numbers.
+
+    The LLM receives numbered lines and returns only the line numbers where
+    new chunks should begin. The actual text is extracted programmatically,
+    keeping LLM output minimal and ensuring 100% content coverage.
 
     Args:
-        content: Full content of the markdown file
+        content: Content of the section, with each line prefixed by its number
         file_path: Path to the file
         chunk_granularity: Threshold for chunk granularity (0.0-1.0)
 
@@ -327,101 +278,56 @@ def create_chunking_prompt(
             "unless they contain clearly unrelated subjects."
         )
 
-    prompt = f"""You are a document segmentation expert. Your task is to split the
-following document content into semantically self-contained chunks for knowledge
-graph extraction.
+    prompt = f"""You are a document segmentation expert. Your task is to identify where
+to split the following numbered lines into semantically self-contained chunks for
+knowledge graph extraction.
 
 File: {file_path}
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-CONTENT
+NUMBERED CONTENT (format: [line_number] text)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 {content}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-IMPORTANT: Process ONLY the content that appears below the <start> flag and above the </end> flag.
-Ignore any content above <start> or below </end> (headers, metadata, etc.).
-
 CHUNKING RULES:
 
-PRIORITY: Content coverage (Rule 6) > Semantic completeness (Rule 1)
-
-1. SEMANTIC COMPLETENESS — every chunk must be self-contained.
-   A chunk must never start mid-sentence or mid-list. If a sentence begins in
-   one section and its meaning depends on the previous paragraph, keep them together.
+1. SEMANTIC COMPLETENESS — chunks must never start mid-sentence or mid-list.
+   If a sentence spans multiple lines, keep them in the same chunk.
 
 2. BOUNDARY DETECTION — split when the subject changes, not when formatting changes.
-   Headers (##, ---) are hints but not hard boundaries. Two paragraphs under the same
-   header can be different chunks if they cover different topics.
+   Headers (##, ---) are hints but not hard boundaries.
 
-3. TABLE AND CHART DATA — sentences verbalized from a table or chart must stay in
-   the same chunk as the paragraph that introduces that table or chart.
-   Example: "According to Table 1..." sentences must NOT be split from the paragraph
-   that says "Table 1 shows valuation multiples..."
+3. TABLE AND CHART DATA — lines that verbalize a table or chart must stay with
+   the paragraph that introduces that table or chart.
 
-4. NUMERIC FACTS — never split a sentence that contains a numeric value from the
-   sentence that names what that value applies to.
-   WRONG: chunk A = "Small businesses have an EBITDA multiple of"
-          chunk B = "3.5x–5.0x in Bangkok."
-   CORRECT: keep the full sentence in one chunk.
+4. NUMERIC FACTS — never split a line containing a numeric value from the line
+   that names what that value applies to.
 
 5. GRANULARITY — use a {granularity} approach: {granularity_instruction}
+   MINIMUM CHUNK SIZE: each chunk must span at least 5 lines unless the section
+   has fewer than 5 lines total. Do NOT create a new split for every sentence.
 
-6. COMPREHENSIVE PROCESSING — process ALL content in the section.
-   Do NOT skip or discard any content unless it's purely whitespace.
-   Every sentence, table reference, and data point must be included in chunks.
-   Even repetitive content, headers, and structural elements should be preserved.
-   CRITICAL: Your chunks must collectively contain at least 90% of the original content.
-   Content preservation takes priority over all other rules.
+6. COVERAGE — every line in this section must belong to exactly one chunk.
+   Do NOT skip any lines.
 
-7. PRONOUN REPLACEMENT — replace ALL pronouns with explicit references.
-   Every chunk must be self-contained without relying on external context.
-   Replace pronouns with the actual entity names they refer to:
-   - "it" → the specific entity name (e.g., "the EBITDA multiple", "the valuation premium")
-   - "they" → the specific entities (e.g., "small businesses", "advisor-led transactions")
-   - "this" → the specific concept (e.g., "this metric", "this process stage")
-   - "that" → the specific entity (e.g., "that business category", "that valuation range")
-   - "its" → the specific entity's name (e.g., "the business's", "the market's")
-   - "their" → the specific entities' names (e.g., "small businesses'", "transactions'")
-   - "these" → the specific items (e.g., "these metrics", "these businesses")
-   - "those" → the specific items (e.g., "those businesses", "those ranges")
-
-   EXAMPLE:
-   WRONG: "Small businesses have an EBITDA multiple of 3.5x–5.0x. It varies by region."
-   CORRECT: "Small businesses have an EBITDA multiple of 3.5x–5.0x. The EBITDA multiple varies by region."
-
-   WRONG: "Advisor-led transactions close faster. They achieve higher valuations."
-   CORRECT: "Advisor-led transactions close faster. Advisor-led transactions achieve higher valuations."
-
-OUTPUT FORMAT — return ONLY valid JSON, no commentary:
+OUTPUT RULES — CRITICAL:
+- Return ONLY a JSON object with a single key "split_at"
+- The value is a compact list of integers (line numbers where each chunk begins)
+- DO NOT include any content, quotes, or text from the document
+- DO NOT explain your reasoning
+- The total response must be under 200 characters
 
 ```json
-{{
-  "chunks": [
-    {{
-      "chunk_id": 1,
-      "content": "The full verbatim text of this chunk..."
-    }},
-    {{
-      "chunk_id": 2,
-      "content": "The full verbatim text of this chunk..."
-    }}
-  ]
-}}
+{{"split_at": [1, 15, 32, 67]}}
 ```
 
-The `content` field must contain the actual text — not a summary or placeholder.
+Where `split_at` is a list of line numbers that begin a new chunk.
+- The first value MUST be 1.
+- Line numbers must be in ascending order.
+- Reference only line numbers shown in the [NNNN] prefixes above.
 
-CRITICAL VALIDATION REQUIREMENT:
-Before returning your JSON, verify that:
-1. The total character count of all chunk contents is at least 90% of the original content character count
-2. No substantive content has been skipped or summarized
-3. All sentences, data points, and factual information are preserved
-
-If your chunks contain less than 90% of the original content, revise your chunking strategy
-to include more content rather than splitting differently.
-
-Analyze the content and return chunks in JSON format:"""
+Respond with ONLY the JSON object:"""
 
     return prompt
 
@@ -430,7 +336,6 @@ def create_triple_extraction_prompt(
     content: str,
     source_file: str,
     chunk_id: int,
-    with_schema: bool = False,
 ) -> str:
     """Create a prompt for the LLM to extract knowledge graph triples.
 
@@ -438,18 +343,14 @@ def create_triple_extraction_prompt(
         content: Content of the chunk to analyze
         source_file: Source file path for context
         chunk_id: Chunk identifier
-        with_schema: Whether to enforce schema validation (default: False)
 
     Returns:
         Prompt string for the LLM
     """
-    schema_rules = ""
-    if with_schema:
-        schema_rules = get_schema_content()
 
     prompt = f"""You are a knowledge graph extraction engine. Your task is to extract
 every factual relationship from the text below as structured triples.
-{schema_rules}
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SOURCE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

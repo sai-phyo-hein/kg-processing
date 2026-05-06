@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterator, List, Optional
 
 import requests
 
-from kg_extractor.utils.api_keys import NVIDIAAPIError, ImageEncodingError
+from kg_extractor.utils.model_setup import NVIDIAAPIError, ImageEncodingError
 from ...document_processor import DocumentProcessor, get_parsing_prompt
 from ..base import (
     encode_image,
@@ -194,6 +194,21 @@ def _process_single_page_nvidia(
                 result = response.json()
                 if "choices" in result and len(result["choices"]) > 0:
                     content = result["choices"][0]["message"]["content"]
+
+                    # Handle None content response
+                    if content is None:
+                        result_dict = {
+                            "page_number": page_num,
+                            "content": {"text": "[Empty page - no content extracted]"},
+                            "metadata": {
+                                "has_text": False,
+                                "has_diagrams": False,
+                                "has_tables": False,
+                                "content_quality": "low",
+                            },
+                        }
+                        time.sleep(NVIDIA_RATE_LIMIT_DELAY)
+                        return result_dict
 
                     try:
                         parsed_content = json.loads(content)
