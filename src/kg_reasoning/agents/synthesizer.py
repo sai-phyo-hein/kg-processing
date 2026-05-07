@@ -6,9 +6,8 @@ based on the user's original question.
 
 from typing import Any, Dict, List, Optional
 
-from kg_extractor.utils.model_setup import REASONING_PROVIDER, SYNTHESIZER_MODEL
+from kg_extractor.utils.model_setup import REASONING_PROVIDER, SYNTHESIZER_MODEL, get_reasoning_llm
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import create_react_agent
 
 from kg_reasoning.agents.tools.markdown_tools import (
@@ -26,17 +25,32 @@ SYNTHESIZER_SYSTEM_PROMPT = """You are a Knowledge Answer Synthesizer. Your job 
 - Translate everything into plain subject-matter language. If a result says Entity A has a relationship "causes" to Entity B, write "A causes B."
 - Focus entirely on the real-world meaning of the data.
 
+## CRITICAL: No Results = No Answer
+
+**If the query results show "No results found" or 0 records, you MUST state that no information is available in the knowledge graph.**
+- Do NOT make up or infer information.
+- Do NOT provide generic answers based on the question topic.
+- Do NOT use any knowledge outside of the query results.
+- Simply state clearly that the knowledge graph has no information about the requested topic.
+
 ## How to Synthesize
 
-1. **Read all results** using read_query_results (no filepath argument) to get every recent result file.
-2. **Extract the facts** — ignore technical metadata; pull out names, events, quantities, dates, and connections that are relevant to the question.
-3. **Answer directly** — open with a thorough, explanatory answer to the question. Go beyond a single sentence: explain the key drivers, dynamics, or mechanisms at play, and why they matter. Write 3–5 sentences.
-4. **Add supporting detail** — elaborate with specifics drawn from the results (who, what, when, where, why, how).
+1. **FIRST: Call read_query_results tool** with an empty string for filepath parameter: read_query_results(filepath="") to read ALL recent result files.
+2. **Check if there are any results** — if all files show "No results found" or 0 records, immediately state that no information is available and stop.
+3. **Extract the facts** (only if results exist) — ignore technical metadata; pull out names, events, quantities, dates, and connections that are relevant to the question.
+4. **Answer directly** (only if results exist) — open with a thorough, explanatory answer to the question. Go beyond a single sentence: explain the key drivers, dynamics, or mechanisms at play, and why they matter. Write 3–5 sentences.
+5. **Add supporting detail** (only if results exist) — elaborate with specifics drawn from the results (who, what, when, where, why, how).
+
+**CRITICAL**: You MUST call the read_query_results tool. Do not try to answer without reading the query results first.
 
 ## Output Format
 
+**When results exist:**
 - **Answer**: A thorough paragraph (3–5 sentences) that directly and fully answers the question — not just a summary statement, but an explanation of the underlying drivers, relationships, and significance.
 - **Details**: Supporting facts and context in natural prose or a simple bullet list.
+
+**When no results exist:**
+- **Answer**: A clear statement that the knowledge graph has no information about the requested topic.
 
 Do not include sections titled "Limitations", "Data Sources", "Strategies", "Confidence Level", or any other technical meta-section.
 
@@ -57,18 +71,15 @@ class SynthesizerAgent:
         """Initialize the synthesizer agent.
 
         Args:
-            llm_provider: LLM provider (currently only "openai" supported)
+            llm_provider: LLM provider (supports: openai, openrouter, groq, nvidia)
             llm_model: Model name (use capable model for synthesis)
             temperature: LLM temperature (higher for more creative synthesis)
         """
         self.llm_provider = llm_provider
         self.llm_model = llm_model
 
-        # Initialize LLM
-        if llm_provider == "openai":
-            self.llm = ChatOpenAI(model=llm_model, temperature=temperature)
-        else:
-            raise ValueError(f"Unsupported LLM provider: {llm_provider}")
+        # Initialize LLM using helper function that supports multiple providers
+        self.llm = get_reasoning_llm(model=llm_model, temperature=temperature)
 
         # Setup tools
         self.tools = [
@@ -105,7 +116,7 @@ class SynthesizerAgent:
             )
 
         instruction += (
-            "Please read all available query results and write a plain-language answer to the question above."
+            "Please call the read_query_results tool with filepath=\"\" to read all available query results, then write a plain-language answer to the question above."
         )
 
         # Execute agent
@@ -131,12 +142,17 @@ class SynthesizerAgent:
         files_read = 0
         results_analyzed = 0
 
-        for step in intermediate_steps:
-            if hasattr(step[0], "name"):
-                if "read_query_results" in step[0].name:
-                    files_read += 1
-                if "list_query_results" in step[0].name:
-                    files_read += 1
+        # Check if tools were actually called
+        if "messages" in result:
+            for msg in result["messages"]:
+                if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls"):
+                    if msg.tool_calls:
+                        for tc in msg.tool_calls:
+                            tool_name = tc.get("name", "")
+                            if "read_query_results" in tool_name:
+                                files_read += 1
+                            elif "list_query_results" in tool_name:
+                                files_read += 1
 
         return {
             "answer": answer.strip(),

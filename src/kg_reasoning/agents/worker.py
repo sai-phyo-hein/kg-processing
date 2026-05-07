@@ -26,23 +26,39 @@ def _execute_expansion(
 
     # Build expansion query
     rel_filter = f":{':'.join(rel_types)}" if rel_types else ""
+    params: Dict[str, Any] = {"entity_ids": entity_ids}
+    
     if depth == 1:
+        # Single-hop expansion
         pattern = f"(start)-[r{rel_filter}]-(connected)"
         return_clause = "RETURN start, r, connected, r.community_id AS community_id"
-    else:
-        pattern = f"path = (start)-[r{rel_filter}*1..{depth}]-(connected)"
-        return_clause = "RETURN path, relationships(path) AS rels"
-
-    community_filter = ""
-    params: Dict[str, Any] = {"entity_ids": entity_ids}
-    if community_ids:
-        community_filter = "AND r.community_id IN $community_ids"
-        params["community_ids"] = community_ids
-
-    cypher = f"""MATCH (start)
+        
+        community_filter = ""
+        if community_ids:
+            community_filter = "AND r.community_id IN $community_ids"
+            params["community_ids"] = community_ids
+        
+        cypher = f"""MATCH (start)
 WHERE start.canonical_id IN $entity_ids
 MATCH {pattern}
 WHERE true {community_filter}
+{return_clause}
+LIMIT {limit}"""
+    else:
+        # Multi-hop expansion (depth > 1)
+        pattern = f"path = (start)-[r{rel_filter}*1..{depth}]-(connected)"
+        return_clause = "RETURN path, relationships(path) AS rels"
+        
+        # For multi-hop, need to check ALL relationships in the path
+        community_filter = ""
+        if community_ids:
+            community_filter = "WHERE ALL(rel IN relationships(path) WHERE rel.community_id IN $community_ids)"
+            params["community_ids"] = community_ids
+        
+        cypher = f"""MATCH (start)
+WHERE start.canonical_id IN $entity_ids
+MATCH {pattern}
+{community_filter}
 {return_clause}
 LIMIT {limit}"""
 
@@ -122,6 +138,28 @@ LIMIT {limit}"""
     return filepath
 
 
+def _execute_community_exploration(
+    community_ids: List[str],
+    parameters: Dict[str, Any],
+    strategy_name: str,
+) -> str:
+    """Run broad community exploration by querying all relationships in the community."""
+    neo = _get_neo4j_manager()
+    md = _get_md_manager()
+
+    limit = parameters.get("limit", 100)
+    params: Dict[str, Any] = {"community_ids": community_ids}
+
+    cypher = f"""MATCH (subject)-[r]->(object)
+WHERE r.community_id IN $community_ids
+RETURN subject, r, object, r.community_id AS community_id
+LIMIT {limit}"""
+
+    results = neo.execute_cypher_query(cypher, params, limit)
+    filepath = md.write_query_results(strategy_name, cypher, results)
+    return filepath
+
+
 class WorkerAgent:
     """Executes a single query strategy directly — no LLM round-trips."""
 
@@ -152,6 +190,8 @@ class WorkerAgent:
                 filepath = _execute_expansion(entity_ids, community_ids, parameters, name)
             elif approach == "path":
                 filepath = _execute_path(entity_ids, community_ids, parameters, name)
+            elif approach == "community_exploration":
+                filepath = _execute_community_exploration(community_ids, parameters, name)
             else:  # "direct" and anything else
                 filepath = _execute_direct(entity_ids, predicate_ids, community_ids, parameters, name)
 

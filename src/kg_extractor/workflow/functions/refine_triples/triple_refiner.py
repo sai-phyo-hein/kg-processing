@@ -211,6 +211,18 @@ class TripleRefiner:
             except Exception as e:
                 print(f"  Warning: Could not create payload index on 'is_canonical' for '{qdrant_name}': {e}")
 
+            predicate_spec = self._role_to_spec_key.get("predicate", "predicate_registry")
+            if spec_key == predicate_spec:
+                try:
+                    self.qdrant_client.create_payload_index(
+                        collection_name=qdrant_name,
+                        field_name="community_id",
+                        field_schema=qm.PayloadSchemaType.KEYWORD,
+                    )
+                    print(f"  Payload index on 'community_id' ensured for '{qdrant_name}'.")
+                except Exception as e:
+                    print(f"  Warning: Could not create payload index on 'community_id' for '{qdrant_name}': {e}")
+
             if spec_key == label_spec:
                 try:
                     self.qdrant_client.create_payload_index(
@@ -311,6 +323,7 @@ class TripleRefiner:
         collection_name: str,
         query_vector: List[float],
         limit: int = 1,
+        community_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Search for canonical entities above the similarity threshold.
 
@@ -321,6 +334,9 @@ class TripleRefiner:
             collection_name: Qdrant collection to search
             query_vector: **English** embedding of the incoming entity
             limit: Maximum number of results
+            community_id: When set (predicates only), restricts matches to the
+                          same community so cross-community canonicals are never
+                          merged together.
 
         Returns:
             List of dicts with keys: id, score, payload
@@ -330,6 +346,20 @@ class TripleRefiner:
 
             vec_en, _ = self._vector_names(collection_name)  # e.g. "entity_en"
 
+            must_conditions = [
+                qm.FieldCondition(
+                    key="is_canonical",
+                    match=qm.MatchValue(value=True),
+                )
+            ]
+            if community_id:
+                must_conditions.append(
+                    qm.FieldCondition(
+                        key="community_id",
+                        match=qm.MatchValue(value=community_id),
+                    )
+                )
+
             search_results = self.qdrant_client.query_points(
                 collection_name=self._qdrant_name(collection_name),
                 query=query_vector,
@@ -337,14 +367,7 @@ class TripleRefiner:
                 limit=limit,
                 with_payload=True,
                 score_threshold=self.similarity_threshold,
-                query_filter=qm.Filter(
-                    must=[
-                        qm.FieldCondition(
-                            key="is_canonical",
-                            match=qm.MatchValue(value=True),
-                        )
-                    ]
-                ),
+                query_filter=qm.Filter(must=must_conditions),
             )
 
             return [
@@ -361,6 +384,7 @@ class TripleRefiner:
         collection_name: str,
         query_vectors: List[List[float]],
         limit: int = 1,
+        community_ids: Optional[List[Optional[str]]] = None,
     ) -> Dict[str, List[Dict[str, Any]]]:
         """Batch query for canonical entities in chunks.
 
@@ -368,6 +392,10 @@ class TripleRefiner:
             collection_name: Qdrant collection to search
             query_vectors: List of embedding vectors
             limit: Maximum results per query
+            community_ids: Optional per-vector community_id values.  When a
+                           community_id is non-None (predicates only), the
+                           corresponding query is filtered to that community so
+                           cross-community canonicals are never matched.
 
         Returns:
             Dict mapping query_vector index to list of matches [{"id", "score", "payload"}, ...]
@@ -376,6 +404,24 @@ class TripleRefiner:
         
         results: Dict[int, List[Dict[str, Any]]] = {}
         vec_en, _ = self._vector_names(collection_name)
+
+        # Build a per-index filter that optionally adds a community_id condition.
+        def _make_filter(idx: int) -> qm.Filter:
+            must_conditions = [
+                qm.FieldCondition(
+                    key="is_canonical",
+                    match=qm.MatchValue(value=True),
+                )
+            ]
+            cid = (community_ids[idx] if community_ids and idx < len(community_ids) else None)
+            if cid:
+                must_conditions.append(
+                    qm.FieldCondition(
+                        key="community_id",
+                        match=qm.MatchValue(value=cid),
+                    )
+                )
+            return qm.Filter(must=must_conditions)
 
         canonical_filter = qm.Filter(
             must=[
@@ -396,10 +442,10 @@ class TripleRefiner:
                     limit=limit,
                     with_payload=True,
                     score_threshold=self.similarity_threshold,
-                    filter=canonical_filter,
+                    filter=_make_filter(i + local_idx),
                     using=vec_en,
                 )
-                for vec in chunk
+                for local_idx, vec in enumerate(chunk)
             ]
 
             max_attempts = 4
@@ -568,8 +614,13 @@ class TripleRefiner:
                 name = entity["name"]
                 name_en = entity.get("name_en")
 
-                # UUID keyed on English label → same real-world concept = same point
+                # UUID keyed on English label → same real-world concept = same point.
+                # For predicates the key also encodes community_id so identical
+                # predicate names from different communities get distinct points.
                 canonical_key = name_en or name
+                community_id  = entity.get("community_id")
+                if community_id:
+                    canonical_key = f"{canonical_key}::{community_id}"
                 point_id = self._generate_uuid(canonical_key)
 
                 # Named vectors — names come from the collection's spec
@@ -588,6 +639,8 @@ class TripleRefiner:
                     "label": label,
                     "type": label,       # backward-compat alias
                 }
+                if entity.get("community_id"):
+                    payload["community_id"] = entity["community_id"]
                 if is_label_collection:
                     payload["group"] = entity.get("group", "")
                 if name_en:
@@ -629,7 +682,11 @@ class TripleRefiner:
 
             if not new_points:
                 return {
-                    entity["name"]: self._generate_uuid(entity.get("name_en") or entity["name"])
+                    entity["name"]: self._generate_uuid(
+                        f"{entity.get('name_en') or entity['name']}::{entity['community_id']}"
+                        if entity.get("community_id")
+                        else (entity.get("name_en") or entity["name"])
+                    )
                     for entity in entities
                 }
 
@@ -640,7 +697,11 @@ class TripleRefiner:
 
             # Return name → point_id mapping
             return {
-                entity["name"]: self._generate_uuid(entity.get("name_en") or entity["name"])
+                entity["name"]: self._generate_uuid(
+                    f"{entity.get('name_en') or entity['name']}::{entity['community_id']}"
+                    if entity.get("community_id")
+                    else (entity.get("name_en") or entity["name"])
+                )
                 for entity in entities
             }
 
@@ -1407,8 +1468,15 @@ Return only valid JSON:"""
                 )
 
         # ── Step 2: Batch query Qdrant (representatives only) ─────────────────
+        # For predicates, pass per-representative community_ids so the query
+        # filters results to the same community, preventing cross-community merges.
+        rep_community_ids: Optional[List[Optional[str]]] = None
+        if is_predicate:
+            rep_community_ids = [rep_entities[i].get("community_id") for i in range(len(rep_entities))]
+
         all_matches = self._query_qdrant_canonical_batch(
-            collection_name, rep_embeddings, limit=1
+            collection_name, rep_embeddings, limit=1,
+            community_ids=rep_community_ids,
         )
         print(f"[{collection_name}]   Queried Qdrant ({len(all_matches)} matches found)")
 
@@ -1463,7 +1531,10 @@ Return only valid JSON:"""
                         "attributes":    {} if is_predicate else entity.get("attributes", {}),
                         "attributes_en": {} if is_predicate else entity.get("attributes_en", {}),
                     })
-                entity_cache[(collection_name, entity["name"])] = cache_entry
+                if is_predicate:
+                    entity_cache[(collection_name, entity["name"], entity.get("community_id"))] = cache_entry
+                else:
+                    entity_cache[(collection_name, entity["name"])] = cache_entry
             print(f"[{collection_name}]   Upserted {len(unmatched)} new canonicals")
 
         # ── Step 4b: Auto-merge high-confidence matches ───────────────────────
@@ -1494,7 +1565,10 @@ Return only valid JSON:"""
                         "attributes":    {} if is_predicate else entity.get("attributes", {}),
                         "attributes_en": {} if is_predicate else entity.get("attributes_en", {}),
                     })
-                entity_cache[(collection_name, entity["name"])] = cache_entry
+                if is_predicate:
+                    entity_cache[(collection_name, entity["name"], entity.get("community_id"))] = cache_entry
+                else:
+                    entity_cache[(collection_name, entity["name"])] = cache_entry
             print(f"[{collection_name}]   Auto-merged {len(high_conf)} high-confidence matches")
 
         # ── Step 4c: LLM decisions for uncertain matches ──────────────────────
@@ -1531,7 +1605,12 @@ Return only valid JSON:"""
             for alias_idx, rep_idx, _score in alias_pairs:
                 alias_entity = entity_list[alias_idx]
                 rep_entity   = entity_list[rep_idx]
-                rep_cache    = entity_cache.get((collection_name, rep_entity["name"]))
+                rep_cache_key = (
+                    (collection_name, rep_entity["name"], rep_entity.get("community_id"))
+                    if is_predicate
+                    else (collection_name, rep_entity["name"])
+                )
+                rep_cache    = entity_cache.get(rep_cache_key)
                 if rep_cache:
                     canonical_id   = rep_cache["canonical_id"]
                     canonical_name = rep_cache["canonical"]
@@ -1555,7 +1634,12 @@ Return only valid JSON:"""
                             "attributes":    {} if is_predicate else alias_entity.get("attributes", {}),
                             "attributes_en": {} if is_predicate else alias_entity.get("attributes_en", {}),
                         })
-                    entity_cache[(collection_name, alias_entity["name"])] = cache_entry
+                    alias_cache_key = (
+                        (collection_name, alias_entity["name"], alias_entity.get("community_id"))
+                        if is_predicate
+                        else (collection_name, alias_entity["name"])
+                    )
+                    entity_cache[alias_cache_key] = cache_entry
                 else:
                     # Unexpected: representative not resolved; fall back to standalone canonical
                     print(
@@ -1584,7 +1668,12 @@ Return only valid JSON:"""
                             "attributes":    {} if is_predicate else alias_entity.get("attributes", {}),
                             "attributes_en": {} if is_predicate else alias_entity.get("attributes_en", {}),
                         })
-                    entity_cache[(collection_name, alias_entity["name"])] = fallback_entry
+                    fallback_cache_key = (
+                        (collection_name, alias_entity["name"], alias_entity.get("community_id"))
+                        if is_predicate
+                        else (collection_name, alias_entity["name"])
+                    )
+                    entity_cache[fallback_cache_key] = fallback_entry
 
             if alias_points:
                 self._batch_upsert_entities(alias_points, collection_name)
@@ -1631,12 +1720,15 @@ Return only valid JSON:"""
                             "attributes_en": node.get("attributes_en", {}),
                         }
 
-                pred    = triple["predicate"]
-                pred_en = triple.get("predicate_en")
-                if pred not in registry_items[predicate_spec]:
-                    registry_items[predicate_spec][pred] = {
-                        "name":    pred,
-                        "name_en": pred_en,
+                pred         = triple["predicate"]
+                pred_en      = triple.get("predicate_en")
+                community_id = triple.get("properties", {}).get("community_id")
+                pred_key     = (pred, community_id)   # composite: same text, diff community → distinct
+                if pred_key not in registry_items[predicate_spec]:
+                    registry_items[predicate_spec][pred_key] = {
+                        "name":         pred,
+                        "name_en":      pred_en,
+                        "community_id": community_id,
                     }
 
                 for lbl in (subj.get("label", ""), obj.get("label", "")):
@@ -1735,13 +1827,19 @@ Return only valid JSON:"""
                 })
             return base
 
+        def _cache_key() -> tuple:
+            """Return the entity_cache key, community-scoped for predicates."""
+            if is_predicate:
+                return (collection_name, entity["name"], entity.get("community_id"))
+            return (collection_name, entity["name"])
+
         # ── Outcome A: not the same → new canonical ───────────────────────────
         if not is_same:
             upserted_ids = self._batch_upsert_entities(
                 [{**entity, "is_canonical": True}], collection_name
             )
             canonical_id = upserted_ids.get(entity["name"])
-            entity_cache[(collection_name, entity["name"])] = _cache_entry(
+            entity_cache[_cache_key()] = _cache_entry(
                 incoming_name, canonical_id, is_new=True, is_canon=True
             )
             return "new"
@@ -1756,7 +1854,7 @@ Return only valid JSON:"""
                 "canonical_id", existing_canonical["id"]
             )
             merged_group = old_payload.get("group", "")
-            entity_cache[(collection_name, entity["name"])] = _cache_entry(
+            entity_cache[_cache_key()] = _cache_entry(
                 existing_name,
                 canonical_id,
                 is_new=False,
@@ -1792,7 +1890,7 @@ Return only valid JSON:"""
             "new_canonical_name": entity["name"],
             "reasoning":          decision.get("reasoning", ""),
         })
-        entity_cache[(collection_name, entity["name"])] = _cache_entry(
+        entity_cache[_cache_key()] = _cache_entry(
             canonical_form, new_id, is_new=True, is_canon=True
         )
         return "replaced"
@@ -1843,7 +1941,8 @@ Return only valid JSON:"""
                     "attributes_en": subj_raw.get("attributes_en", {}),
                 })
 
-                predicate_key = (_predicate_spec, triple["predicate"])
+                predicate_community_id = triple.get("properties", {}).get("community_id")
+                predicate_key = (_predicate_spec, triple["predicate"], predicate_community_id)
                 refined_predicate = entity_cache.get(predicate_key, {
                     "original": triple["predicate"],
                     "canonical": triple.get("predicate_en") or triple["predicate"],

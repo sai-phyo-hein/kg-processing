@@ -52,7 +52,7 @@ class QdrantToolsManager:
             Dict mapping registry key to its spec (collection_name, vector_names).
         """
         specs = {}
-        for registry_key in ("entity_registry", "predicate_registry", "metadata_registry"):
+        for registry_key in ("entity_registry", "predicate_registry", "metadata_registry", "label_registry"):
             spec_file = self.registry_info_dir / f"{registry_key}.json"
             with open(spec_file) as f:
                 data = json.load(f)
@@ -261,6 +261,156 @@ class QdrantToolsManager:
             print(f"Warning: Failed to query metadata registry: {e}")
             return []
 
+    def get_all_community_ids(self) -> List[str]:
+        """Get all unique community IDs from metadata_registry.
+
+        Returns:
+            List of unique community IDs
+        """
+        try:
+            spec = self._registry_specs["metadata_registry"]
+            community_ids = set()
+            offset = None
+
+            while True:
+                scroll_result = self.client.scroll(
+                    collection_name=spec["collection_name"],
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                )
+
+                for point in scroll_result[0]:
+                    community_id = point.payload.get("community_id")
+                    if community_id:
+                        community_ids.add(community_id)
+
+                offset = scroll_result[1]
+                if offset is None:
+                    break
+
+            return sorted(list(community_ids))
+
+        except Exception as e:
+            print(f"Warning: Failed to query all community IDs: {e}")
+            return []
+
+    def get_labels_by_group(
+        self, label_group: str, limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Get labels from label_registry filtered by group.
+
+        Args:
+            label_group: The label group to filter by (e.g., "Community", "Person")
+            limit: Maximum number of results to return
+
+        Returns:
+            List of labels with their metadata
+        """
+        if not label_group:
+            return []
+
+        try:
+            spec = self._registry_specs["label_registry"]
+            results = []
+            offset = None
+
+            while len(results) < limit:
+                scroll_result = self.client.scroll(
+                    collection_name=spec["collection_name"],
+                    scroll_filter={
+                        "must": [
+                            {
+                                "key": "group",
+                                "match": {"value": label_group}
+                            }
+                        ]
+                    },
+                    limit=min(100, limit - len(results)),
+                    offset=offset,
+                    with_payload=True,
+                )
+
+                for point in scroll_result[0]:
+                    results.append({
+                        "canonical_id": point.payload.get("canonical_id") or str(point.id),
+                        "name": point.payload.get("name"),
+                        "group": point.payload.get("group"),
+                        "label": point.payload.get("label"),
+                        "type": point.payload.get("type"),
+                        "metadata": point.payload,
+                    })
+
+                offset = scroll_result[1]
+                if offset is None:
+                    break
+
+            return results
+
+        except Exception as e:
+            print(f"Warning: Failed to query labels by group '{label_group}': {e}")
+            return []
+
+    def get_entities_by_labels(
+        self, label_names: List[str], limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Get entities from entity_registry filtered by label.
+
+        Args:
+            label_names: List of label names to filter by
+            limit: Maximum number of results per label
+
+        Returns:
+            List of entities with their metadata
+        """
+        if not label_names:
+            return []
+
+        results = []
+
+        try:
+            spec = self._registry_specs["entity_registry"]
+
+            for label_name in label_names:
+                offset = None
+                label_results = []
+
+                while len(label_results) < limit:
+                    scroll_result = self.client.scroll(
+                        collection_name=spec["collection_name"],
+                        scroll_filter={
+                            "must": [
+                                {
+                                    "key": "label",
+                                    "match": {"value": label_name}
+                                }
+                            ]
+                        },
+                        limit=min(100, limit - len(label_results)),
+                        offset=offset,
+                        with_payload=True,
+                    )
+
+                    for point in scroll_result[0]:
+                        label_results.append({
+                            "canonical_id": point.payload.get("canonical_id") or str(point.id),
+                            "name": point.payload.get("name"),
+                            "label": point.payload.get("label"),
+                            "type": point.payload.get("type"),
+                            "metadata": point.payload,
+                        })
+
+                    offset = scroll_result[1]
+                    if offset is None:
+                        break
+
+                results.extend(label_results)
+
+        except Exception as e:
+            print(f"Warning: Failed to query entities by labels: {e}")
+
+        return results
+
 
 # Create global instance for tools
 _manager = None
@@ -345,4 +495,72 @@ def get_community_metadata(community_ids: str = "", limit: int = 100) -> str:
     manager = _get_manager()
     ids = [cid.strip() for cid in community_ids.split(",") if cid.strip()] if community_ids else None
     results = manager.get_community_metadata(ids, limit)
+    return json.dumps(results, indent=2)
+
+
+@tool
+def get_labels_by_group(label_group: str, limit: int = 50) -> str:
+    """Get labels from Qdrant label_registry filtered by label group.
+
+    Use this tool when the user query relates to a specific domain/category.
+    First identify the label_group from configs/label_group_config.yaml, then use
+    this tool to retrieve all labels in that group.
+
+    Payload schema:
+    - canonical_id (uuid): Unique identifier for the label
+    - name (keyword): Label name
+    - group (keyword): Label group (e.g., "Community", "Person", "Activity")
+    - label (keyword): Label type
+    - type (keyword): Entity type
+
+    Args:
+        label_group: The label group to filter by (e.g., "Community", "Person", "Activity")
+        limit: Maximum number of results to return (default: 50)
+
+    Returns:
+        JSON string with labels matching the specified group
+    """
+    manager = _get_manager()
+    results = manager.get_labels_by_group(label_group, limit)
+    return json.dumps(results, indent=2)
+
+
+@tool
+def get_entities_by_labels(label_names: str, limit: int = 50) -> str:
+    """Get entities from Qdrant entity_registry filtered by label.
+
+    Use this tool after identifying relevant labels to find entities of those types.
+    This helps narrow down entities based on their classification.
+
+    Payload schema:
+    - canonical_id (uuid): Unique identifier for the entity
+    - name (keyword): Entity name
+    - label (keyword): Entity label/type
+    - type (keyword): Entity type
+
+    Args:
+        label_names: Comma-separated list of label names to filter by
+        limit: Maximum number of results per label (default: 50)
+
+    Returns:
+        JSON string with entities matching the specified labels
+    """
+    manager = _get_manager()
+    names = [name.strip() for name in label_names.split(",") if name.strip()]
+    results = manager.get_entities_by_labels(names, limit)
+    return json.dumps(results, indent=2)
+
+
+@tool
+def get_all_community_ids() -> str:
+    """Get all unique community IDs from Qdrant metadata_registry.
+
+    Use this tool to retrieve the complete list of available community IDs in the knowledge graph.
+    This is useful for understanding what communities exist and for filtering queries by community.
+
+    Returns:
+        JSON string with list of all unique community IDs (e.g., ["หมู่ 1_village", "หมู่ 2_village"])
+    """
+    manager = _get_manager()
+    results = manager.get_all_community_ids()
     return json.dumps(results, indent=2)

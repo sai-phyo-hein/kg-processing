@@ -46,7 +46,7 @@ class MultiAgentState(TypedDict, total=False):
     communities_identified: List[str]  # List of community IDs
     strategies: List[Dict[str, Any]]  # List of query strategies (max 5)
     orchestrator_raw_output: str  # Raw output from orchestrator
-    resolution_method: str  # How entities/predicates were resolved: "matched", "partial_match", "fallback_top_connected"
+    resolution_method: str  # How entities/predicates were resolved: "matched", "partial_match", "label_group_expansion", "fallback_top_connected"
 
     # ===== Worker Outputs =====
     worker_results: List[Dict[str, Any]]  # Results from each worker

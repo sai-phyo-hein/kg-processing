@@ -189,3 +189,35 @@ def get_embedding_client():
     if base_url:
         kwargs["base_url"] = base_url
     return OpenAI(**kwargs)
+
+
+def get_reasoning_llm(model: str = None, temperature: float = 0.1):
+    """Return a LangChain ChatOpenAI instance for the active REASONING_PROVIDER.
+
+    Supports: openai (default), openrouter, groq, nvidia.
+
+    Args:
+        model: Model name (uses ORCHESTRATOR_MODEL if not provided)
+        temperature: LLM temperature
+
+    Returns:
+        ChatOpenAI instance configured for the provider
+    """
+    from langchain_openai import ChatOpenAI
+
+    provider = REASONING_PROVIDER
+    model_name = model or ORCHESTRATOR_MODEL
+    
+    api_key_env = _EMBEDDING_PROVIDER_API_KEY_ENV.get(provider, "OPENAI_API_KEY")
+    api_key = os.getenv(api_key_env)
+    base_url = _EMBEDDING_PROVIDER_BASES.get(provider)  # None → default OpenAI URL
+    
+    kwargs = {
+        "model": model_name,
+        "temperature": temperature,
+        "api_key": api_key,
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+    
+    return ChatOpenAI(**kwargs)

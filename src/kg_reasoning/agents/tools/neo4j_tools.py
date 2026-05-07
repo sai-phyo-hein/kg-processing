@@ -438,3 +438,31 @@ def get_top_connected_nodes(limit: int = 20) -> str:
 
     results = manager.execute_cypher_query(cypher_query, {}, limit)
     return json.dumps(results, indent=2)
+
+
+@tool
+def get_community_ids_from_relationships() -> str:
+    """Get all unique community IDs from relationship properties in Neo4j.
+
+    Use this tool to discover what communities exist in the knowledge graph.
+    Community IDs are stored in relationship properties and can be used to
+    filter queries to specific communities.
+
+    Returns:
+        JSON string with list of unique community IDs found in the graph
+    """
+    manager = _get_manager()
+
+    cypher_query = """
+    MATCH ()-[r]->()
+    WHERE r.community_id IS NOT NULL
+    RETURN DISTINCT r.community_id AS community_id
+    ORDER BY community_id
+    """
+
+    results = manager.execute_cypher_query(cypher_query, {}, 1000)
+    
+    # Extract just the community_id strings
+    community_ids = [r.get("community_id") for r in results if r.get("community_id")]
+    
+    return json.dumps(community_ids, indent=2)
