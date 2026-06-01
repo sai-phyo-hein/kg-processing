@@ -1,0 +1,20 @@
+{
+  "collection_name": "ci_evidence_registry",
+  "description": "Evidence registry for triple evidence",
+  "triple_role": "evidence_quote",
+  "vector_name": "evidence_quote",
+  "vector_name_en": "evidence_quote_en",
+  "vector_name_th": "evidence_quote_th",
+  "sparse_vector_name": "evidence_vector",
+  "vector_config": {
+    "datatype": "float32",
+    "distance": "Cosine",
+    "hnsw_config": {
+      "ef_construct": 256,
+      "m": 24,
+      "payload_m": 24
+    },
+    "on_disk": false,
+    "size": 3072
+  }
+}

@@ -13,6 +13,7 @@ load_dotenv()
 
 from kg_extractor.utils.model_setup import CHUNKING_PROVIDER, CHUNKING_MODEL
 from kg_extractor.utils.prompts import create_chunking_prompt
+from kg_extractor.utils.llm_response_parser import parse_chunk_splits_response
 
 
 class SemanticChunker:
@@ -433,21 +434,10 @@ Return ONLY valid JSON, no markdown code blocks or extra text."""
             List of chunk boundaries: [{"chunk_id": 1, "start": 1, "end": 5}, ...]
         """
         try:
-            # Clean up response
-            response = response.strip()
-            
-            # Remove markdown code blocks if present
-            if response.startswith("```json"):
-                response = response[7:]
-            elif response.startswith("```"):
-                response = response[3:]
-            if response.endswith("```"):
-                response = response[:-3]
-            
-            response = response.strip()
-            
-            # Parse JSON
-            data = json.loads(response)
+            data = parse_json_with_repair(response)
+            if not data:
+                print(f"Warning: Failed to parse JSON from response")
+                return []
             
             if "chunks" not in data or not isinstance(data["chunks"], list):
                 print(f"Warning: Invalid response structure: {list(data.keys())}")
@@ -467,9 +457,6 @@ Return ONLY valid JSON, no markdown code blocks or extra text."""
             
             return sorted(valid_chunks, key=lambda x: x["start"])
         
-        except json.JSONDecodeError as e:
-            print(f"Warning: Failed to parse JSON response: {e}")
-            return []
         except Exception as e:
             print(f"Warning: Failed to parse chunk boundaries: {e}")
             return []
@@ -946,51 +933,8 @@ Return ONLY valid JSON, no markdown code blocks or extra text."""
             LLM response text
         """
         try:
-            import os
-            from langchain_openai import ChatOpenAI
-            from kg_extractor.utils.parser import (
-                get_api_key,
-                get_groq_api_key,
-                get_openrouter_api_key,
-            )
-
-            # Create LLM based on provider
-            if self.llm_provider == "openai":
-                openai_api_key = os.getenv("OPENAI_API_KEY")
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=openai_api_key,
-                )
-            elif self.llm_provider == "groq":
-                groq_api_key = get_groq_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=groq_api_key,
-                    base_url="https://api.groq.com/openai/v1",
-                )
-            elif self.llm_provider == "nvidia":
-                nvidia_api_key = get_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=nvidia_api_key,
-                    base_url="https://integrate.api.nvidia.com/v1",
-                )
-            else:  # openrouter
-                openrouter_api_key = get_openrouter_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=openrouter_api_key,
-                    base_url="https://openrouter.ai/api/v1",
-                )
-
-            # Get response
-            response = llm.invoke(prompt)
-            return response.content
-
+            from kg_extractor.utils.model_setup import get_llm_response
+            return get_llm_response(prompt, self.llm_provider, self.llm_model, temperature=0.3)
         except Exception as e:
             # Fallback: return empty response
             print(f"Warning: Failed to get LLM response: {e}")
@@ -998,12 +942,6 @@ Return ONLY valid JSON, no markdown code blocks or extra text."""
 
     def _parse_llm_response(self, response: str, section_line_count: int) -> List[int]:
         """Parse LLM response to extract chunk split-point line numbers.
-
-        Attempts multiple parsing strategies in order:
-        1. Full JSON parse of {"split_at": [...]}
-        2. Regex extraction from partial/truncated JSON (handles output-limit cutoffs)
-        3. Old-format {"chunks": [...]} detection — extracts chunk_ids as proxies
-        4. Fallback: treat entire section as a single chunk
 
         Args:
             response: LLM response text
@@ -1013,68 +951,7 @@ Return ONLY valid JSON, no markdown code blocks or extra text."""
             Sorted list of 1-based relative line numbers where new chunks begin.
             Always starts with 1.
         """
-        import re
-
-        def _validate_splits(splits: List[int]) -> List[int]:
-            """Deduplicate, sort, validate range, and ensure starts with 1."""
-            valid = sorted(set(
-                int(s) for s in splits
-                if isinstance(s, (int, float)) and 1 <= int(s) <= section_line_count
-            ))
-            if not valid or valid[0] != 1:
-                valid = [1] + [s for s in valid if s != 1]
-            return valid
-
-        raw = response.strip()
-
-        # Strip markdown code fences
-        if raw.startswith("```json"):
-            raw = raw[7:]
-        elif raw.startswith("```"):
-            raw = raw[3:]
-        if raw.endswith("```"):
-            raw = raw[:-3]
-        raw = raw.strip()
-
-        # Strategy 1: full JSON parse
-        try:
-            data = json.loads(raw)
-            if "split_at" in data and isinstance(data["split_at"], list):
-                return _validate_splits(data["split_at"])
-            # LLM returned old chunks format — extract chunk count to estimate splits
-            if "chunks" in data and isinstance(data["chunks"], list):
-                n_chunks = len(data["chunks"])
-                if n_chunks > 1:
-                    step = max(1, section_line_count // n_chunks)
-                    estimated = [1 + i * step for i in range(n_chunks)]
-                    print(f"⚠️  LLM returned content-format (chunks). "
-                          f"Estimating {n_chunks} splits from chunk count.")
-                    return _validate_splits(estimated)
-                return [1]
-        except json.JSONDecodeError:
-            pass
-
-        # Strategy 2: regex — extract numbers from a partial/truncated split_at array
-        # Handles responses cut off mid-array like: {"split_at": [1, 5, 12, 20,
-        match = re.search(r'"split_at"\s*:\s*\[([0-9,\s]*)', raw)
-        if match:
-            numbers_str = match.group(1)
-            numbers = re.findall(r'\d+', numbers_str)
-            if numbers:
-                print(f"⚠️  Used regex fallback to extract {len(numbers)} split points "
-                      "from partial JSON response.")
-                return _validate_splits([int(n) for n in numbers])
-
-        # Strategy 3: any JSON-like array of numbers in the response
-        match = re.search(r'\[([0-9,\s]+)\]', raw)
-        if match:
-            numbers = re.findall(r'\d+', match.group(1))
-            if numbers:
-                print(f"⚠️  Extracted split points from bare number array in response.")
-                return _validate_splits([int(n) for n in numbers])
-
-        print(f"⚠️  Could not parse LLM response (len={len(raw)}); treating section as one chunk.")
-        return [1]
+        return parse_chunk_splits_response(response, section_line_count)
 
     def save_chunks(self, chunks: List[Dict[str, Any]], output_path: str) -> str:
         """Save chunks to a JSON file with comprehensive metadata.

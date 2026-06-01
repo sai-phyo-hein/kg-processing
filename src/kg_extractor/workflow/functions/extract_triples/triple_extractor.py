@@ -11,8 +11,12 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-from kg_extractor.utils.model_setup import TRIPLET_PROVIDER, TRIPLET_MODEL
-from kg_extractor.utils.prompts import create_triple_extraction_prompt
+from kg_extractor.utils.model_setup import TRIPLET_PROVIDER, TRIPLET_MODEL, get_reasoning_llm
+from kg_extractor.utils.prompts import (
+    TRIPLE_EXTRACTION_SYSTEM_PROMPT,
+    create_triple_extraction_user_message,
+)
+from kg_extractor.utils.llm_response_parser import parse_triple_extraction_response
 
 # Try to import faster JSON library
 try:
@@ -52,6 +56,29 @@ class TripleExtractor:
         self.batch_size = max(1, batch_size)
         self.max_workers = max(1, max_workers)
         self._response_cache = {}  # Cache for identical chunks
+        
+        # Initialize stateful agent with persistent system prompt
+        self._init_stateful_agent()
+
+    def _init_stateful_agent(self):
+        """Initialize stateful agent with persistent system prompt.
+        
+        The triple extraction agent maintains the system prompt between calls.
+        User messages (chunk content) are cleared after each response.
+        """
+        from langchain_core.messages import SystemMessage
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+        
+        # Create LLM instance and history
+        self.extraction_agent = {
+            'llm': get_reasoning_llm(model=self.llm_model, temperature=0.3),
+            'history': InMemoryChatMessageHistory()
+        }
+        
+        # Add persistent system message
+        self.extraction_agent['history'].add_message(
+            SystemMessage(content=TRIPLE_EXTRACTION_SYSTEM_PROMPT)
+        )
 
     def extract_triples_from_chunks(
         self,
@@ -128,11 +155,11 @@ class TripleExtractor:
         chunk_id = chunk["chunk_id"]
         content = chunk["content"]
 
-        # Create prompt for triple extraction
-        prompt = create_triple_extraction_prompt(content, source_file, chunk_id)
+        # Create user message for triple extraction (source + content only)
+        user_message = create_triple_extraction_user_message(content, source_file, chunk_id)
 
-        # Get LLM response
-        response = self._get_llm_response(prompt)
+        # Get LLM response from stateful agent
+        response = self._get_llm_response(user_message)
 
         # Parse response to extract triples and metadata
         parsed_data = self._parse_llm_response(response)
@@ -143,59 +170,35 @@ class TripleExtractor:
             "triples": parsed_data.get("discovered_triples", []),
         }
 
-    def _get_llm_response(self, prompt: str) -> str:
-        """Get response from LLM.
+    def _get_llm_response(self, user_message: str) -> str:
+        """Get response from stateful agent with persistent system prompt.
+        
+        The system prompt persists in the agent's history.
+        User messages are added, processed, then cleared after each call.
 
         Args:
-            prompt: Prompt to send to LLM
+            user_message: User-specific content (source + chunk text)
 
         Returns:
             LLM response text
         """
         try:
-            import os
-            from langchain_openai import ChatOpenAI
-            from kg_extractor.utils.parser import (
-                get_api_key,
-                get_groq_api_key,
-                get_openrouter_api_key,
-            )
-
-            # Create LLM based on provider
-            if self.llm_provider == "openai":
-                openai_api_key = os.getenv("OPENAI_API_KEY")
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=openai_api_key,
-                )
-            elif self.llm_provider == "groq":
-                groq_api_key = get_groq_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=groq_api_key,
-                    base_url="https://api.groq.com/openai/v1",
-                )
-            elif self.llm_provider == "nvidia":
-                nvidia_api_key = get_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=nvidia_api_key,
-                    base_url="https://integrate.api.nvidia.com/v1",
-                )
-            else:  # openrouter
-                openrouter_api_key = get_openrouter_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=openrouter_api_key,
-                    base_url="https://openrouter.ai/api/v1",
-                )
-
-            # Get response
-            response = llm.invoke(prompt)
+            # Get the agent
+            agent = self.extraction_agent
+            
+            # Add user message to agent's history (system message already persists)
+            agent['history'].add_user_message(user_message)
+            
+            # Get all messages (system + user)
+            messages = agent['history'].messages
+            
+            # Invoke the agent's LLM
+            response = agent['llm'].invoke(messages)
+            
+            # Clear user message to prevent accumulation (keep only system message)
+            while len(agent['history'].messages) > 1:  # Keep only the first message (system)
+                agent['history'].messages.pop()
+            
             return response.content
 
         except Exception as e:
@@ -204,56 +207,8 @@ class TripleExtractor:
             return '{"document_metadata": {"reference_date": null, "source_id": null, "chunk_id": null}, "discovered_triples": []}'
 
     def _parse_llm_response(self, response: str) -> Dict[str, Any]:
-        """Parse LLM response to extract triples and metadata.
-
-        Args:
-            response: LLM response text
-
-        Returns:
-            Dictionary with document metadata and triples
-        """
-        try:
-            # Try to extract JSON from response
-            response = response.strip()
-
-            # Remove markdown code blocks if present
-            if response.startswith("```json"):
-                response = response[7:]  # Remove ```json
-            elif response.startswith("```"):
-                response = response[3:]  # Remove ```
-            if response.endswith("```"):
-                response = response[:-3]  # Remove trailing ```
-
-            response = response.strip()
-
-            # Parse JSON (use faster orjson if available)
-            if HAS_ORJSON:
-                data = json.loads(response)  # orjson.loads for bytes, use json for str
-            else:
-                data = json.loads(response)
-
-            # Validate new structure
-            if "document_metadata" not in data or "discovered_triples" not in data:
-                print(f"Warning: Invalid response structure: {list(data.keys())}")
-                return {
-                    "document_metadata": {"reference_date": None, "source_id": None, "chunk_id": None},
-                    "discovered_triples": []
-                }
-
-            return data
-
-        except json.JSONDecodeError as e:
-            print(f"Warning: Failed to parse JSON response: {e}")
-            return {
-                "document_metadata": {"reference_date": None, "source_id": None, "chunk_id": None},
-                "discovered_triples": []
-            }
-        except Exception as e:
-            print(f"Warning: Failed to parse LLM response: {e}")
-            return {
-                "document_metadata": {"reference_date": None, "source_id": None, "chunk_id": None},
-                "discovered_triples": []
-            }
+        """Parse LLM response to extract triples and metadata."""
+        return parse_triple_extraction_response(response)
 
     def save_triples(
         self,

@@ -221,3 +221,44 @@ def get_reasoning_llm(model: str = None, temperature: float = 0.1):
         kwargs["base_url"] = base_url
     
     return ChatOpenAI(**kwargs)
+
+
+def get_llm_response(prompt: str, provider: str, model: str, temperature: float = 0.3) -> str:
+    """Get LLM response for a given prompt using specified provider and model.
+
+    Supports: openai, openrouter, groq, nvidia.
+
+    Args:
+        prompt: The prompt to send to the LLM
+        provider: LLM provider (openai, groq, nvidia, openrouter)
+        model: Model name to use
+        temperature: LLM temperature (default: 0.3)
+
+    Returns:
+        LLM response text
+
+    Raises:
+        Exception: If LLM call fails
+    """
+    from langchain_openai import ChatOpenAI
+
+    # Get API key based on provider
+    api_key_env = _EMBEDDING_PROVIDER_API_KEY_ENV.get(provider, "OPENAI_API_KEY")
+    api_key = os.getenv(api_key_env)
+    
+    # Get base URL for non-OpenAI providers
+    base_url = _EMBEDDING_PROVIDER_BASES.get(provider)
+    
+    # Build LLM kwargs
+    kwargs = {
+        "model": model,
+        "temperature": temperature,
+        "api_key": api_key,
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+    
+    # Create LLM and get response
+    llm = ChatOpenAI(**kwargs)
+    response = llm.invoke(prompt)
+    return response.content

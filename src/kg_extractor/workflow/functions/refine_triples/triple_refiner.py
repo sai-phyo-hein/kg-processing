@@ -1,9 +1,10 @@
 """Triple refinement module for entity resolution using Qdrant.
 
-Single-vector architecture
---------------------------
-Every point in Qdrant carries **one named dense vector** whose name is
-derived from the collection's ``vector_name`` field in its registry spec JSON:
+Single-vector architecture (entity / predicate / label registries)
+------------------------------------------------------------------
+Every point in the entity/predicate/label registries carries **one named
+dense vector** whose name is derived from the collection's ``vector_name``
+field in its registry spec JSON:
 
   • ``{vector_name}``  – OpenAI embedding of the entity label (English).
 
@@ -11,6 +12,21 @@ Per-collection vector names (from registry spec JSON files):
   entity_registry    → entity    (sparse: entity_vector)
   predicate_registry → predicate (sparse: predicate_vector)
   label_registry     → label     (sparse: label_vector)
+  evidence_registry   → evidence  (sparse: evidence_vector)
+
+Evidence collection (dual-vector)
+----------------------------------
+A separate ``evidence_registry`` collection stores one point per triple.
+Each point carries **two** named dense vectors:
+
+  • ``evidence_quote_en``  – text-embedding-3-large embedding of the English evidence quote
+  • ``evidence_quote``  – text-embedding-3-large embedding of the Thai evidence quote
+
+Payload fields per evidence point:
+  subject        – original English subject name
+  predicate      – original English predicate
+  object         – original English object name
+  community_id   – community id (when present)
 
 All labels, entity names, and predicates are in English.  Qdrant queries
 use the single vector per collection for entity resolution.
@@ -20,8 +36,8 @@ Point UUID
 Derived deterministically from the entity name so that the same real-world
 concept always maps to the same Qdrant point.
 
-Payload schema
---------------
+Payload schema (entity / predicate / label registries)
+------------------------------------------------------
     name         – entity label / surface form (English)
     label        – semantic PascalCase ontology label
     type         – alias for label (backward-compat)
@@ -35,7 +51,8 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from kg_extractor.utils.model_setup import OPENAI_EMBEDDING_MODEL, REFINEMENT_PROVIDER, REFINEMENT_MODEL, get_embedding_client
+from kg_extractor.utils.model_setup import OPENAI_EMBEDDING_MODEL, REFINEMENT_PROVIDER, REFINEMENT_MODEL, get_embedding_client, get_reasoning_llm
+from kg_extractor.utils.llm_response_parser import parse_json_with_repair
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 
@@ -49,6 +66,76 @@ _EN_SUFFIX = "_en"
 _TH_SUFFIX = "_th"
 HIGH_CONFIDENCE_THRESHOLD = 0.95
 QUERY_BATCH_SIZE = 50
+
+# Evidence collection
+EVIDENCE_EMBEDDING_MODEL = "text-embedding-3-large"
+EVIDENCE_VECTOR_DIM = 3072          # text-embedding-3-large native dimension
+
+# ---------------------------------------------------------------------------
+# System prompts for LLM
+# ---------------------------------------------------------------------------
+ENTITY_RESOLUTION_SYSTEM_PROMPT = """You are an expert in entity resolution and knowledge graph curation.
+
+Two entities with high vector similarity have been found. Your task has two steps:
+
+**Step 1 – Identity check:** Decide whether these two entities refer to the *same real-world
+concept* (i.e. they are aliases, abbreviations, or surface variants of the same thing).
+Set "are_same_entity": true ONLY when both names clearly denote the identical concept.
+If one is a specific attribute, metric, sub-component, or related-but-distinct concept of the
+other (e.g. "Thai E-Commerce Market" vs "Thai E-Commerce Market Annual Value"), they are
+DIFFERENT entities — set "are_same_entity": false.
+
+**Step 2 – Canonical selection (only when are_same_entity is true):** Decide which form should
+be the canonical entry. The existing canonical keeps its status UNLESS the new entity is clearly
+superior (more specific name, better evidence, more complete information).
+
+**Output Format (JSON):**
+```json
+{
+  "are_same_entity": true_or_false,
+  "new_is_canonical": true_or_false,
+  "reasoning": "brief explanation"
+}
+```
+
+Rules:
+- If "are_same_entity" is false, set "new_is_canonical" to true (the new entity needs its own canonical entry).
+- If "are_same_entity" is true, set "new_is_canonical" based on which form is superior.
+
+Return only valid JSON."""
+
+PREDICATE_RESOLUTION_SYSTEM_PROMPT = """You are an expert in knowledge graph schema design and relationship normalisation.
+
+Two predicates (relationship types) have high vector similarity. Your task:
+
+**Step 1 – Semantic equivalence check:** Decide whether these two predicates express the
+*same relationship type* in a knowledge graph. Synonyms and near-synonyms count as
+equivalent (e.g. "increase" / "grow" / "rise" / "improve" are all equivalent; but
+"increase" and "decrease" are NOT equivalent even though they are related).
+
+**Step 2 – Canonical form selection (only when equivalent):** Choose the most standard,
+concise, and generic English verb form as the canonical predicate. Prefer:
+- Short, common English verbs over long phrases
+- Active voice, base form (infinitive without "to")
+- Domain-neutral wording when both options work
+
+**Output Format (JSON):**
+```json
+{
+  "are_equivalent": true_or_false,
+  "new_is_canonical": true_or_false,
+  "canonical_form": "chosen canonical predicate string",
+  "reasoning": "brief explanation"
+}
+```
+
+Rules:
+- If "are_equivalent" is false → set "new_is_canonical" to true so the incoming predicate
+  gets its own canonical entry; "canonical_form" should be the incoming predicate.
+- If "are_equivalent" is true → set "new_is_canonical" based on which form is superior;
+  "canonical_form" must be the chosen canonical string.
+
+Return only valid JSON."""
 
 
 class TripleRefiner:
@@ -85,17 +172,54 @@ class TripleRefiner:
         if registry_info_dir is None:
             project_root = Path(__file__).parent.parent.parent.parent.parent.parent
             self.registry_info_dir = project_root / "registry_info"
-            self.label_group_config_path = project_root / "configs" / "label_group_config.yaml"
         else:
             self.registry_info_dir = Path(registry_info_dir)
-            self.label_group_config_path = Path(registry_info_dir).parent / "configs" / "label_group_config.yaml"
 
         self.registry_specs = self._load_registry_specs()
 
         print(f"Registry info directory: {self.registry_info_dir}")
         print(f"Registry specs loaded: {list(self.registry_specs.keys())}")
 
+        # Initialize stateful agents with persistent system prompts
+        self._init_stateful_agents()
+
         self._init_qdrant_client()
+
+    # ------------------------------------------------------------------
+    # Stateful agent initialization
+    # ------------------------------------------------------------------
+
+    def _init_stateful_agents(self):
+        """Initialize separate stateful agents with persistent system prompts.
+        
+        Creates two completely separate agents:
+        - Entity agent: for entity/label resolution
+        - Predicate agent: for predicate resolution
+        
+        Each agent has its own LLM instance and message history.
+        System messages persist, user messages are cleared after each call.
+        """
+        from langchain_core.messages import SystemMessage
+        from langchain_core.chat_history import InMemoryChatMessageHistory
+        
+        # Create separate LLM instances for each agent
+        self.entity_agent = {
+            'llm': get_reasoning_llm(model=self.llm_model, temperature=0.3),
+            'history': InMemoryChatMessageHistory()
+        }
+        
+        self.predicate_agent = {
+            'llm': get_reasoning_llm(model=self.llm_model, temperature=0.3),
+            'history': InMemoryChatMessageHistory()
+        }
+        
+        # Add persistent system messages to each agent's history
+        self.entity_agent['history'].add_message(
+            SystemMessage(content=ENTITY_RESOLUTION_SYSTEM_PROMPT)
+        )
+        self.predicate_agent['history'].add_message(
+            SystemMessage(content=PREDICATE_RESOLUTION_SYSTEM_PROMPT)
+        )
 
     # ------------------------------------------------------------------
     # Qdrant client
@@ -176,19 +300,18 @@ class TripleRefiner:
         return self.registry_specs[spec_key]["collection_name"]
     
     def _ensure_collections_exist(self):
-        """Ensure all required collections exist and have the required payload index.
+        """Ensure all required entity/predicate/label collections exist.
 
         Qdrant requires a payload index on any field used in a filter.
         'is_canonical' is filtered on every canonical query, so we create a
         bool index for it if one does not already exist.
-
-        For the label registry, we also ensure an index on ``group`` so label
-        grouping filters remain fast.
+        
+        Evidence collection does not need payload indexes (uses vector comparison only).
         """
         from qdrant_client.http import models as qm
 
         collections = list(self.registry_specs.keys())
-        label_spec = self._role_to_spec_key.get("label", "label_registry")
+        evidence_spec = self._role_to_spec_key.get("evidence", "evidence_registry")
 
         for spec_key in collections:
             qdrant_name = self._qdrant_name(spec_key)
@@ -198,6 +321,11 @@ class TripleRefiner:
                 print(f"Collection '{qdrant_name}' already exists.")
             except Exception as e:
                 raise e
+
+            # Skip payload indexes for evidence collection (uses vector comparison only)
+            if spec_key == evidence_spec:
+                print(f"  Skipping payload indexes for evidence collection '{qdrant_name}'")
+                continue
 
             # Ensure payload index on is_canonical exists.
             # create_payload_index is idempotent — safe to call every run.
@@ -222,17 +350,6 @@ class TripleRefiner:
                     print(f"  Payload index on 'community_id' ensured for '{qdrant_name}'.")
                 except Exception as e:
                     print(f"  Warning: Could not create payload index on 'community_id' for '{qdrant_name}': {e}")
-
-            if spec_key == label_spec:
-                try:
-                    self.qdrant_client.create_payload_index(
-                        collection_name=qdrant_name,
-                        field_name="group",
-                        field_schema=qm.PayloadSchemaType.KEYWORD,
-                    )
-                    print(f"  Payload index on 'group' ensured for '{qdrant_name}'.")
-                except Exception as e:
-                    print(f"  Warning: Could not create payload index on 'group' for '{qdrant_name}': {e}")
 
     # ------------------------------------------------------------------
     # UUID helpers
@@ -282,6 +399,9 @@ class TripleRefiner:
     def _get_embedding(self, text: str) -> List[float]:
         """Get embedding for a single text string."""
         client = get_embedding_client()
+        # Ensure text is not empty to prevent OpenAI API errors
+        if not text.strip():
+            text = " "
         response = client.embeddings.create(
             model=OPENAI_EMBEDDING_MODEL,
             input=text,
@@ -293,6 +413,8 @@ class TripleRefiner:
         client = get_embedding_client()
         batch_size = 100
         all_embeddings = []
+        # Filter out empty strings to prevent OpenAI API errors
+        texts = [t if t.strip() else " " for t in texts]
         for i in range(0, len(texts), batch_size):
             batch = texts[i : i + batch_size]
             all_embeddings.extend(
@@ -641,8 +763,6 @@ class TripleRefiner:
                 }
                 if entity.get("community_id"):
                     payload["community_id"] = entity["community_id"]
-                if is_label_collection:
-                    payload["group"] = entity.get("group", "")
                 if name_en:
                     payload["name_en"] = name_en
                 if has_thai:
@@ -742,50 +862,42 @@ class TripleRefiner:
         return result.get(name)
 
     # ------------------------------------------------------------------
-    # LLM helpers  (unchanged logic, same prompts)
+    # LLM helpers
     # ------------------------------------------------------------------
 
-    def _get_llm_response(self, prompt: str) -> str:
-        """Get response from LLM."""
+    def _get_llm_response(self, user_message: str, is_predicate: bool = False) -> str:
+        """Get response from the appropriate stateful agent.
+        
+        Selects between entity_agent and predicate_agent based on context.
+        The system prompt persists in each agent's history.
+        User messages are added, processed, then cleared after each call.
+        
+        Args:
+            user_message: Specific data/question for this call
+            is_predicate: If True, use predicate agent; else use entity agent
+            
+        Returns:
+            LLM response text
+        """
         try:
-            import os
-            from langchain_openai import ChatOpenAI
-            from kg_extractor.utils.parser import (
-                get_api_key,
-                get_groq_api_key,
-                get_openrouter_api_key,
-            )
-
-            if self.llm_provider == "openai":
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=os.getenv("OPENAI_API_KEY"),
-                )
-            elif self.llm_provider == "groq":
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=get_groq_api_key(),
-                    base_url="https://api.groq.com/openai/v1",
-                )
-            elif self.llm_provider == "nvidia":
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=get_api_key(),
-                    base_url="https://integrate.api.nvidia.com/v1",
-                )
-            else:  # openrouter
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=get_openrouter_api_key(),
-                    base_url="https://openrouter.ai/api/v1",
-                )
-
-            return llm.invoke(prompt).content
-
+            # Select the appropriate agent (separate LLM + history)
+            agent = self.predicate_agent if is_predicate else self.entity_agent
+            
+            # Add user message to agent's history (system message already persists)
+            agent['history'].add_user_message(user_message)
+            
+            # Get all messages (system + user)
+            messages = agent['history'].messages
+            
+            # Invoke the agent's LLM
+            response = agent['llm'].invoke(messages)
+            
+            # Clear user message to prevent accumulation (keep only system message)
+            # Remove the last message (user message) and any AI response
+            while len(agent['history'].messages) > 1:  # Keep only the first message (system)
+                agent['history'].messages.pop()
+            
+            return response.content
         except Exception as e:
             print(f"Warning: Failed to get LLM response: {e}")
             return '{"canonical": null, "canonical_id": null, "synonyms": [], "reasoning": "LLM error"}'
@@ -797,10 +909,10 @@ class TripleRefiner:
         entity_type: str,
     ) -> Dict[str, Any]:
         """Use LLM to decide whether the new entity should replace the existing canonical."""
-        prompt = self._create_canonical_comparison_prompt(
+        user_message = self._create_canonical_comparison_message(
             new_entity, existing_canonical, entity_type
         )
-        response = self._get_llm_response(prompt)
+        response = self._get_llm_response(user_message, is_predicate=False)
         return self._parse_canonical_winner(response)
 
     def _compare_predicate_with_llm(
@@ -814,48 +926,15 @@ class TripleRefiner:
         existing_name = old_payload.get("name_en") or old_payload.get("name", "")
         incoming_name = new_predicate_en or new_predicate
 
-        prompt = f"""You are an expert in knowledge graph schema design and relationship normalisation.
-
-Two predicates (relationship types) have high vector similarity.  Your task:
-
-**Step 1 – Semantic equivalence check:** Decide whether these two predicates express the
-*same relationship type* in a knowledge graph.  Synonyms and near-synonyms count as
-equivalent (e.g. "increase" / "grow" / "rise" / "improve" are all equivalent; but
-"increase" and "decrease" are NOT equivalent even though they are related).
-
-**Step 2 – Canonical form selection (only when equivalent):** Choose the most standard,
-concise, and generic English verb form as the canonical predicate.  Prefer:
-- Short, common English verbs over long phrases
-- Active voice, base form (infinitive without "to")
-- Domain-neutral wording when both options work
-
-**Existing Canonical:**  {existing_name}
+        user_message = f"""**Existing Canonical:**  {existing_name}
   (original: {old_payload.get("name", "")})
   ID: {existing_canonical.get("id")}
   Similarity score: {existing_canonical.get("score", 0):.3f}
 
 **Incoming Predicate:**  {incoming_name}
-  (original: {new_predicate})
+  (original: {new_predicate})"""
 
-**Output Format (JSON):**
-```json
-{{
-  "are_equivalent": true_or_false,
-  "new_is_canonical": true_or_false,
-  "canonical_form": "chosen canonical predicate string",
-  "reasoning": "brief explanation"
-}}
-```
-
-Rules:
-- If "are_equivalent" is false → set "new_is_canonical" to true so the incoming predicate
-  gets its own canonical entry; "canonical_form" should be {incoming_name!r}.
-- If "are_equivalent" is true → set "new_is_canonical" based on which form is superior;
-  "canonical_form" must be the chosen canonical string.
-
-Return only valid JSON:"""
-
-        response = self._get_llm_response(prompt)
+        response = self._get_llm_response(user_message, is_predicate=True)
         return self._parse_predicate_equivalence(response, incoming_name)
 
     def _compare_batch_with_llm(
@@ -878,80 +957,31 @@ Return only valid JSON:"""
             return results
 
         if is_predicate:
-            # For predicates: batch by prompts + single call
-            prompts = []
-            pair_indices = []
+            # For predicates: use predicate agent
             for entity, canonical, _ in pairs:
                 entity_name = entity["name"]
                 old_payload = canonical.get("payload", {})
                 existing_name = old_payload.get("name_en") or old_payload.get("name", "")
                 incoming_name = entity.get("name_en") or entity["name"]
 
-                prompt = f"""You are an expert in knowledge graph schema design and relationship normalisation.
-
-Two predicates (relationship types) have high vector similarity.  Your task:
-
-**Step 1 – Semantic equivalence check:** Decide whether these two predicates express the
-*same relationship type* in a knowledge graph.  Synonyms and near-synonyms count as
-equivalent (e.g. "increase" / "grow" / "rise" / "improve" are all equivalent; but
-"increase" and "decrease" are NOT equivalent even though they are related).
-
-**Step 2 – Canonical form selection (only when equivalent):** Choose the most standard,
-concise, and generic English verb form as the canonical predicate.  Prefer:
-- Short, common English verbs over long phrases
-- Active voice, base form (infinitive without "to")
-- Domain-neutral wording when both options work
-
-**Existing Canonical:**  {existing_name}
+                user_message = f"""**Existing Canonical:**  {existing_name}
   (original: {old_payload.get("name", "")})
   ID: {canonical.get("id")}
   Similarity score: {canonical.get("score", 0):.3f}
 
 **Incoming Predicate:**  {incoming_name}
-  (original: {entity["name"]})
+  (original: {entity["name"]})"""
 
-**Output Format (JSON):**
-```json
-{{
-  "are_equivalent": true_or_false,
-  "new_is_canonical": true_or_false,
-  "canonical_form": "chosen canonical predicate string",
-  "reasoning": "brief explanation"
-}}
-```
-
-Rules:
-- If "are_equivalent" is false → set "new_is_canonical" to true so the incoming predicate
-  gets its own canonical entry; "canonical_form" should be {incoming_name!r}.
-- If "are_equivalent" is true → set "new_is_canonical" based on which form is superior;
-  "canonical_form" must be the chosen canonical string.
-
-Return only valid JSON:"""
-
-                prompts.append(prompt)
-                pair_indices.append(entity_name)
-
-            # Batch all LLM calls
-            for entity_name, prompt in zip(pair_indices, prompts):
-                response = self._get_llm_response(prompt)
-                entity_dict = next(e for e, _, _ in pairs if e["name"] == entity_name)
-                incoming_name = entity_dict.get("name_en") or entity_dict["name"]
+                response = self._get_llm_response(user_message, is_predicate=True)
                 results[entity_name] = self._parse_predicate_equivalence(response, incoming_name)
         else:
-            # For entities/labels: batch by prompts + single call
-            prompts = []
-            pair_indices = []
+            # For entities/labels: use entity agent
             for entity, canonical, entity_type in pairs:
                 entity_name = entity["name"]
-                prompt = self._create_canonical_comparison_prompt(
+                user_message = self._create_canonical_comparison_message(
                     entity, canonical, entity_type
                 )
-                prompts.append(prompt)
-                pair_indices.append(entity_name)
-
-            # Batch all LLM calls
-            for entity_name, prompt in zip(pair_indices, prompts):
-                response = self._get_llm_response(prompt)
+                response = self._get_llm_response(user_message, is_predicate=False)
                 results[entity_name] = self._parse_canonical_winner(response)
 
         return results
@@ -963,16 +993,10 @@ Return only valid JSON:"""
     ) -> Dict[str, Any]:
         """Parse LLM response for predicate equivalence decision."""
         try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            elif response.startswith("```"):
-                response = response[3:]
-            if response.endswith("```"):
-                response = response[:-3]
-            response = response.strip()
-
-            data = json.loads(response)
+            data = parse_json_with_repair(response)
+            if not data:
+                raise ValueError("Failed to parse JSON")
+            
             are_equiv = bool(data.get("are_equivalent", True))
             new_is_canonical = (
                 bool(data.get("new_is_canonical", False)) if are_equiv else True
@@ -992,13 +1016,16 @@ Return only valid JSON:"""
                 "reasoning": "parse error",
             }
 
-    def _create_canonical_comparison_prompt(
+    def _create_canonical_comparison_message(
         self,
         new_entity: Dict[str, Any],
         existing_canonical: Dict[str, Any],
         entity_type: str,
     ) -> str:
-        """Build the LLM prompt for entity identity + canonical selection."""
+        """Build the user message for entity identity + canonical selection.
+        
+        Returns only the data portion - system instructions are in ENTITY_RESOLUTION_SYSTEM_PROMPT.
+        """
 
         def _format_entity(name: str, name_en: Optional[str], attributes: Dict) -> str:
             lines = [f"  Name: {name}"]
@@ -1022,22 +1049,7 @@ Return only valid JSON:"""
             new_entity.get("attributes") or {},
         )
 
-        return f"""You are an expert in entity resolution and knowledge graph curation.
-
-Two entities with high vector similarity have been found.  Your task has two steps:
-
-**Step 1 – Identity check:** Decide whether these two entities refer to the *same real-world
-concept* (i.e. they are aliases, abbreviations, or surface variants of the same thing).
-Set "are_same_entity": true ONLY when both names clearly denote the identical concept.
-If one is a specific attribute, metric, sub-component, or related-but-distinct concept of the
-other (e.g. "Thai E-Commerce Market" vs "Thai E-Commerce Market Annual Value"), they are
-DIFFERENT entities — set "are_same_entity": false.
-
-**Step 2 – Canonical selection (only when are_same_entity is true):** Decide which form should
-be the canonical entry.  The existing canonical keeps its status UNLESS the new entity is clearly
-superior (more specific name, better evidence, more complete information).
-
-**Entity Type:** {entity_type}
+        return f"""**Entity Type:** {entity_type}
 
 **Existing Canonical (currently registered):**
 {old_text}
@@ -1045,36 +1057,15 @@ superior (more specific name, better evidence, more complete information).
   Similarity score: {existing_canonical.get("score", 0):.3f}
 
 **New Entity (incoming):**
-{new_text}
-
-**Output Format (JSON):**
-```json
-{{
-  "are_same_entity": true_or_false,
-  "new_is_canonical": true_or_false,
-  "reasoning": "brief explanation"
-}}
-```
-
-Rules:
-- If "are_same_entity" is false, set "new_is_canonical" to true (the new entity needs its own canonical entry).
-- If "are_same_entity" is true, set "new_is_canonical" based on which form is superior.
-
-Return only valid JSON:"""
+{new_text}"""
 
     def _parse_canonical_winner(self, response: str) -> Dict[str, Any]:
         """Parse LLM response for canonical winner decision."""
         try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            elif response.startswith("```"):
-                response = response[3:]
-            if response.endswith("```"):
-                response = response[:-3]
-            response = response.strip()
-
-            data = json.loads(response)
+            data = parse_json_with_repair(response)
+            if not data:
+                raise ValueError("Failed to parse JSON")
+            
             are_same = bool(data.get("are_same_entity", True))
             new_is_canonical = (
                 bool(data.get("new_is_canonical", False)) if are_same else True
@@ -1105,250 +1096,6 @@ Return only valid JSON:"""
             m2 = sum(b * b for b in vec2) ** 0.5
             return dot / (m1 * m2) if m1 and m2 else 0.0
 
-    # ------------------------------------------------------------------
-    # Label group assignment
-    # ------------------------------------------------------------------
-
-    def _load_label_group_config(self) -> Dict[str, str]:
-        """Load label group configuration from YAML file.
-        
-        Returns:
-            Dict mapping group_name → description
-        """
-        try:
-            import yaml
-            
-            if not self.label_group_config_path.exists():
-                print(f"Warning: Label group config not found at {self.label_group_config_path}")
-                return {}
-            
-            with open(self.label_group_config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            
-            return config if config else {}
-        except Exception as e:
-            print(f"Warning: Failed to load label group config: {e}")
-            return {}
-
-    def _update_label_group_config(self, new_groups: Dict[str, str]) -> None:
-        """Update label group configuration YAML file with new groups.
-        
-        Args:
-            new_groups: Dict mapping group_name → description for new groups
-        """
-        try:
-            import yaml
-            
-            print(f"📝 Updating label group config at: {self.label_group_config_path}")
-            print(f"   Adding {len(new_groups)} new group(s): {list(new_groups.keys())}")
-            
-            # Load existing config
-            existing_groups = self._load_label_group_config()
-            print(f"   Loaded {len(existing_groups)} existing groups")
-            
-            # Merge with new groups
-            existing_groups.update(new_groups)
-            print(f"   Total groups after merge: {len(existing_groups)}")
-            
-            # Write back to file
-            with open(self.label_group_config_path, 'w', encoding='utf-8') as f:
-                yaml.dump(existing_groups, f, default_flow_style=False, allow_unicode=True, sort_keys=True)
-            
-            print(f"✅ Successfully updated label group config file")
-            
-        except Exception as e:
-            import traceback
-            print(f"❌ Failed to update label group config: {e}")
-            print(f"   Traceback: {traceback.format_exc()}")
-
-    def _assign_label_groups_with_llm(self, labels: List[Dict[str, Any]]) -> Dict[str, str]:
-        """Use LLM to assign groups to labels that don't have one.
-        
-        Args:
-            labels: List of label entities (dicts with 'name' field)
-        
-        Returns:
-            Dict mapping label name → assigned group_name
-        """
-        if not labels:
-            return {}
-        
-        # Load current group config
-        group_config = self._load_label_group_config()
-        
-        if not group_config:
-            print("Warning: No label group configuration found, skipping group assignment")
-            return {label["name"]: "" for label in labels}
-        
-        # Format group config for prompt
-        group_list = "\n".join([
-            f"  - {group_name}: {description}"
-            for group_name, description in sorted(group_config.items())
-        ])
-        
-        # Format labels for prompt
-        label_list = "\n".join([f"  - {label['name']}" for label in labels])
-        
-        prompt = f"""You are an expert in knowledge graph ontology design and entity classification.
-
-You are given a list of entity labels that need to be assigned to semantic groups.
-Each group represents a high-level category in a community knowledge graph.
-
-**Available Groups:**
-{group_list}
-
-**Labels to Classify:**
-{label_list}
-
-**Task:**
-1. For each label, assign it to the most appropriate EXISTING group from the available groups above.
-2. IMPORTANT: You MUST use ONLY the existing groups listed above - DO NOT create new groups.
-3. If a label doesn't fit well into any category, assign it to 'Others'.
-4. The purpose of grouping is to CLUSTER multiple similar labels together, NOT to create unique tags.
-5. Use the BROADEST matching group - avoid trying to create more specific subcategories.
-
-**Output Format (JSON):**
-```json
-{{
-  "assignments": {{
-    "LabelName": "GroupName",
-    "AnotherLabel": "GroupName"
-  }}
-}}
-```
-
-**Critical Rules:**
-- Use ONLY the existing groups listed above
-- Every group name in "assignments" MUST be from the available groups list
-- Use the closest semantic match from existing groups
-- If uncertain, use 'Others'
-- Every label must have an assignment
-- Do NOT include a "new_groups" field - it will be ignored
-
-Return only valid JSON:"""
-        
-        try:
-            response = self._get_llm_response(prompt)
-            return self._parse_label_group_assignments(response, labels, group_config)
-        except Exception as e:
-            print(f"Warning: LLM group assignment failed: {e}")
-            # Fallback: return empty groups
-            return {label["name"]: "" for label in labels}
-
-    def _parse_label_group_assignments(
-        self,
-        response: str,
-        labels: List[Dict[str, Any]],
-        existing_groups: Dict[str, str],
-    ) -> Dict[str, str]:
-        """Parse LLM response for label group assignments.
-        
-        Args:
-            response: LLM JSON response
-            labels: Original label list
-            existing_groups: Existing group config
-        
-        Returns:
-            Dict mapping label name → group_name
-        """
-        try:
-            response = response.strip()
-            if response.startswith("```json"):
-                response = response[7:]
-            elif response.startswith("```"):
-                response = response[3:]
-            if response.endswith("```"):
-                response = response[:-3]
-            response = response.strip()
-            
-            data = json.loads(response)
-            assignments = data.get("assignments", {})
-            new_groups = data.get("new_groups", {})
-            
-            # Detect undeclared new groups: groups used in assignments but not in existing config or new_groups
-            all_existing_groups = set(existing_groups.keys())
-            all_declared_new = set(new_groups.keys())
-            groups_in_use = set(assignments.values())
-            
-            # Find groups that are used but not declared
-            undeclared_groups = groups_in_use - all_existing_groups - all_declared_new
-            
-            if undeclared_groups:
-                print(f"⚠️  LLM used {len(undeclared_groups)} undeclared group(s): {sorted(undeclared_groups)}")
-                print("   These groups were assigned but not declared in 'new_groups' field")
-                
-                # Count labels per undeclared group
-                undeclared_counts = {g: 0 for g in undeclared_groups}
-                for group in assignments.values():
-                    if group in undeclared_groups:
-                        undeclared_counts[group] += 1
-                
-                # Add undeclared groups to new_groups with auto-generated descriptions
-                for group_name in undeclared_groups:
-                    count = undeclared_counts[group_name]
-                    new_groups[group_name] = f"Auto-generated group for {count} label(s)"
-                    print(f"   → {group_name}: {count} label(s)")
-            
-            # Validate new groups: each should have multiple labels (clustering purpose)
-            if new_groups:
-                # Count how many labels are assigned to each new group
-                new_group_counts = {group: 0 for group in new_groups.keys()}
-                for label_name, group in assignments.items():
-                    if group in new_group_counts:
-                        new_group_counts[group] += 1
-                
-                # Filter out singleton/doubleton groups (defeats purpose of grouping)
-                MIN_GROUP_SIZE = 3
-                valid_new_groups = {}
-                rejected_groups = {}
-                
-                for group_name, description in new_groups.items():
-                    count = new_group_counts.get(group_name, 0)
-                    if count >= MIN_GROUP_SIZE:
-                        valid_new_groups[group_name] = description
-                    else:
-                        rejected_groups[group_name] = count
-                        print(f"⚠️  Rejected new group '{group_name}' (only {count} label{'s' if count != 1 else ''}) - groups should cluster multiple labels")
-                
-                # Reassign labels from rejected groups to 'Others' fallback
-                if rejected_groups:
-                    print(f"🔄 Reassigning labels from {len(rejected_groups)} rejected group(s) to 'Others'...")
-                    
-                    # Fallback to 'Others' group for rejected labels
-                    reassignment_count = 0
-                    for label_name, assigned_group in list(assignments.items()):
-                        if assigned_group in rejected_groups:
-                            assignments[label_name] = "Others"
-                            reassignment_count += 1
-                            if reassignment_count <= 5:  # Show first 5 examples
-                                print(f"   - {label_name}: '{assigned_group}' → 'Others'")
-                    
-                    if reassignment_count > 5:
-                        print(f"   ... and {reassignment_count - 5} more reassignments")
-                
-                # Update config file only with valid new groups
-                if valid_new_groups:
-                    print(f"✅ Accepting {len(valid_new_groups)} new group(s): {list(valid_new_groups.keys())}")
-                    self._update_label_group_config(valid_new_groups)
-                else:
-                    print("ℹ️  No valid new groups to add (all had too few labels)")
-            
-            # Validate all labels have assignments
-            result = {}
-            for label in labels:
-                label_name = label["name"]
-                if label_name in assignments:
-                    result[label_name] = assignments[label_name]
-                else:
-                    print(f"Warning: No group assignment for label '{label_name}', using empty string")
-                    result[label_name] = ""
-            
-            return result
-            
-        except Exception as e:
-            print(f"Warning: Failed to parse label group assignments: {e}")
-            # Fallback: return empty groups
-            return {label["name"]: "" for label in labels}
 
     def _dedup_within_batch(
         self,
@@ -1423,18 +1170,6 @@ Return only valid JSON:"""
         kind = "label" if is_label else ("predicate" if is_predicate else "entity")
         n    = len(entity_list)
         print(f"[{collection_name}] Processing {n} {kind}s")
-
-        # ── Step 0: Assign groups to labels without group field ──────────────
-        if is_label:
-            labels_without_group = [e for e in entity_list if not e.get("group")]
-            if labels_without_group:
-                print(f"[{collection_name}]   Found {len(labels_without_group)} labels without group, calling LLM...")
-                group_assignments = self._assign_label_groups_with_llm(labels_without_group)
-                # Update entity_list with assigned groups
-                for entity in entity_list:
-                    if entity["name"] in group_assignments:
-                        entity["group"] = group_assignments[entity["name"]]
-                print(f"[{collection_name}]   Assigned groups to {len(group_assignments)} labels")
 
         # ── Step 1: Embed ─────────────────────────────────────────────────────
         # Labels use name directly (already English). Entities/predicates use name_en.
@@ -1523,7 +1258,6 @@ Return only valid JSON:"""
                 }
                 if is_label:
                     cache_entry["label"] = "label"
-                    cache_entry["group"] = entity.get("group", "")
                 else:
                     cache_entry.update({
                         "label":         "predicate" if is_predicate else entity.get("label", ""),
@@ -1537,65 +1271,13 @@ Return only valid JSON:"""
                     entity_cache[(collection_name, entity["name"])] = cache_entry
             print(f"[{collection_name}]   Upserted {len(unmatched)} new canonicals")
 
-        # ── Step 4b: Auto-merge high-confidence matches ───────────────────────
+        # ── Step 4b: SKIP auto-merge (merging disabled) ──────────────────────
         if high_conf:
-            merge_entities = [
-                {**entity, "is_canonical": False, "canonical_id": canonical["id"]}
-                for entity, canonical in high_conf
-            ]
-            self._batch_upsert_entities(merge_entities, collection_name)
-            for entity, canonical in high_conf:
-                old_payload    = canonical.get("payload", {})
-                canonical_name = old_payload.get("name_en") or old_payload.get("name", entity["name"])
-                canonical_id   = old_payload.get("canonical_id", canonical["id"])
-                cache_entry    = {
-                    "original":     entity["name"],
-                    "canonical":    canonical_name,
-                    "canonical_id": canonical_id,
-                    "is_new":       False,
-                    "is_canonical": False,
-                }
-                if is_label:
-                    cache_entry["label"] = "label"
-                    cache_entry["group"] = old_payload.get("group", "")
-                else:
-                    cache_entry.update({
-                        "label":         "predicate" if is_predicate else entity.get("label", ""),
-                        "name_en":       entity.get("name_en"),
-                        "attributes":    {} if is_predicate else entity.get("attributes", {}),
-                        "attributes_en": {} if is_predicate else entity.get("attributes_en", {}),
-                    })
-                if is_predicate:
-                    entity_cache[(collection_name, entity["name"], entity.get("community_id"))] = cache_entry
-                else:
-                    entity_cache[(collection_name, entity["name"])] = cache_entry
-            print(f"[{collection_name}]   Auto-merged {len(high_conf)} high-confidence matches")
+            print(f"[{collection_name}]   Skipped {len(high_conf)} auto-merge candidates (merging disabled)")
 
-        # ── Step 4c: LLM decisions for uncertain matches ──────────────────────
+        # ── Step 4c: SKIP LLM decisions (merging disabled) ────────────────────
         if uncertain:
-            # Build pairs list in the format _compare_batch_with_llm expects:
-            # [(entity, canonical, entity_type_str), ...]
-            pairs = [
-                (entity, canonical, "predicate" if is_predicate else entity.get("label", ""))
-                for entity, canonical in uncertain
-            ]
-            llm_results = self._compare_batch_with_llm(pairs, is_predicate=is_predicate)
-
-            counts: Dict[str, int] = {"new": 0, "merged": 0, "replaced": 0}
-            for entity, canonical, _ in pairs:
-                decision = llm_results.get(entity["name"], {})
-                outcome  = self._apply_match_decision(
-                    entity, canonical, collection_name,
-                    entity_cache, canonical_change_log, decision,
-                    is_predicate=is_predicate,
-                    is_label=is_label,
-                )
-                counts[outcome] = counts.get(outcome, 0) + 1
-
-            print(
-                f"[{collection_name}]   LLM decisions: "
-                f"{counts['new']} new | {counts['merged']} merged | {counts['replaced']} replaced"
-            )
+            print(f"[{collection_name}]   Skipped {len(uncertain)} LLM decision candidates (merging disabled)")
 
         # ── Step 4d: Upsert within-batch aliases ──────────────────────────────
         # All representatives have now been processed and are in entity_cache.
@@ -1626,7 +1308,6 @@ Return only valid JSON:"""
                     }
                     if is_label:
                         cache_entry["label"] = "label"
-                        cache_entry["group"] = rep_cache.get("group", "")
                     else:
                         cache_entry.update({
                             "label":         "predicate" if is_predicate else alias_entity.get("label", ""),
@@ -1660,7 +1341,6 @@ Return only valid JSON:"""
                     }
                     if is_label:
                         fallback_entry["label"] = "label"
-                        fallback_entry["group"] = alias_entity.get("group", "")
                     else:
                         fallback_entry.update({
                             "label":         "predicate" if is_predicate else alias_entity.get("label", ""),
@@ -1678,6 +1358,249 @@ Return only valid JSON:"""
             if alias_points:
                 self._batch_upsert_entities(alias_points, collection_name)
             print(f"[{collection_name}]   Upserted {len(alias_pairs)} within-batch alias(es)")
+
+    # ------------------------------------------------------------------
+    # Evidence collection (dual-vector)
+    # ------------------------------------------------------------------
+
+    def _dedup_evidence_within_batch(
+        self,
+        records: List[Dict[str, Any]],
+        embeddings: List[List[float]],
+    ) -> Tuple[List[int], List[Tuple[int, int, float]]]:
+        """Greedy within-batch deduplication for evidence using cosine similarity.
+
+        Compares evidence records based on their English embeddings.  If two evidence
+        items have embeddings above the similarity threshold, only one is kept.
+
+        Algorithm (greedy, O(n²)):
+          Iterate through evidence records.  For each record, compute cosine
+          similarity against every already-chosen representative.  If the best
+          match exceeds ``self.similarity_threshold``, the record is considered
+          a duplicate; otherwise it becomes a new representative.
+
+        Args:
+            records:    Evidence record dicts in the current batch.
+            embeddings: Corresponding English embeddings (parallel to records).
+
+        Returns:
+            rep_indices:  Indices (into ``records``) of unique representatives.
+                          Only these will be upserted to Qdrant.
+            dup_pairs:    List of ``(dup_idx, rep_idx, score)`` tuples for
+                          records that are duplicates of a representative.
+        """
+        n = len(records)
+        if n <= 1:
+            return list(range(n)), []
+
+        rep_indices: List[int] = []
+        dup_pairs: List[Tuple[int, int, float]] = []
+
+        for i in range(n):
+            best_rep_idx: Optional[int] = None
+            best_score = 0.0
+            for rep_idx in rep_indices:
+                score = self._cosine_similarity(embeddings[i], embeddings[rep_idx])
+                if score >= self.similarity_threshold and score > best_score:
+                    best_score = score
+                    best_rep_idx = rep_idx
+
+            if best_rep_idx is None:
+                rep_indices.append(i)
+            else:
+                dup_pairs.append((i, best_rep_idx, best_score))
+
+        return rep_indices, dup_pairs
+
+    def _get_evidence_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Embed texts with text-embedding-3-large at EVIDENCE_VECTOR_DIM dimensions.
+
+        Uses a separate OpenAI call so the evidence collection stays independent
+        of the entity/predicate embedding model.
+        """
+        client = get_embedding_client()
+        batch_size = 100
+        all_embeddings: List[List[float]] = []
+        # Filter out empty strings to prevent OpenAI API errors
+        texts = [t if t.strip() else " " for t in texts]
+        for i in range(0, len(texts), batch_size):
+            batch = texts[i : i + batch_size]
+            all_embeddings.extend(
+                self._get_evidence_embeddings_batch_chunk(client, batch)
+            )
+        return all_embeddings
+
+    @retry(
+        retry=retry_if_exception_type(Exception),
+        wait=wait_exponential(multiplier=2, min=5, max=60),
+        stop=stop_after_attempt(5),
+        reraise=True,
+    )
+    def _get_evidence_embeddings_batch_chunk(
+        self, client: Any, batch: List[str]
+    ) -> List[List[float]]:
+        """Fetch evidence embeddings for a single chunk, with retry."""
+        response = client.embeddings.create(
+            model=EVIDENCE_EMBEDDING_MODEL,
+            input=batch,
+            dimensions=EVIDENCE_VECTOR_DIM,
+        )
+        return [item.embedding for item in response.data]
+
+    def _upsert_evidence_triples(
+        self,
+        refined_chunks: List[Dict[str, Any]],
+    ) -> None:
+        """Embed and upsert every refined triple into the evidence collection.
+
+        Each Qdrant point represents one triple.  The English evidence quote is
+        embedded into the English vector and the Thai evidence quote into the Thai
+        vector (names read from evidence_registry spec), enabling nearest-neighbour
+        retrieval by evidence text in either language.
+        Subject name, predicate, and object name are stored in the payload.
+
+        The point UUID is derived deterministically from
+        ``"<subject>::<predicate>::<object>::<chunk_id>"`` so the same triple is
+        never duplicated across re-runs.
+
+        Args:
+            refined_chunks: The ``chunks`` list produced by ``_build_refined_output``
+                            (each item has ``chunk_id`` and ``triples``).
+        """
+        from qdrant_client.http import models as qm
+        
+        # Get vector names from evidence registry spec
+        evidence_spec = self._role_to_spec_key.get("evidence", "evidence_registry")
+        vec_en, vec_th = self._vector_names(evidence_spec)
+        evidence_collection = self._qdrant_name(evidence_spec)
+
+        # ── Collect all triples to embed ──────────────────────────────────────
+        records: List[Dict[str, Any]] = []
+        for chunk in refined_chunks:
+            chunk_id = chunk["chunk_id"]
+            for triple in chunk.get("triples", []):
+                subj_name = triple["subject"]["name"]
+                pred_name = triple["predicate"]
+                obj_name  = triple["object"]["name"]
+                props     = triple.get("properties", {})
+
+                records.append({
+                    "subject":           subj_name,
+                    "predicate":         pred_name,
+                    "object":            obj_name,
+                    "evidence_quote_en": props.get("evidence_quote_en", ""),
+                    "evidence_quote":    props.get("evidence_quote", ""),
+                    "chunk_id":          chunk_id,
+                    "community_id":      props.get("community_id"),
+                })
+
+        if not records:
+            print("No evidence triples to upsert.")
+            return
+
+        print(f"Embedding {len(records)} evidence triples (dual-vector)...")
+
+        # ── Batch-embed English and Thai evidence quotes ──────────────────────
+        # Filter out empty strings and replace with placeholder to avoid OpenAI API errors
+        en_texts = [r["evidence_quote_en"] if r["evidence_quote_en"].strip() else "[no evidence]" for r in records]
+        th_texts = [r["evidence_quote"] if r["evidence_quote"].strip() else "[no evidence]" for r in records]
+
+        en_embeddings = self._get_evidence_embeddings_batch(en_texts)
+        th_embeddings = self._get_evidence_embeddings_batch(th_texts)
+
+        # ── Within-batch deduplication ────────────────────────────────────────
+        # Compare evidence records against each other based on English embeddings.
+        # If two records are similar (above threshold), keep only one.
+        rep_indices, dup_pairs = self._dedup_evidence_within_batch(
+            records, en_embeddings
+        )
+        rep_records       = [records[i]       for i in rep_indices]
+        rep_en_embeddings = [en_embeddings[i] for i in rep_indices]
+        rep_th_embeddings = [th_embeddings[i] for i in rep_indices]
+
+        if dup_pairs:
+            dup_info = [
+                f"{records[d]['subject']}->{records[d]['predicate']}->{records[d]['object']} "
+                f"(sim={score:.3f} to rep {rep_idx})"
+                for d, rep_idx, score in dup_pairs[:5]  # Show first 5
+            ]
+            print(
+                f"   Within-batch dedup: {len(dup_pairs)} duplicate(s) removed, "
+                f"{len(rep_records)} unique evidence records remain"
+            )
+            if len(dup_pairs) <= 5:
+                for info in dup_info:
+                    print(f"      - {info}")
+            else:
+                for info in dup_info:
+                    print(f"      - {info}")
+                print(f"      ... and {len(dup_pairs) - 5} more")
+
+        # ── Build PointStructs ────────────────────────────────────────────────
+        points: List[qm.PointStruct] = []
+        for record, en_vec, th_vec in zip(rep_records, rep_en_embeddings, rep_th_embeddings):
+            point_key = (
+                f"{record['subject']}::{record['predicate']}"
+                f"::{record['object']}::{record['chunk_id']}"
+            )
+            point_id = self._generate_uuid(point_key)
+
+            payload: Dict[str, Any] = {
+                "subject":          record["subject"],
+                "predicate":        record["predicate"],
+                "object":           record["object"],
+                "evidence_quote":   record["evidence_quote"],
+                "evidence_quote_en": record["evidence_quote_en"],
+            }
+            if record["community_id"]:
+                payload["community_id"] = record["community_id"]
+
+            points.append(
+                qm.PointStruct(
+                    id=point_id,
+                    vector={
+                        vec_en: en_vec,
+                        vec_th: th_vec,
+                    },
+                    payload=payload,
+                )
+            )
+
+        # ── Skip identical vectors already in Qdrant ──────────────────────────
+        try:
+            existing = self.qdrant_client.retrieve(
+                collection_name=evidence_collection,
+                ids=[p.id for p in points],
+                with_payload=False,
+                with_vectors=True,
+            )
+            existing_vectors = {r.id: r.vector for r in existing}
+        except Exception:
+            existing_vectors = {}
+
+        # Compare vectors (both en and th) to determine if update is needed
+        import numpy as np
+        new_points = []
+        for p in points:
+            if p.id not in existing_vectors:
+                # Point doesn't exist, add it
+                new_points.append(p)
+            else:
+                # Point exists, compare vectors
+                existing_vec = existing_vectors[p.id]
+                # Check if either vector differs
+                en_diff = not np.allclose(existing_vec.get(vec_en, []), p.vector[vec_en], atol=1e-6)
+                th_diff = not np.allclose(existing_vec.get(vec_th, []), p.vector[vec_th], atol=1e-6)
+                if en_diff or th_diff:
+                    new_points.append(p)
+
+        if not new_points:
+            print("All evidence vectors already up-to-date in Qdrant.")
+            return
+
+        print(f"Upserting {len(new_points)} new/updated evidence points (vector comparison)...")
+        self._qdrant_upsert_with_retry(evidence_collection, new_points)
+        print(f"✅ Evidence upsert complete ({len(new_points)} points).")
 
     def refine_triples(self, triples_data: Dict[str, Any]) -> Dict[str, Any]:
         """Refine all triples using Qdrant for entity resolution.
@@ -1738,6 +1661,13 @@ Return only valid JSON:"""
         total_items = sum(len(v) for v in registry_items.values())
         print(f"Collected {total_items} unique items across {len(registry_items)} registries")
 
+        # ── Embed and upsert evidence triples FIRST (dual-vector) ─────────────
+        print("📎 Processing evidence registry first...")
+        # Build initial output for evidence (before entity resolution)
+        initial_output = {"chunks": triples_data.get("chunks", [])}
+        self._upsert_evidence_triples(initial_output.get("chunks", []))
+        print("✅ Evidence registry processed\n")
+
         # ── Process each registry ─────────────────────────────────────────────
         entity_cache:        Dict[tuple, Dict[str, Any]] = {}
         canonical_change_log: List[Dict[str, Any]]       = []
@@ -1761,7 +1691,9 @@ Return only valid JSON:"""
         if canonical_change_log:
             print(f"Canonical replacements this run: {len(canonical_change_log)}")
 
-        return self._build_refined_output(triples_data, entity_cache, canonical_change_log)
+        refined_output = self._build_refined_output(triples_data, entity_cache, canonical_change_log)
+
+        return refined_output
 
     # ------------------------------------------------------------------
     # Unified match-decision handler
@@ -1806,7 +1738,6 @@ Return only valid JSON:"""
             canonical_id: str,
             is_new: bool,
             is_canon: bool,
-            group_value: Optional[str] = None,
         ) -> Dict:
             base = {
                 "original":     entity["name"],
@@ -1817,7 +1748,6 @@ Return only valid JSON:"""
             }
             if is_label:
                 base["label"] = "label"
-                base["group"] = group_value or ""
             else:
                 base.update({
                     "label":         "predicate" if is_predicate else entity.get("label", ""),
@@ -1853,13 +1783,11 @@ Return only valid JSON:"""
             canonical_id = existing_canonical["payload"].get(
                 "canonical_id", existing_canonical["id"]
             )
-            merged_group = old_payload.get("group", "")
             entity_cache[_cache_key()] = _cache_entry(
                 existing_name,
                 canonical_id,
                 is_new=False,
                 is_canon=False,
-                group_value=merged_group,
             )
             return "merged"
 

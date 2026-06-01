@@ -27,6 +27,7 @@ def extract_triples_node(state: "WorkflowState") -> "WorkflowState":
             chunks_data = json.load(f)
 
         chunks = chunks_data.get("chunks", [])
+        print(f"📄 Found {len(chunks)} chunks for triple extraction")
 
         # Get community_id from metadata
         community_id = None

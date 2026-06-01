@@ -14,6 +14,9 @@ from kg_extractor.workflow.functions.build_graph.schema_parser import get_schema
 
 class Neo4jGraphBuilder:
     """Build knowledge graphs in Neo4j from refined triples."""
+    
+    # Evidence fields that should be excluded from Neo4j (stored in Qdrant instead)
+    _EVIDENCE_KEYS = {"evidence_quote", "evidence_quote_en", "causal_link"}
 
     def __init__(
         self,
@@ -279,15 +282,14 @@ class Neo4jGraphBuilder:
                     # Get predicate name as edge type
                     predicate_name = triple["predicate"]
 
-                    # Flatten triple properties for edge properties
-                    edge_props = {}
-                    for key, value in triple["properties"].items():
-                        if key == "causal_link" and isinstance(value, dict):
-                            # Flatten causal_link properties
-                            for causal_key, causal_value in value.items():
-                                edge_props[causal_key] = causal_value
-                        else:
-                            edge_props[key] = value
+                    # Build edge properties from structural/semantic fields only.
+                    # Evidence fields (evidence_quote, evidence_quote_en, causal_link) are stored in
+                    # Qdrant's evidence_registry collection and excluded here.
+                    edge_props = {
+                        key: value
+                        for key, value in triple["properties"].items()
+                        if key not in self._EVIDENCE_KEYS
+                    }
 
                     # Add metadata
                     edge_props["chunk_id"] = chunk_id
