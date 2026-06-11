@@ -3,7 +3,9 @@
     "allow": [
       "Bash(cat)",
       "Bash(uv run *)",
-      "Bash(uv sync *)"
+      "Bash(uv sync *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk find *)"
     ]
   }
 }

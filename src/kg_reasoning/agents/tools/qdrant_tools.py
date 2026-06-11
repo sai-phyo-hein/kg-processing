@@ -6,11 +6,18 @@ predicates, and community metadata.
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from kg_extractor.utils.model_setup import OPENAI_EMBEDDING_MODEL, get_embedding_client
+from kg_extractor.utils.model_setup import (
+    OPENAI_EMBEDDING_MODEL,
+    EVIDENCE_EMBEDDING_MODEL,
+    EVIDENCE_VECTOR_DIM,
+    get_embedding_client,
+)
+from kg_extractor.utils.sparse_vectors import compute_query_sparse
 from langchain_core.tools import tool
 from qdrant_client import QdrantClient
 
@@ -52,7 +59,7 @@ class QdrantToolsManager:
             Dict mapping registry key to its spec (collection_name, vector_names).
         """
         specs = {}
-        for registry_key in ("entity_registry", "predicate_registry", "metadata_registry", "label_registry"):
+        for registry_key in ("entity_registry", "predicate_registry", "metadata_registry", "label_registry", "evidence_registry"):
             spec_file = self.registry_info_dir / f"{registry_key}.json"
             with open(spec_file) as f:
                 data = json.load(f)
@@ -81,10 +88,98 @@ class QdrantToolsManager:
             import random
             return [[random.random() for _ in range(1536)] for _ in texts]
 
+    def _get_evidence_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """Embed texts with text-embedding-3-large at EVIDENCE_VECTOR_DIM dimensions.
+
+        Uses a separate model from entity/predicate embeddings because the evidence
+        collection stores 3072-dim vectors (vs 1536 for entities/predicates).
+        """
+        try:
+            client = get_embedding_client()
+            texts = [t if t.strip() else " " for t in texts]
+            response = client.embeddings.create(
+                model=EVIDENCE_EMBEDDING_MODEL,
+                input=texts,
+                dimensions=EVIDENCE_VECTOR_DIM,
+            )
+            return [item.embedding for item in response.data]
+        except Exception as e:
+            print(f"Warning: Failed to get evidence embeddings: {e}")
+            return [[0.0] * EVIDENCE_VECTOR_DIM for _ in texts]
+
+    def _query_registry_parallel(
+        self,
+        registry_key: str,
+        names: List[str],
+        limit: int,
+        threshold: float,
+        embeddings: List[List[float]],
+    ) -> List[Dict[str, Any]]:
+        """Parallel canonical ID lookup shared by entity and predicate methods.
+
+        Submits all (name, embedding, vector_name) Qdrant queries concurrently,
+        then deduplicates per canonical_id keeping the best score.
+        """
+        spec = self._registry_specs[registry_key]
+        collection = spec["collection_name"]
+        populated = [v for v in spec["vector_names"] if v.endswith(("_en", "_th"))]
+
+        # Build all query tasks upfront
+        tasks: List[tuple] = []  # (name, embedding, vector_name)
+        for name, embedding in zip(names, embeddings):
+            for vector_name in populated:
+                tasks.append((name, embedding, vector_name))
+
+        def _run_query(task: tuple) -> List[tuple]:
+            """Execute a single Qdrant query. Returns [(point, query_name)]."""
+            name, embedding, vector_name = task
+            try:
+                search_results = self.client.query_points(
+                    collection_name=collection,
+                    query=embedding,
+                    using=vector_name,
+                    limit=limit,
+                    with_payload=True,
+                )
+                return [(point, name) for point in search_results.points if point.score >= threshold]
+            except Exception as e:
+                print(f"Warning: Failed to query {registry_key} '{name}' via {vector_name}: {e}")
+                return []
+
+        # Run all queries concurrently
+        all_hits: List[tuple] = []
+        max_workers = min(len(tasks), 8) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for hits in pool.map(_run_query, tasks):
+                all_hits.extend(hits)
+
+        # Deduplicate by canonical_id per query name, keeping best score
+        # Key: (query_name, canonical_id) → (score, point)
+        best: Dict[tuple, tuple] = {}
+        for point, query_name in all_hits:
+            cid = point.payload.get("canonical_id") or str(point.id)
+            key = (query_name, cid)
+            if key not in best or point.score > best[key][0]:
+                best[key] = (point.score, point)
+
+        results: List[Dict[str, Any]] = []
+        for (query_name, cid), (score, point) in best.items():
+            results.append({
+                "query": query_name,
+                "canonical_id": cid,
+                "name": point.payload.get("name"),
+                "score": score,
+                "metadata": point.payload,
+            })
+
+        return results
+
     def get_canonical_entities(
         self, entity_names: List[str], limit: int = 5, threshold: float = 0.7
     ) -> List[Dict[str, Any]]:
         """Get canonical entity IDs from entity_registry.
+
+        Queries all (entity × vector_name) combinations concurrently.
 
         Args:
             entity_names: List of entity names to search for
@@ -97,49 +192,21 @@ class QdrantToolsManager:
         if not entity_names:
             return []
 
-        results = []
-
-        # Get embeddings for all entities
         embeddings = self._get_embeddings(entity_names)
-
-        for entity_name, embedding in zip(entity_names, embeddings):
-            try:
-                spec = self._registry_specs["entity_registry"]
-                seen: Dict[str, float] = {}  # canonical_id -> best score
-                points_by_id: Dict[str, Any] = {}
-
-                for vector_name in spec["vector_names"]:
-                    search_results = self.client.query_points(
-                        collection_name=spec["collection_name"],
-                        query=embedding,
-                        using=vector_name,
-                        limit=limit,
-                        with_payload=True,
-                    )
-                    for point in search_results.points:
-                        if point.score >= threshold:
-                            cid = point.payload.get("canonical_id") or str(point.id)
-                            if cid not in seen or point.score > seen[cid]:
-                                seen[cid] = point.score
-                                points_by_id[cid] = point
-
-                for point in points_by_id.values():
-                    results.append({
-                        "query": entity_name,
-                        "canonical_id": point.payload.get("canonical_id") or str(point.id),
-                        "name": point.payload.get("name"),
-                        "score": point.score,
-                        "metadata": point.payload,
-                    })
-            except Exception as e:
-                print(f"Warning: Failed to query entity '{entity_name}': {e}")
-
-        return results
+        return self._query_registry_parallel(
+            registry_key="entity_registry",
+            names=entity_names,
+            limit=limit,
+            threshold=threshold,
+            embeddings=embeddings,
+        )
 
     def get_canonical_predicates(
         self, predicate_names: List[str], limit: int = 5, threshold: float = 0.7
     ) -> List[Dict[str, Any]]:
         """Get canonical predicate IDs from predicate_registry.
+
+        Queries all (predicate × vector_name) combinations concurrently.
 
         Args:
             predicate_names: List of predicate names to search for
@@ -152,44 +219,14 @@ class QdrantToolsManager:
         if not predicate_names:
             return []
 
-        results = []
-
-        # Get embeddings for all predicates
         embeddings = self._get_embeddings(predicate_names)
-
-        for predicate_name, embedding in zip(predicate_names, embeddings):
-            try:
-                spec = self._registry_specs["predicate_registry"]
-                seen: Dict[str, float] = {}  # canonical_id -> best score
-                points_by_id: Dict[str, Any] = {}
-
-                for vector_name in spec["vector_names"]:
-                    search_results = self.client.query_points(
-                        collection_name=spec["collection_name"],
-                        query=embedding,
-                        using=vector_name,
-                        limit=limit,
-                        with_payload=True,
-                    )
-                    for point in search_results.points:
-                        if point.score >= threshold:
-                            cid = point.payload.get("canonical_id") or str(point.id)
-                            if cid not in seen or point.score > seen[cid]:
-                                seen[cid] = point.score
-                                points_by_id[cid] = point
-
-                for point in points_by_id.values():
-                    results.append({
-                        "query": predicate_name,
-                        "canonical_id": point.payload.get("canonical_id") or str(point.id),
-                        "name": point.payload.get("name"),
-                        "score": point.score,
-                        "metadata": point.payload,
-                    })
-            except Exception as e:
-                print(f"Warning: Failed to query predicate '{predicate_name}': {e}")
-
-        return results
+        return self._query_registry_parallel(
+            registry_key="predicate_registry",
+            names=predicate_names,
+            limit=limit,
+            threshold=threshold,
+            embeddings=embeddings,
+        )
 
     def get_community_metadata(
         self, community_ids: Optional[List[str]] = None, limit: int = 100
@@ -411,6 +448,142 @@ class QdrantToolsManager:
 
         return results
 
+    @staticmethod
+    def _sparse_vector_names(spec: Dict[str, Any]) -> Dict[str, str]:
+        """Map dense vector suffix ('_en' or '_th') to its sparse vector name.
+
+        Reads ``sparse_vector_name_en`` / ``sparse_vector_name_th`` from the
+        spec.  Returns a dict like ``{"_en": "evidence_vector_en", ...}``.
+        """
+        mapping: Dict[str, str] = {}
+        for suffix in ("_en", "_th"):
+            key = f"sparse_vector_name{suffix}"
+            name = spec.get(key, "")
+            if name:
+                mapping[suffix] = name
+        return mapping
+
+    def search_evidence(
+        self, query_texts: List[str], limit: int = 5, threshold: float = 0.7
+    ) -> List[Dict[str, Any]]:
+        """Search evidence registry with hybrid dense + sparse (RRF fusion).
+
+        Language variants (_en, _th) are queried concurrently for each query text.
+        Deduplicates across languages by point ID (keeps best score).
+
+        Args:
+            query_texts: List of text queries to search for
+            limit: Maximum number of results per query
+            threshold: Minimum similarity threshold
+
+        Returns:
+            List of matching evidence records with entities, predicates, and quotes
+        """
+        from qdrant_client.http import models as qm
+
+        if not query_texts:
+            return []
+
+        spec = self._registry_specs["evidence_registry"]
+        collection = spec["collection_name"]
+        populated = [v for v in spec["vector_names"] if v.endswith(("_en", "_th"))]
+        sparse_map = self._sparse_vector_names(spec)
+        embeddings = self._get_evidence_embeddings(query_texts)
+
+        def _search_language(args: tuple):
+            """Run one (query_text, embedding, dense_name) search."""
+            query_text, embedding, dense_name = args
+            suffix = "_en" if dense_name.endswith("_en") else "_th"
+            sparse_name = sparse_map.get(suffix, "")
+
+            try:
+                # ── Hybrid: dense + sparse → RRF fusion ──────────────
+                if sparse_name:
+                    query_sparse = compute_query_sparse(query_text)
+                    prefetch: list = [
+                        qm.Prefetch(
+                            query=embedding,
+                            using=dense_name,
+                            limit=limit * 4,
+                        ),
+                    ]
+                    if query_sparse["indices"]:
+                        prefetch.append(
+                            qm.Prefetch(
+                                query=qm.SparseVector(
+                                    indices=query_sparse["indices"],
+                                    values=query_sparse["values"],
+                                ),
+                                using=sparse_name,
+                                limit=limit * 4,
+                            )
+                        )
+                    return self.client.query_points(
+                        collection_name=collection,
+                        prefetch=prefetch,
+                        query=qm.FusionQuery(fusion=qm.Fusion.RRF),
+                        limit=limit,
+                        with_payload=True,
+                    )
+                else:
+                    raise ValueError("no sparse vector")
+            except Exception:
+                # ── Fallback: dense-only ─────────────────────────────
+                try:
+                    return self.client.query_points(
+                        collection_name=collection,
+                        query=embedding,
+                        using=dense_name,
+                        limit=limit,
+                        with_payload=True,
+                    )
+                except Exception as e:
+                    print(f"Warning: Evidence search failed for '{query_text}': {e}")
+                    return None
+
+        # Build all (query_text, embedding, dense_name) tasks
+        tasks = []
+        for query_text, embedding in zip(query_texts, embeddings):
+            for dense_name in populated:
+                tasks.append((query_text, embedding, dense_name))
+
+        # Run all language searches concurrently
+        all_results: List[tuple] = []  # (query_text, search_results)
+        max_workers = min(len(tasks), 8) or 1
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for task, result in zip(tasks, pool.map(_search_language, tasks)):
+                if result is not None:
+                    all_results.append((task[0], result))
+
+        # Deduplicate across languages per query text
+        results_map: Dict[str, Dict[str, Any]] = {}  # query_text -> {seen, points_by_id}
+        for query_text, search_results in all_results:
+            if query_text not in results_map:
+                results_map[query_text] = {"seen": {}, "points_by_id": {}}
+            entry = results_map[query_text]
+
+            for point in search_results.points:
+                if point.score >= threshold:
+                    pid = str(point.id)
+                    if pid not in entry["seen"] or point.score > entry["seen"][pid]:
+                        entry["seen"][pid] = point.score
+                        entry["points_by_id"][pid] = point
+
+        results = []
+        for query_text, entry in results_map.items():
+            for point in entry["points_by_id"].values():
+                results.append({
+                    "query": query_text,
+                    "score": point.score,
+                    "entities": point.payload.get("entities", []),
+                    "predicates": point.payload.get("predicates", []),
+                    "evidence_quote": point.payload.get("evidence_quote", ""),
+                    "evidence_quote_en": point.payload.get("evidence_quote_en", ""),
+                    "community_id": point.payload.get("community_id"),
+                })
+
+        return results
+
 
 # Create global instance for tools
 _manager = None
@@ -563,4 +736,33 @@ def get_all_community_ids() -> str:
     """
     manager = _get_manager()
     results = manager.get_all_community_ids()
+    return json.dumps(results, indent=2)
+
+
+@tool
+def search_evidence(query_texts: str, limit: int = 5, threshold: float = 0.7) -> str:
+    """Search evidence registry for evidence quotes matching the query.
+
+    Use this tool to find source evidence quotes and their associated entities
+    and predicates. Useful for answering questions about what evidence supports
+    particular claims or relationships.
+
+    Payload schema:
+    - evidence_quote (text): Original source evidence text
+    - evidence_quote_en (text): English translation of evidence
+    - entities (keyword[]): List of entity names mentioned in evidence
+    - predicates (keyword[]): List of predicate names in evidence
+    - community_id (keyword): Community identifier
+
+    Args:
+        query_texts: Comma-separated list of query texts to search for evidence
+        limit: Maximum number of results per query (default: 5)
+        threshold: Minimum similarity threshold 0-1 (default: 0.7)
+
+    Returns:
+        JSON string with matching evidence records
+    """
+    manager = _get_manager()
+    queries = [q.strip() for q in query_texts.split(",") if q.strip()]
+    results = manager.search_evidence(queries, limit, threshold)
     return json.dumps(results, indent=2)

@@ -15,19 +15,58 @@ from kg_extractor.utils.model_setup import (
     ORCHESTRATOR_MODEL,
     WORKER_MODEL,
     SYNTHESIZER_MODEL,
+    PREPROCESSING_MODEL,
 )
 from kg_reasoning.agents.orchestrator import OrchestratorAgent
+from kg_reasoning.agents.preprocessor import PreProcessor
 from kg_reasoning.agents.worker import WorkerAgent, execute_strategy_parallel
 from kg_reasoning.agents.synthesizer import SynthesizerAgent
 from kg_reasoning.workflows.state import (
     MultiAgentState,
     create_initial_state,
     update_state_from_orchestrator,
+    update_state_from_preprocessor,
     update_state_from_worker,
     update_state_from_synthesizer,
 )
 
 load_dotenv()
+
+
+def preprocessor_node(state: MultiAgentState) -> MultiAgentState:
+    """PreProcessor node: Runs 9-step pipeline before orchestrator.
+
+    Expands query, searches evidence, filters with LLM, resolves canonical IDs.
+    Non-fatal: on failure, orchestrator falls back to original ReAct behavior.
+    """
+    print("\n" + "=" * 60)
+    print("🔍 PRE-PROCESSOR AGENT")
+    print("=" * 60)
+
+    try:
+        state["current_step"] = "preprocessor_running"
+
+        preprocessor = PreProcessor(
+            llm_model=state.get("llm_model_preprocessor", PREPROCESSING_MODEL),
+        )
+
+        result = preprocessor.run(state["user_query"])
+        state = update_state_from_preprocessor(state, result)
+
+        print(f"\n  ✅ Pre-processor complete:")
+        print(f"     - Query type: {state['preprocessor_query_type']}")
+        print(f"     - Entity IDs: {len(state['preprocessor_entity_ids'])}")
+        print(f"     - Predicate IDs: {len(state['preprocessor_predicate_ids'])}")
+        print(f"     - Community IDs: {state['preprocessor_community_ids']}")
+        print(f"     - Needs pathing: {state['preprocessor_needs_pathing']}")
+        print(f"     - Needs community: {state['preprocessor_needs_community']}")
+
+    except Exception as e:
+        print(f"\n  ⚠️  Pre-processor failed: {e}")
+        print("     Orchestrator will use original ReAct flow")
+        state["current_step"] = "preprocessor_fallback"
+
+    return state
 
 
 def orchestrator_node(state: MultiAgentState) -> MultiAgentState:
@@ -53,7 +92,11 @@ def orchestrator_node(state: MultiAgentState) -> MultiAgentState:
         )
 
         # Analyze and plan
-        result = orchestrator.analyze_and_plan(state["user_query"])
+        # Use context-aware planning if pre-processor resolved IDs
+        if state.get("preprocessor_entity_ids") or state.get("preprocessor_predicate_ids"):
+            result = orchestrator.analyze_and_plan_with_context(state)
+        else:
+            result = orchestrator.analyze_and_plan(state["user_query"])
 
         # Update state
         state = update_state_from_orchestrator(state, result)
@@ -238,12 +281,14 @@ def create_workflow() -> StateGraph:
     workflow = StateGraph(MultiAgentState)
 
     # Add nodes
+    workflow.add_node("preprocessor", preprocessor_node)
     workflow.add_node("orchestrator", orchestrator_node)
     workflow.add_node("workers", workers_node)
     workflow.add_node("synthesizer", synthesizer_node)
 
-    # Add edges
-    workflow.set_entry_point("orchestrator")
+    # Add edges — preprocessor is the new entry point
+    workflow.set_entry_point("preprocessor")
+    workflow.add_edge("preprocessor", "orchestrator")
 
     # Conditional edge after orchestrator
     workflow.add_conditional_edges(
@@ -278,6 +323,7 @@ def run_multi_agent_workflow(
     llm_model_orchestrator: str = ORCHESTRATOR_MODEL,
     llm_model_worker: str = WORKER_MODEL,
     llm_model_synthesizer: str = SYNTHESIZER_MODEL,
+    llm_model_preprocessor: str = PREPROCESSING_MODEL,
     qdrant_url: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
     neo4j_uri: Optional[str] = None,
@@ -292,6 +338,7 @@ def run_multi_agent_workflow(
         llm_model_orchestrator: Model for orchestrator
         llm_model_worker: Model for workers
         llm_model_synthesizer: Model for synthesizer
+        llm_model_preprocessor: Model for pre-processor
         qdrant_url: Qdrant server URL
         qdrant_api_key: Qdrant API key
         neo4j_uri: Neo4j server URI
@@ -313,6 +360,7 @@ def run_multi_agent_workflow(
         llm_model_orchestrator=llm_model_orchestrator,
         llm_model_worker=llm_model_worker,
         llm_model_synthesizer=llm_model_synthesizer,
+        llm_model_preprocessor=llm_model_preprocessor,
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
         neo4j_uri=neo4j_uri,

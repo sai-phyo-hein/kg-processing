@@ -17,6 +17,7 @@ from kg_extractor.utils.prompts import (
     create_triple_extraction_user_message,
 )
 from kg_extractor.utils.llm_response_parser import parse_triple_extraction_response
+from kg_extractor.workflow.functions.chunk_document.semantic_chunker import SemanticChunker
 
 # Try to import faster JSON library
 try:
@@ -70,8 +71,11 @@ class TripleExtractor:
         from langchain_core.chat_history import InMemoryChatMessageHistory
         
         # Create LLM instance and history
+        # Use high max_tokens for triple extraction: 40-50 triples with long evidence quotes
+        # can easily require many tokens in Thai (which uses more tokens per character)
+        # Claude Sonnet 4.6 supports up to 128K output tokens
         self.extraction_agent = {
-            'llm': get_reasoning_llm(model=self.llm_model, temperature=0.3),
+            'llm': get_reasoning_llm(model=self.llm_model, temperature=0.3, max_tokens=64000),
             'history': InMemoryChatMessageHistory()
         }
         
@@ -155,8 +159,13 @@ class TripleExtractor:
         chunk_id = chunk["chunk_id"]
         content = chunk["content"]
 
-        # Create user message for triple extraction (source + content only)
-        user_message = create_triple_extraction_user_message(content, source_file, chunk_id)
+        # Number the content lines for LLM input
+        numbered_content, original_lines = self._number_chunk_content(content)
+
+        # Create user message with numbered content
+        user_message = create_triple_extraction_user_message(
+            numbered_content, source_file, chunk_id
+        )
 
         # Get LLM response from stateful agent
         response = self._get_llm_response(user_message)
@@ -164,10 +173,14 @@ class TripleExtractor:
         # Parse response to extract triples and metadata
         parsed_data = self._parse_llm_response(response)
 
+        # Post-process: resolve evidence_lines → evidence_quote from source
+        triples = parsed_data.get("discovered_triples", [])
+        triples = self._resolve_evidence_lines(triples, original_lines)
+
         return {
             "chunk_id": chunk_id,
             "document_metadata": parsed_data.get("document_metadata", {}),
-            "triples": parsed_data.get("discovered_triples", []),
+            "triples": triples,
         }
 
     def _get_llm_response(self, user_message: str) -> str:
@@ -209,6 +222,62 @@ class TripleExtractor:
     def _parse_llm_response(self, response: str) -> Dict[str, Any]:
         """Parse LLM response to extract triples and metadata."""
         return parse_triple_extraction_response(response)
+
+    @staticmethod
+    def _number_chunk_content(content: str) -> tuple:
+        """Split chunk content into lines and build numbered text for LLM.
+
+        Returns:
+            Tuple of (numbered_text, original_lines) where:
+            - numbered_text: string with [NNNN] prefix per line
+            - original_lines: list of original line strings (for post-processing)
+        """
+        lines = content.split("\n")
+        numbered_text = SemanticChunker._build_numbered_content(lines, start_number=1)
+        return numbered_text, lines
+
+    @staticmethod
+    def _resolve_evidence_lines(
+        triples: list, original_lines: list
+    ) -> list:
+        """Replace evidence_lines with evidence_quote from source text.
+
+        For each triple that has evidence_lines in properties:
+        1. Extract lines from original_lines using start/end (1-based, inclusive).
+        2. Join them into evidence_quote.
+        3. Remove evidence_lines from properties.
+        4. Keep evidence_quote_en as-is (provided by LLM for Thai sources).
+
+        Args:
+            triples: List of triple dicts from LLM response.
+            original_lines: Original un-numbered lines from chunk content.
+
+        Returns:
+            The same triples list with evidence_quote populated.
+        """
+        n_lines = len(original_lines)
+        for triple in triples:
+            props = triple.get("properties", {})
+            evidence_lines = props.pop("evidence_lines", None)
+
+            if evidence_lines and isinstance(evidence_lines, dict):
+                start = int(evidence_lines.get("start", 1))
+                end = int(evidence_lines.get("end", start))
+
+                # Clamp to valid range (1-based, inclusive)
+                start = max(1, min(start, n_lines))
+                end = max(start, min(end, n_lines))
+
+                # Extract text (convert 1-based to 0-based index)
+                extracted = original_lines[start - 1:end]
+                props["evidence_quote"] = "\n".join(
+                    line.rstrip("\n") for line in extracted
+                ).strip()
+            elif "evidence_quote" not in props:
+                # Fallback: LLM returned neither evidence_lines nor evidence_quote
+                props["evidence_quote"] = ""
+
+        return triples
 
     def save_triples(
         self,

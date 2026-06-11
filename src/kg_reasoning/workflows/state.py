@@ -10,6 +10,7 @@ from kg_extractor.utils.model_setup import (
     ORCHESTRATOR_MODEL,
     WORKER_MODEL,
     SYNTHESIZER_MODEL,
+    PREPROCESSING_MODEL,
 )
 
 
@@ -30,6 +31,18 @@ class MultiAgentState(TypedDict, total=False):
     llm_model_orchestrator: str  # Model for orchestrator
     llm_model_worker: str  # Model for workers
     llm_model_synthesizer: str  # Model for synthesizer
+    llm_model_preprocessor: str  # Model for pre-processor
+
+    # ===== PreProcessor Outputs =====
+    expanded_query: str  # Step 1 expanded query
+    preprocessor_entity_ids: List[str]  # Resolved entity canonical IDs
+    preprocessor_predicate_ids: List[str]  # Resolved predicate canonical IDs
+    preprocessor_community_ids: List[str]  # Community IDs from evidence
+    preprocessor_entity_details: Dict[str, Any]  # canonical_id -> {name, score}
+    preprocessor_predicate_details: Dict[str, Any]  # canonical_id -> {name, score}
+    preprocessor_query_type: str  # "pathing"/"exploration"/"community"/"general"
+    preprocessor_needs_pathing: bool  # Whether pathing between entities is needed
+    preprocessor_needs_community: bool  # Whether community_id filtering is needed
 
     # ===== Qdrant Configuration =====
     qdrant_url: Optional[str]
@@ -78,6 +91,7 @@ def create_initial_state(
     llm_model_orchestrator: str = ORCHESTRATOR_MODEL,
     llm_model_worker: str = WORKER_MODEL,
     llm_model_synthesizer: str = SYNTHESIZER_MODEL,
+    llm_model_preprocessor: str = PREPROCESSING_MODEL,
     qdrant_url: Optional[str] = None,
     qdrant_api_key: Optional[str] = None,
     neo4j_uri: Optional[str] = None,
@@ -92,6 +106,7 @@ def create_initial_state(
         llm_model_orchestrator: Model for orchestrator agent
         llm_model_worker: Model for worker agents
         llm_model_synthesizer: Model for synthesizer agent
+        llm_model_preprocessor: Model for pre-processor agent
         qdrant_url: Qdrant server URL
         qdrant_api_key: Qdrant API key
         neo4j_uri: Neo4j server URI
@@ -110,6 +125,7 @@ def create_initial_state(
         llm_model_orchestrator=llm_model_orchestrator,
         llm_model_worker=llm_model_worker,
         llm_model_synthesizer=llm_model_synthesizer,
+        llm_model_preprocessor=llm_model_preprocessor,
         # Configuration
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
@@ -131,6 +147,16 @@ def create_initial_state(
         synthesis_quality="",
         files_read=0,
         results_analyzed=0,
+        # PreProcessor outputs
+        expanded_query="",
+        preprocessor_entity_ids=[],
+        preprocessor_predicate_ids=[],
+        preprocessor_community_ids=[],
+        preprocessor_entity_details={},
+        preprocessor_predicate_details={},
+        preprocessor_query_type="general",
+        preprocessor_needs_pathing=False,
+        preprocessor_needs_community=False,
         # Status
         current_step="initializing",
         status="running",
@@ -163,6 +189,33 @@ def update_state_from_orchestrator(
     state["orchestrator_raw_output"] = orchestrator_output.get("raw_output", "")
     state["resolution_method"] = orchestrator_output.get("resolution_method", "unknown")
     state["current_step"] = "orchestrator_complete"
+
+    return state
+
+
+def update_state_from_preprocessor(
+    state: MultiAgentState,
+    preprocessor_output: Dict[str, Any],
+) -> MultiAgentState:
+    """Update state with pre-processor results.
+
+    Args:
+        state: Current state
+        preprocessor_output: Output from PreProcessor.run()
+
+    Returns:
+        Updated state
+    """
+    state["expanded_query"] = preprocessor_output.get("expanded_query", "")
+    state["preprocessor_entity_ids"] = preprocessor_output.get("entity_ids", [])
+    state["preprocessor_predicate_ids"] = preprocessor_output.get("predicate_ids", [])
+    state["preprocessor_community_ids"] = preprocessor_output.get("community_ids", [])
+    state["preprocessor_entity_details"] = preprocessor_output.get("entity_details", {})
+    state["preprocessor_predicate_details"] = preprocessor_output.get("predicate_details", {})
+    state["preprocessor_query_type"] = preprocessor_output.get("query_type", "general")
+    state["preprocessor_needs_pathing"] = preprocessor_output.get("needs_pathing", False)
+    state["preprocessor_needs_community"] = preprocessor_output.get("needs_community", False)
+    state["current_step"] = "preprocessor_complete"
 
     return state
 

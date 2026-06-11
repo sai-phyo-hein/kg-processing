@@ -26,12 +26,15 @@ CHUNKING_MODEL = os.getenv("CHUNKING_MODEL", "gpt-4o-mini")
 TRIPLET_MODEL = os.getenv("TRIPLET_MODEL", "gpt-4o-mini")
 REFINEMENT_MODEL = os.getenv("REFINEMENT_MODEL", "gpt-4o-mini")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+EVIDENCE_EMBEDDING_MODEL = os.getenv("EVIDENCE_EMBEDDING_MODEL", "text-embedding-3-large")
+EVIDENCE_VECTOR_DIM = int(os.getenv("EVIDENCE_VECTOR_DIM", "3072"))
 
 # Reasoning agents
 REASONING_PROVIDER = os.getenv("REASONING_PROVIDER", "openai")
 ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "gpt-4o")
 WORKER_MODEL = os.getenv("WORKER_MODEL", "gpt-4o-mini")
 SYNTHESIZER_MODEL = os.getenv("SYNTHESIZER_MODEL", "gpt-4o")
+PREPROCESSING_MODEL = os.getenv("PREPROCESSING_MODEL", "gpt-4o-mini")
 
 
 class NVIDIAAPIError(Exception):
@@ -174,31 +177,44 @@ _EMBEDDING_PROVIDER_API_KEY_ENV = {
 }
 
 
+# Module-level client caches — avoids re-creating HTTP connection pools per call.
+_embedding_client_cache: dict = {}
+_reasoning_llm_cache: dict = {}
+
+
 def get_embedding_client():
-    """Return an OpenAI-compatible client configured for the active EMBEDDING_PROVIDER.
+    """Return a cached OpenAI-compatible client configured for the active EMBEDDING_PROVIDER.
 
     Supports: openai (default), openrouter, groq, nvidia.
+    Client is cached by provider so the HTTP connection pool is reused.
     """
     from openai import OpenAI
 
     provider = EMBEDDING_PROVIDER
+    if provider in _embedding_client_cache:
+        return _embedding_client_cache[provider]
+
     api_key_env = _EMBEDDING_PROVIDER_API_KEY_ENV.get(provider, "OPENAI_API_KEY")
     api_key = os.getenv(api_key_env)
-    base_url = _EMBEDDING_PROVIDER_BASES.get(provider)  # None → default OpenAI URL
+    base_url = _EMBEDDING_PROVIDER_BASES.get(provider)
     kwargs = {"api_key": api_key}
     if base_url:
         kwargs["base_url"] = base_url
-    return OpenAI(**kwargs)
+    client = OpenAI(**kwargs)
+    _embedding_client_cache[provider] = client
+    return client
 
 
-def get_reasoning_llm(model: str = None, temperature: float = 0.1):
-    """Return a LangChain ChatOpenAI instance for the active REASONING_PROVIDER.
+def get_reasoning_llm(model: str = None, temperature: float = 0.1, max_tokens: int = 16000):
+    """Return a cached LangChain ChatOpenAI instance for the active REASONING_PROVIDER.
 
     Supports: openai (default), openrouter, groq, nvidia.
+    Instance is cached by (provider, model) so the HTTP connection pool is reused.
 
     Args:
         model: Model name (uses ORCHESTRATOR_MODEL if not provided)
         temperature: LLM temperature
+        max_tokens: Maximum tokens for LLM output (default: 16000 for large extractions)
 
     Returns:
         ChatOpenAI instance configured for the provider
@@ -207,20 +223,27 @@ def get_reasoning_llm(model: str = None, temperature: float = 0.1):
 
     provider = REASONING_PROVIDER
     model_name = model or ORCHESTRATOR_MODEL
-    
+    cache_key = (provider, model_name)
+
+    if cache_key in _reasoning_llm_cache:
+        return _reasoning_llm_cache[cache_key]
+
     api_key_env = _EMBEDDING_PROVIDER_API_KEY_ENV.get(provider, "OPENAI_API_KEY")
     api_key = os.getenv(api_key_env)
-    base_url = _EMBEDDING_PROVIDER_BASES.get(provider)  # None → default OpenAI URL
-    
+    base_url = _EMBEDDING_PROVIDER_BASES.get(provider)
+
     kwargs = {
         "model": model_name,
         "temperature": temperature,
         "api_key": api_key,
+        "max_tokens": max_tokens,
     }
     if base_url:
         kwargs["base_url"] = base_url
-    
-    return ChatOpenAI(**kwargs)
+
+    llm = ChatOpenAI(**kwargs)
+    _reasoning_llm_cache[cache_key] = llm
+    return llm
 
 
 def get_llm_response(prompt: str, provider: str, model: str, temperature: float = 0.3) -> str:

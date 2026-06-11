@@ -17,6 +17,7 @@ from kg_reasoning.agents.tools.qdrant_tools import (
     get_labels_by_group,
     get_entities_by_labels,
     get_all_community_ids,
+    search_evidence,
 )
 from kg_reasoning.agents.tools.neo4j_tools import (
     get_top_connected_nodes,
@@ -120,6 +121,64 @@ If get_canonical_entities and get_canonical_predicates return no matches:
 Output your final plan as a structured JSON object with a "strategies" list."""
 
 
+ORCHESTRATOR_CONTEXT_PROMPT = """You are an Orchestrator Agent for a knowledge graph reasoning system.
+
+A pre-processor has already resolved canonical entity IDs and predicate IDs from the evidence.
+Your job is to plan up to 5 query strategies using the provided IDs — you do NOT need to call
+entity/predicate lookup tools.
+
+## Pre-Processed Context (already resolved)
+
+You will receive a context block containing:
+- **Entity Canonical IDs**: UUIDs with human-readable names and match scores
+- **Predicate Canonical IDs**: UUIDs with human-readable names and match scores
+- **Community IDs**: Community identifiers detected from evidence
+- **Query Type Hint**: "pathing" (multiple entities to connect), "exploration" (surroundings of one entity), "community" (village/area context), or "general"
+- **Needs Pathing**: Whether the question asks about connections between entities
+- **Needs Community**: Whether community_id filtering is required
+
+## Strategy Planning
+
+Based on the pre-resolved canonical IDs, plan up to 5 strategies:
+
+1. **Direct Connections** (approach: "direct"): Direct triples involving the entities
+2. **Graph Expansion** (approach: "expansion"): 1-hop or 2-hop neighborhood exploration
+3. **Predicate-based** (approach: "direct" with predicates): Connections using specific relationship types
+4. **Path Finding** (approach: "path"): Paths between entities (when needs_pathing is true and ≥2 entities)
+5. **Community Exploration** (approach: "community_exploration"): All relationships filtered by community_id (when needs_community is true)
+
+## Strategy Format
+
+Each strategy must include:
+- **name**: Short descriptive name
+- **description**: What this strategy aims to find
+- **approach**: "direct", "expansion", "path", or "community_exploration"
+- **canonical_ids**: {{ "entities": [...], "predicates": [...] }} — use the UUIDs from context
+- **community_ids**: Relevant community IDs (if applicable)
+- **parameters**: Additional parameters (limit, depth, etc.)
+
+## Rules
+
+- Do NOT call get_canonical_entities, get_canonical_predicates, or search_evidence — IDs are already resolved
+- Use community/label tools ONLY if you need additional context beyond what the pre-processor provided
+- Maximum 5 strategies — prioritize based on the query type hint
+- Each strategy should be distinct and offer a different perspective
+- Use actual UUIDs from the context block, not placeholder text
+
+## Output Format
+
+Return a JSON object:
+```json
+{{
+  "query_type": "<from context>",
+  "entities_found": ["<entity UUIDs from context>"],
+  "predicates_found": ["<predicate UUIDs from context>"],
+  "communities_identified": ["<community IDs from context>"],
+  "strategies": [ ... ]
+}}
+```"""
+
+
 class OrchestratorAgent:
     """Orchestrator agent for query analysis and strategy planning."""
 
@@ -150,6 +209,7 @@ class OrchestratorAgent:
             get_labels_by_group,
             get_entities_by_labels,
             get_all_community_ids,
+            search_evidence,
             get_top_connected_nodes,
             get_community_ids_from_relationships,
         ]
@@ -364,6 +424,152 @@ Replace the example UUIDs above with actual canonical_ids from your tool calls. 
         plan["user_query"] = user_query
 
         return plan
+
+    def analyze_and_plan_with_context(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        """Plan strategies using pre-resolved canonical IDs from the pre-processor.
+
+        This bypasses entity/predicate lookup tools — the IDs are already resolved.
+        Falls back to direct strategy building if the LLM response can't be parsed.
+
+        Args:
+            state: Workflow state containing pre-processor results
+
+        Returns:
+            Dictionary containing strategies and metadata
+        """
+        import json
+
+        entity_ids = state.get("preprocessor_entity_ids", [])
+        predicate_ids = state.get("preprocessor_predicate_ids", [])
+        community_ids = state.get("preprocessor_community_ids", [])
+        entity_details = state.get("preprocessor_entity_details", {})
+        predicate_details = state.get("preprocessor_predicate_details", {})
+        query_type = state.get("preprocessor_query_type", "general")
+        needs_pathing = state.get("preprocessor_needs_pathing", False)
+        needs_community = state.get("preprocessor_needs_community", False)
+        user_query = state.get("user_query", "")
+
+        # Build context block for the prompt
+        entity_lines = []
+        for cid in entity_ids:
+            info = entity_details.get(cid, {})
+            entity_lines.append(f"  - {cid} (name: \"{info.get('name', '?')}\", score: {info.get('score', 0):.2f})")
+
+        predicate_lines = []
+        for cid in predicate_ids:
+            info = predicate_details.get(cid, {})
+            predicate_lines.append(f"  - {cid} (name: \"{info.get('name', '?')}\", score: {info.get('score', 0):.2f})")
+
+        context_block = f"""## Pre-Processed Context
+
+### Entity Canonical IDs (already resolved — do NOT re-resolve):
+{chr(10).join(entity_lines) if entity_lines else "  (none)"}
+
+### Predicate Canonical IDs (already resolved — do NOT re-resolve):
+{chr(10).join(predicate_lines) if predicate_lines else "  (none)"}
+
+### Community IDs: {json.dumps(community_ids)}
+### Query Type: {query_type}
+### Needs Pathing: {needs_pathing}
+### Needs Community: {needs_community}"""
+
+        # Build enhanced query with context
+        enhanced_query = f"""{ORCHESTRATOR_CONTEXT_PROMPT}
+
+{context_block}
+
+User Question: {user_query}
+
+Plan up to 5 strategies using the canonical IDs above. Return ONLY valid JSON."""
+
+        # Single-shot LLM call — no ReAct agent, no tools.
+        # Pre-processor already resolved all IDs; the orchestrator just formats strategies.
+        messages = [
+            SystemMessage(content=ORCHESTRATOR_CONTEXT_PROMPT),
+            HumanMessage(content=f"{context_block}\n\nUser Question: {user_query}\n\nPlan up to 5 strategies using the canonical IDs above. Return ONLY valid JSON."),
+        ]
+
+        print("\n[Orchestrator Debug] ── Context-aware mode (single-shot) ──────")
+        response = self.llm.invoke(messages)
+        output = response.content
+        preview = output[:300].replace("\n", " ")
+        print(f"  [ai_response] {preview}{'...' if len(output) > 300 else ''}")
+        print("[Orchestrator Debug] ────────────────────────────────────────────\n")
+
+        # Parse JSON from output
+        plan = self._parse_json_from_output(output)
+
+        if not plan or "strategies" not in plan or not plan["strategies"]:
+            # Fallback: build strategies directly from pre-resolved IDs
+            print("[Orchestrator Debug] LLM JSON parse failed — building strategies directly")
+            plan = {
+                "query_type": query_type,
+                "entities_found": entity_ids,
+                "predicates_found": predicate_ids,
+                "communities_identified": community_ids,
+                "strategies": self._build_comprehensive_strategies(
+                    entity_ids=entity_ids,
+                    predicate_ids=predicate_ids,
+                    community_ids=community_ids,
+                ),
+                "resolution_method": "preprocessor_direct",
+            }
+
+            # Add community exploration if needed
+            if needs_community and community_ids:
+                plan["strategies"].append(
+                    self._build_community_exploration_strategy(community_ids)
+                )
+
+            plan["strategies"] = plan["strategies"][:5]
+        else:
+            plan["resolution_method"] = "preprocessor_llm"
+
+        plan["raw_output"] = output
+        plan["user_query"] = user_query
+        return plan
+
+    def _parse_json_from_output(self, output: str) -> Optional[Dict[str, Any]]:
+        """Try multiple methods to extract JSON from LLM output."""
+        import json
+        import re
+
+        # Method 1: markdown code fence with json tag
+        match = re.search(r'```json\s*(\{.*?\})\s*```', output, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Method 2: markdown code fence without json tag
+        match = re.search(r'```\s*(\{.*?\})\s*```', output, re.DOTALL)
+        if match:
+            try:
+                return json.loads(match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        # Method 3: bare JSON object (brace-matching)
+        start_idx = output.find('{')
+        if start_idx != -1:
+            brace_count = 0
+            end_idx = start_idx
+            for i in range(start_idx, len(output)):
+                if output[i] == '{':
+                    brace_count += 1
+                elif output[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i + 1
+                        break
+            if end_idx > start_idx:
+                try:
+                    return json.loads(output[start_idx:end_idx])
+                except json.JSONDecodeError:
+                    pass
+
+        return None
 
     def _build_comprehensive_strategies(
         self,

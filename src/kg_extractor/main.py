@@ -294,8 +294,8 @@ Model configuration is done via environment variables (see .env):
     parser.add_argument(
         "--chunk-granularity",
         type=float,
-        default=0.5,
-        help="Granularity for semantic chunking (0.0=very fine, 1.0=coarse, default: 0.5)",
+        default=0.1,
+        help="Granularity for semantic chunking (0.0=very fine, 1.0=coarse, default: 0.2)",
     )
     parser.add_argument(
         "--similarity-threshold",

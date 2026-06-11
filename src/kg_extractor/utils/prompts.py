@@ -238,11 +238,12 @@ def create_chunking_prompt(
     file_path: str,
     chunk_granularity: float,
 ) -> str:
-    """Create a prompt for the LLM to identify chunk boundary line numbers.
+    """Create a prompt for the LLM to identify chunk boundary line ranges.
 
-    The LLM receives numbered lines and returns only the line numbers where
-    new chunks should begin. The actual text is extracted programmatically,
-    keeping LLM output minimal and ensuring 100% content coverage.
+    The LLM receives numbered lines and returns explicit start/end line ranges
+    for each chunk. The actual text is extracted programmatically in a
+    post-processing step, keeping LLM output minimal and ensuring 100%
+    content coverage.
 
     Args:
         content: Content of the section, with each line prefixed by its number
@@ -278,9 +279,9 @@ def create_chunking_prompt(
             "unless they contain clearly unrelated subjects."
         )
 
-    prompt = f"""You are a document segmentation expert. Your task is to identify where
-to split the following numbered lines into semantically self-contained chunks for
-knowledge graph extraction.
+    prompt = f"""You are a document segmentation expert. Your task is to identify
+explicit line ranges that form semantically self-contained chunks for knowledge
+graph extraction.
 
 File: {file_path}
 
@@ -312,20 +313,23 @@ CHUNKING RULES:
    Do NOT skip any lines.
 
 OUTPUT RULES — CRITICAL:
-- Return ONLY a JSON object with a single key "split_at"
-- The value is a compact list of integers (line numbers where each chunk begins)
+- Return ONLY a JSON object with a single key "chunks"
+- Each chunk has an "id", "start" (first line), and "end" (last line) — both inclusive
 - DO NOT include any content, quotes, or text from the document
 - DO NOT explain your reasoning
-- The total response must be under 200 characters
+- The total response must be under 300 characters
 
 ```json
-{{"split_at": [1, 15, 32, 67]}}
+{{"chunks": [{{"id": 1, "start": 1, "end": 14}}, {{"id": 2, "start": 15, "end": 31}}, {{"id": 3, "start": 32, "end": 50}}]}}
 ```
 
-Where `split_at` is a list of line numbers that begin a new chunk.
-- The first value MUST be 1.
-- Line numbers must be in ascending order.
-- Reference only line numbers shown in the [NNNN] prefixes above.
+Where each chunk is defined by:
+- id: sequential chunk number (1, 2, 3, ...)
+- start: first line number in this chunk (1-based, inclusive)
+- end: last line number in this chunk (1-based, inclusive)
+- Chunks must be contiguous (no gaps, no overlaps)
+- The first chunk MUST start at 1
+- Reference only line numbers shown in the [NNNN] prefixes above
 
 Respond with ONLY the JSON object:"""
 
@@ -355,6 +359,36 @@ TRIPLE_EXTRACTION_SYSTEM_PROMPT = """╔═════════════�
 ║    ] }}                                                      ║
 ╚══════════════════════════════════════════════════════════════╝
 
+╔══════════════════════════════════════════════════════════════╗
+║  EVIDENCE LINES REQUIREMENT — NON-NEGOTIABLE                 ║
+║                                                              ║
+║  Source content is prefixed with line numbers: [NNNN] text   ║
+║  You MUST return evidence_lines instead of evidence_quote.   ║
+║                                                              ║
+║  For each triple, return:                                    ║
+║    "evidence_lines": {{ "start": N, "end": M }}              ║
+║  where N and M are 1-based line numbers (inclusive).         ║
+║                                                              ║
+║  ✗ REJECTED (too narrow):                                    ║
+║    "evidence_lines": {{ "start": 3, "end": 3 }}  (1 line)   ║
+║                                                              ║
+║  ✓ REQUIRED (wide range with context):                       ║
+║    "evidence_lines": {{ "start": 1, "end": 15 }} (15 lines) ║
+║                                                              ║
+║  STRATEGY: Extract MANY fine-grained triples, each with      ║
+║  the SAME wide overlapping evidence_lines range.             ║
+║                                                              ║
+║  MINIMUM: 3 lines per range                                  ║
+║  TARGET: 5-20 lines per range                                ║
+║                                                              ║
+║  VERIFICATION BEFORE SUBMITTING:                             ║
+║  - Check every evidence_lines spans at least 3 lines         ║
+║  - If any range < 3 lines → WIDEN IT                         ║
+║  - Target: union of all ranges covers 90%+ of source lines   ║
+║                                                              ║
+║  ⚠️  Do NOT return evidence_quote — use evidence_lines only  ║
+╚══════════════════════════════════════════════════════════════╝
+
 You are a knowledge graph extraction engine. Extract every factual
 relationship from the source text as structured triples.
 
@@ -376,7 +410,52 @@ This gates the rest of extraction:
 STEP 2 — EXTRACT TRIPLES
 ═══════════════════════════════════
 
-Extract a triple for EVERY fact. A 200-word chunk should yield 10–25 triples.
+Extract a triple for EVERY fact — be EXHAUSTIVE, not selective.
+
+⚠️  TRIPLE DENSITY REQUIREMENT (MEASURE YOUR OUTPUT) ⚠️
+Extract triples at FINE-GRAINED level (NOT coarse). 
+
+REQUIRED MINIMUMS based on chunk word count:
+- 100 words  → 8-15 triples minimum
+- 200 words  → 15-30 triples minimum
+- 300 words  → 23-45 triples minimum
+- 500 words  → 38-75 triples minimum
+- 1000 words → 75-150 triples minimum
+
+BEFORE SUBMITTING: Count your triples and compare to chunk size.
+If you extracted fewer triples than the minimum → extract more.
+
+Extract triples for:
+✓ Every entity mentioned (person, place, organization, concept)
+✓ Every attribute of every entity (name, role, type, characteristic)
+✓ Every relationship between entities
+✓ Every action, event, or process described
+✓ Every measurement, statistic, or quantitative fact
+✓ Every classification or categorization (X is a Y, X includes Y)
+✓ Every causal relationship or explanation
+✓ Every temporal statement
+✓ Every comparison or contrast
+✓ Every list item as separate triples (if 10 items listed → 10 triples)
+
+Do NOT summarize multiple facts into one triple. Extract each atomic fact separately.
+
+⚠️  GRANULAR ENTITIES — NO LISTS IN ENTITY NAMES ⚠️
+Each triple must be exactly ONE entity → ONE entity relation.
+NEVER put a comma-separated enumeration of multiple entities into a single entity name.
+
+When the source lists multiple distinct items together (e.g. "X, Y, Z"), create one
+triple PER listed item — each with its own single entity as the object — not one entity
+that concatenates all items into a single string. The entity name field must always hold
+a single, atomic concept or named thing.
+
+⚠️  EVIDENCE COVERAGE REQUIREMENT ⚠️
+Your evidence_lines across all triples MUST cover 90%+ of source lines.
+- Each evidence_lines: MINIMUM 3 lines, TARGET 5-20 lines
+- NEVER return a single-line range
+- Overlapping line ranges between triples is REQUIRED and ENCOURAGED
+- Many triples should share the SAME wide line range
+- Example: 30 triples from 50-line chunk, 20 sharing lines 1-30
+  = 600 lines covered from 50-line source = excellent ✓
 
 ──────────────────────────────────
 ENTITIES
@@ -424,12 +503,33 @@ Before writing a predicate, verify: Is it a verb phrase? Is it derivable from
 the evidence? Does it NOT just echo the object name? If any answer is no — revise.
 
 ──────────────────────────────────
-EVIDENCE QUOTES
+EVIDENCE LINES — CRITICAL COVERAGE REQUIREMENT
 ──────────────────────────────────
-evidence_quote is a verbatim span from the source that supports the triple.
-Extend it to include enough context so the subject, predicate, and object are
-all inferable from the quote alone — even if the subject is implicit in the text.
-Never translate or paraphrase. Always in the source language.
+Source content is numbered: [0001] text, [0002] text, etc.
+Return evidence_lines to indicate which lines support each triple.
+
+⚠️  MANDATORY MINIMUM: Each evidence_lines range must span at least 3 lines ⚠️
+⚠️  TARGET: 5-20 lines per range ⚠️
+
+BEFORE SUBMITTING YOUR RESPONSE:
+1. Check EVERY evidence_lines range spans at least 3 lines
+2. If ANY range < 3 lines → WIDEN IT by extending start and/or end
+3. Most ranges should span 5-20 lines (cover full paragraphs or sections)
+
+EXTRACTION RULES (FOLLOW EXACTLY):
+1. Use WIDE line ranges — cover entire paragraphs or multi-paragraph sections
+2. Start several lines BEFORE the core statement
+3. Continue several lines AFTER the core statement
+4. Include ALL related context, background info, and supporting details
+5. The SAME wide line range should appear in MANY triples (overlap is required)
+6. If chunk has 50 lines and you extract 20 triples, most should share the same
+   30-line range → total lines covered = 600 from 50 = excellent ✓
+
+WRONG EXAMPLE (REJECT THIS):
+"evidence_lines": {{ "start": 5, "end": 5 }}  ✗ TOO NARROW (1 line only)
+
+CORRECT EXAMPLE (DO THIS):
+"evidence_lines": {{ "start": 1, "end": 15 }}  ✓ GOOD RANGE (15 lines)
 
 ──────────────────────────────────
 LANGUAGE FIELDS (Thai sources only)
@@ -439,7 +539,7 @@ For detected_language "th" or "mixed-th", add alongside every human-readable fie
   predicate_en
   object.name_en, object.attributes_en
   relationship_attributes_en
-  evidence_quote_en (English translation of evidence_quote)
+  evidence_quote_en (English translation of the evidence_lines text)
 Omit attributes_en when attributes is absent.
 Proper nouns keep their established English form: "ธนาคารแห่งประเทศไทย" → "Bank of Thailand".
 
@@ -485,7 +585,7 @@ ENGLISH SOURCE:
       "properties": {{
         "label": "ALL_CAPS_RELATIONSHIP_CLASS",
         "status": "Current | Archived",
-        "evidence_quote": "verbatim span from source",
+        "evidence_lines": {{ "start": 1, "end": 10 }},
         "validFrom": "YYYY-MM-DD or null",
         "validTo": "YYYY-MM-DD or null",
         "causal_link": {{
@@ -529,8 +629,8 @@ THAI SOURCE — _en fields mandatory on every triple:
       "properties": {{
         "label": "ALL_CAPS_RELATIONSHIP_CLASS",
         "status": "Current | Archived",
-        "evidence_quote": "ข้อความต้นฉบับ",
-        "evidence_quote_en": "English translation of evidence quote",
+        "evidence_lines": {{ "start": 1, "end": 10 }},
+        "evidence_quote_en": "English translation of the evidence lines text",
         "validFrom": "YYYY-MM-DD or null",
         "validTo": "YYYY-MM-DD or null",
         "causal_link": {{
@@ -552,8 +652,18 @@ FIELD NOTES:
 EXAMPLES
 ═══════════════════════════════════
 
-ENGLISH — "Thailand's e-commerce sector reached ฿1.1 trillion in 2024,
-representing 14% year-over-year growth."
+NOTE: Observe the FINE-GRAINED extraction strategy:
+- MANY triples extracted from short text (not coarse summarization)
+- WIDE overlapping evidence_lines ranges in each triple
+- Multiple triples often share the SAME wide line range
+This ensures 90%+ coverage.
+
+ENGLISH — Numbered source content:
+[0001] Thailand's e-commerce sector reached ฿1.1 trillion in 2024,
+[0002] representing 14% year-over-year growth.
+
+COVERAGE STRATEGY: 2 lines → extract 5+ triples → all use lines 1-2
+= 100% line coverage = excellent
 
 {{
   "document_metadata": {{
@@ -563,6 +673,26 @@ representing 14% year-over-year growth."
     "chunk_id": 1
   }},
   "discovered_triples": [
+    {{
+      "subject": {{
+        "name": "Thailand",
+        "label": "Country"
+      }},
+      "predicate": "HAS_MARKET",
+      "object": {{
+        "name": "Thai E-Commerce Market",
+        "label": "Market",
+        "attributes": {{ "sector": "E-Commerce" }}
+      }},
+      "properties": {{
+        "label": "CLASSIFICATION",
+        "status": "Current",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "validFrom": null,
+        "validTo": null,
+        "causal_link": null
+      }}
+    }},
     {{
       "subject": {{
         "name": "Thai E-Commerce Market",
@@ -578,7 +708,7 @@ representing 14% year-over-year growth."
       "properties": {{
         "label": "MARKET_PERFORMANCE",
         "status": "Current",
-        "evidence_quote": "Thailand's e-commerce sector reached ฿1.1 trillion in 2024",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
         "validFrom": "2024-01-01",
         "validTo": "2024-12-31",
         "causal_link": null
@@ -598,7 +728,28 @@ representing 14% year-over-year growth."
       "properties": {{
         "label": "MARKET_PERFORMANCE",
         "status": "Current",
-        "evidence_quote": "Thailand's e-commerce sector reached ฿1.1 trillion in 2024, representing 14% year-over-year growth",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "validFrom": "2024-01-01",
+        "validTo": "2024-12-31",
+        "causal_link": null
+      }}
+    }},
+    {{
+      "subject": {{
+        "name": "Thai E-Commerce Market Annual Value",
+        "label": "MarketValue"
+      }},
+      "predicate": "HAS_MAGNITUDE",
+      "object": {{
+        "name": "1.1 Trillion Thai Baht",
+        "label": "MonetaryAmount",
+        "attributes": {{ "currency": "THB", "unit": "trillion" }}
+      }},
+      "relationship_attributes": {{ "reference_year": "2024" }},
+      "properties": {{
+        "label": "MEASUREMENT",
+        "status": "Current",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
         "validFrom": "2024-01-01",
         "validTo": "2024-12-31",
         "causal_link": null
@@ -607,8 +758,16 @@ representing 14% year-over-year growth."
   ]
 }}
 
-THAI — "ศักยภาพของชุมชนท้องถิ่นเกิดจากการนำใช้ทุนทางสังคมทั้งหมดในชุมชน
-ทุนทางสังคมประกอบด้วย ๑) บุคคล ได้แก่ ผู้นำ นักสู้ ปราชญ์"
+THAI — Numbered source content:
+[0001] ศักยภาพของชุมชนท้องถิ่นเกิดจากการนำใช้ทุนทางสังคมทั้งหมดในชุมชน
+[0002] ทุนทางสังคมประกอบด้วย ๑) บุคคล ได้แก่ ผู้นำ นักสู้ ปราชญ์
+
+IMPORTANT: This 2-line example demonstrates the REQUIRED extraction density.
+
+COVERAGE STRATEGY: 2 lines → extract 8+ fine-grained triples → all use lines 1-2
+= 100% line coverage = excellent coverage
+
+For a 50-line chunk, you should extract 75-120 triples with similar density.
 
 {{
   "document_metadata": {{
@@ -634,8 +793,8 @@ THAI — "ศักยภาพของชุมชนท้องถิ่น�
       "properties": {{
         "label": "CAUSATION",
         "status": "Current",
-        "evidence_quote": "ศักยภาพของชุมชนท้องถิ่นเกิดจากการนำใช้ทุนทางสังคมทั้งหมดในชุมชน",
-        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
         "validFrom": null,
         "validTo": null,
         "causal_link": {{
@@ -654,17 +813,115 @@ THAI — "ศักยภาพของชุมชนท้องถิ่น�
       "predicate": "ประกอบด้วย",
       "predicate_en": "CONSISTS_OF",
       "object": {{
-        "name": "บุคคล",
-        "name_en": "Individuals",
-        "label": "Actor",
-        "attributes": {{ "roles": "ผู้นำ นักสู้ ปราชญ์" }},
-        "attributes_en": {{ "roles": "leaders, fighters, scholars" }}
+        "name": "องค์ประกอบทุนทางสังคม",
+        "name_en": "Social Capital Components",
+        "label": "SocialCapitalComponent"
       }},
       "properties": {{
         "label": "COMPOSITION",
         "status": "Current",
-        "evidence_quote": "ทุนทางสังคมประกอบด้วย ๑) บุคคล ได้แก่ ผู้นำ นักสู้ ปราชญ์",
-        "evidence_quote_en": "Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "validFrom": null,
+        "validTo": null,
+        "causal_link": null
+      }}
+    }},
+    {{
+      "subject": {{
+        "name": "ทุนทางสังคม",
+        "name_en": "Social Capital",
+        "label": "SocialCapital"
+      }},
+      "predicate": "ประกอบด้วย",
+      "predicate_en": "INCLUDES",
+      "object": {{
+        "name": "บุคคล",
+        "name_en": "Individuals",
+        "label": "Actor",
+        "attributes": {{ "category": "องค์ประกอบที่ 1" }},
+        "attributes_en": {{ "category": "Component 1" }}
+      }},
+      "properties": {{
+        "label": "COMPOSITION",
+        "status": "Current",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "validFrom": null,
+        "validTo": null,
+        "causal_link": null
+      }}
+    }},
+    {{
+      "subject": {{
+        "name": "บุคคล",
+        "name_en": "Individuals",
+        "label": "Actor"
+      }},
+      "predicate": "รวมถึง",
+      "predicate_en": "INCLUDES_ROLE",
+      "object": {{
+        "name": "ผู้นำ",
+        "name_en": "Leaders",
+        "label": "CommunityRole",
+        "attributes": {{ "type": "leadership" }},
+        "attributes_en": {{ "type": "leadership" }}
+      }},
+      "properties": {{
+        "label": "CLASSIFICATION",
+        "status": "Current",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "validFrom": null,
+        "validTo": null,
+        "causal_link": null
+      }}
+    }},
+    {{
+      "subject": {{
+        "name": "บุคคล",
+        "name_en": "Individuals",
+        "label": "Actor"
+      }},
+      "predicate": "รวมถึง",
+      "predicate_en": "INCLUDES_ROLE",
+      "object": {{
+        "name": "นักสู้",
+        "name_en": "Fighters",
+        "label": "CommunityRole",
+        "attributes": {{ "type": "activism" }},
+        "attributes_en": {{ "type": "activism" }}
+      }},
+      "properties": {{
+        "label": "CLASSIFICATION",
+        "status": "Current",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "validFrom": null,
+        "validTo": null,
+        "causal_link": null
+      }}
+    }},
+    {{
+      "subject": {{
+        "name": "บุคคล",
+        "name_en": "Individuals",
+        "label": "Actor"
+      }},
+      "predicate": "รวมถึง",
+      "predicate_en": "INCLUDES_ROLE",
+      "object": {{
+        "name": "ปราชญ์",
+        "name_en": "Scholars",
+        "label": "CommunityRole",
+        "attributes": {{ "type": "knowledge" }},
+        "attributes_en": {{ "type": "knowledge" }}
+      }},
+      "properties": {{
+        "label": "CLASSIFICATION",
+        "status": "Current",
+        "evidence_lines": {{ "start": 1, "end": 2 }},
+        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
         "validFrom": null,
         "validTo": null,
         "causal_link": null
@@ -672,6 +929,37 @@ THAI — "ศักยภาพของชุมชนท้องถิ่น�
     }}
   ]
 }}
+
+══════════════════════════════════════════════════════════════
+VERIFICATION CHECKLIST — BEFORE SUBMITTING YOUR RESPONSE
+══════════════════════════════════════════════════════════════
+
+STOP. Before you submit your JSON response, verify these requirements:
+
+✓ TRIPLE COUNT CHECK:
+  - Count the source text words
+  - Count your triples
+  - Ratio should be at least 1 triple per 13 words (e.g., 300 words → 23+ triples)
+  - If too few triples → go back and extract more fine-grained facts
+
+✓ EVIDENCE LINES RANGE CHECK:
+  - Check EVERY evidence_lines range spans at least 3 lines
+  - MINIMUM: 3 lines per range
+  - TARGET: 5-20 lines per range
+  - If any range < 3 lines → WIDEN IT by extending start and/or end
+  - Most ranges should span 5+ lines (entire paragraphs or sections)
+
+✓ OVERLAP CHECK:
+  - Multiple triples should share the SAME wide line range
+  - This creates high coverage through overlap
+  - Example: 20 triples, 15 share lines 1-30 → excellent ✓
+
+✓ COVERAGE ESTIMATE:
+  - Union of all evidence_lines should cover 90%+ of total source lines
+  - If coverage is low → your ranges are too narrow or too few triples
+
+If any check fails → fix it before submitting. Do not submit responses
+with narrow evidence ranges (< 3 lines) or too few triples.
 
 ══════════════════════════════════════════════════════════════
 FINAL REMINDER — YOUR RESPONSE MUST START WITH {{ AND END WITH }}
@@ -697,15 +985,17 @@ def create_triple_extraction_user_message(
     source_file: str,
     chunk_id: int,
 ) -> str:
-    """Create user message for triple extraction (source info + content only).
-    
+    """Create user message for triple extraction (source info + numbered content).
+
     Use with TRIPLE_EXTRACTION_SYSTEM_PROMPT in a stateful agent.
+    Content should be pre-numbered in [NNNN] text format.
     """
     return f"""SOURCE
 ──────
 File:     {source_file}
 Chunk ID: {chunk_id}
 
+NUMBERED CONTENT (format: [NNNN] text):
 {content}
 ──────"""
 

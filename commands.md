@@ -1,0 +1,1 @@
+analyse coverage: cd /home/sai_phyo_hein/kg-processing && uv run helpers/diagnose_coverage.py "output/ปฏิบัติการที่-1_หมู่-1  เสร็จแล้ว_chunks.json" "output/ปฏิบัติการที่-1_หมู่-1  เสร็จแล้ว_triples.json"

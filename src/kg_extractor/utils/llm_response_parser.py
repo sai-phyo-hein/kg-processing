@@ -149,16 +149,174 @@ def parse_triple_extraction_response(response: str) -> Dict[str, Any]:
     # Extract and parse JSON
     data = parse_json_with_repair(response)
     if not data:
-        print(f"Warning: No JSON object found in response.")
-        print(f"Response content: {response[:300]}")
+        # Check if JSON appears truncated (more opening than closing braces)
+        open_braces = response.count("{")
+        close_braces = response.count("}")
+        if open_braces > close_braces:
+            print(f"⚠️  JSON parsing failed: Response appears truncated ({open_braces} opening vs {close_braces} closing braces). "
+                  f"Check max_tokens setting or LLM output limits.")
+        else:
+            print(f"⚠️  JSON parsing failed: Malformed response structure.")
         return empty
     
     # Validate structure
     if "document_metadata" not in data or "discovered_triples" not in data:
-        print(f"Warning: Invalid response structure — keys found: {list(data.keys())}")
+        print(f"⚠️  Invalid response structure — expected 'document_metadata' and 'discovered_triples', found: {list(data.keys())}")
         return empty
-    
+
+    # Validate evidence_lines ranges in discovered_triples
+    for triple in data.get("discovered_triples", []):
+        props = triple.get("properties", {})
+        evidence_lines = props.get("evidence_lines")
+        if evidence_lines and isinstance(evidence_lines, dict):
+            start = evidence_lines.get("start")
+            end = evidence_lines.get("end")
+            if start is not None and end is not None:
+                try:
+                    evidence_lines["start"] = max(1, int(start))
+                    evidence_lines["end"] = max(evidence_lines["start"], int(end))
+                except (ValueError, TypeError):
+                    # Remove invalid evidence_lines
+                    props.pop("evidence_lines", None)
+
     return data
+
+
+def parse_chunk_ranges_response(response: str, section_line_count: int) -> list[dict]:
+    """Parse LLM response for explicit chunk line ranges.
+
+    Expected format:
+    {
+        "chunks": [
+            {"id": 1, "start": 1, "end": 14},
+            {"id": 2, "start": 15, "end": 31}
+        ]
+    }
+
+    Also accepts the legacy "split_at" format and converts it to ranges.
+
+    Args:
+        response: LLM response text
+        section_line_count: Total lines in section for validation
+
+    Returns:
+        List of {"id": int, "start": int, "end": int} (1-based, inclusive).
+        Empty list on failure.
+    """
+    def _validate_ranges(ranges: list[dict]) -> list[dict]:
+        """Validate, deduplicate, and sort chunk ranges."""
+        valid = []
+        for r in ranges:
+            start = int(r.get("start", 0))
+            end = int(r.get("end", 0))
+            if start < 1 or end < start or start > section_line_count:
+                continue
+            end = min(end, section_line_count)
+            valid.append({"id": int(r.get("id", len(valid) + 1)), "start": start, "end": end})
+        # Sort by start line
+        valid.sort(key=lambda x: x["start"])
+        # Ensure first chunk starts at 1
+        if valid and valid[0]["start"] != 1:
+            valid.insert(0, {"id": 0, "start": 1, "end": valid[0]["start"] - 1})
+        # Fill any gaps by extending the previous chunk
+        for i in range(1, len(valid)):
+            if valid[i]["start"] > valid[i - 1]["end"] + 1:
+                valid[i - 1]["end"] = valid[i]["start"] - 1
+        # Re-number ids
+        for i, r in enumerate(valid):
+            r["id"] = i + 1
+        return valid
+
+    # Extract JSON
+    json_str = extract_json_from_response(response)
+    if not json_str:
+        print("⚠️  Could not extract JSON for chunk ranges.")
+        return []
+
+    # Try full JSON parse
+    try:
+        data = json.loads(json_str)
+    except json.JSONDecodeError:
+        # Try repair
+        try:
+            data = json.loads(repair_json(json_str))
+        except json.JSONDecodeError:
+            pass
+        else:
+            return _parse_ranges_from_data(data, section_line_count, _validate_ranges)
+        # Regex fallback: extract chunk objects
+        return _regex_fallback_ranges(json_str, section_line_count, _validate_ranges)
+
+    return _parse_ranges_from_data(data, section_line_count, _validate_ranges)
+
+
+def _parse_ranges_from_data(
+    data: dict, section_line_count: int, validator
+) -> list[dict]:
+    """Parse chunk ranges from a parsed JSON dict (new or legacy format)."""
+    if not isinstance(data, dict):
+        return []
+
+    # New format: {"chunks": [{"id": 1, "start": 1, "end": 10}, ...]}
+    if "chunks" in data and isinstance(data["chunks"], list):
+        raw = []
+        for c in data["chunks"]:
+            if isinstance(c, dict) and "start" in c and "end" in c:
+                raw.append(c)
+        if raw:
+            return validator(raw)
+
+    # Legacy format: {"split_at": [1, 15, 32]}
+    if "split_at" in data and isinstance(data["split_at"], list):
+        splits = sorted(set(
+            int(s) for s in data["split_at"]
+            if isinstance(s, (int, float)) and 1 <= int(s) <= section_line_count
+        ))
+        if not splits or splits[0] != 1:
+            splits = [1] + [s for s in splits if s != 1]
+        # Convert split points to ranges
+        ranges = []
+        for i, sp in enumerate(splits):
+            end = splits[i + 1] - 1 if i + 1 < len(splits) else section_line_count
+            ranges.append({"id": i + 1, "start": sp, "end": end})
+        print("⚠️  LLM returned legacy split_at format; converted to chunk ranges.")
+        return ranges
+
+    return []
+
+
+def _regex_fallback_ranges(
+    json_str: str, section_line_count: int, validator
+) -> list[dict]:
+    """Last-resort regex extraction of chunk ranges from partial JSON."""
+    # Try to find individual {"id": N, "start": N, "end": N} objects
+    pattern = r'\{\s*"id"\s*:\s*(\d+)\s*,\s*"start"\s*:\s*(\d+)\s*,\s*"end"\s*:\s*(\d+)\s*\}'
+    matches = re.findall(pattern, json_str)
+    if matches:
+        raw = [
+            {"id": int(m[0]), "start": int(m[1]), "end": int(m[2])}
+            for m in matches
+        ]
+        print(f"⚠️  Regex fallback extracted {len(raw)} chunk ranges.")
+        return validator(raw)
+
+    # Try to find bare number arrays (legacy split_at fallback)
+    match = re.search(r'\[([0-9,\s]+)\]', json_str)
+    if match:
+        numbers = [int(n) for n in re.findall(r'\d+', match.group(1))]
+        if numbers:
+            splits = sorted(set(n for n in numbers if 1 <= n <= section_line_count))
+            if not splits or splits[0] != 1:
+                splits = [1] + [s for s in splits if s != 1]
+            ranges = []
+            for i, sp in enumerate(splits):
+                end = splits[i + 1] - 1 if i + 1 < len(splits) else section_line_count
+                ranges.append({"id": i + 1, "start": sp, "end": end})
+            print("⚠️  Regex fallback extracted split points, converted to ranges.")
+            return ranges
+
+    print("⚠️  Could not parse chunk ranges from response.")
+    return []
 
 
 def parse_chunk_splits_response(response: str, section_line_count: int) -> list[int]:

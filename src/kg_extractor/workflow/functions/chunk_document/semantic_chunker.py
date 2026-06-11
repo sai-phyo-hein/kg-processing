@@ -1,10 +1,15 @@
-"""Semantic chunking module for markdown documents based on LLM analysis."""
+"""Semantic chunking module for markdown documents based on LLM line-range analysis.
+
+The chunker sends numbered source lines to an LLM, which returns explicit line ranges
+(e.g. chunk1: 1~14, chunk2: 15~31). A post-processing step then slices the original
+source text using those ranges and writes each chunk to its own file.
+"""
 
 import json
 import re
 import tiktoken
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
@@ -13,977 +18,399 @@ load_dotenv()
 
 from kg_extractor.utils.model_setup import CHUNKING_PROVIDER, CHUNKING_MODEL
 from kg_extractor.utils.prompts import create_chunking_prompt
-from kg_extractor.utils.llm_response_parser import parse_chunk_splits_response
+from kg_extractor.utils.llm_response_parser import parse_chunk_ranges_response
 
 
 class SemanticChunker:
-    """Chunk markdown documents using 3-step LLM-assisted approach.
+    """Chunk markdown documents using LLM-assisted line-range approach.
 
     Process:
-    1. Pre-process: Extract <start>...</end> content, split into 1-sentence-1-line,
-       remove non-word sentences, number lines [1], [2], etc.
-    2. LLM Analysis: Send numbered text to LLM, get chunk boundaries (start/end line numbers)
-    3. Programmatic Chunking: Extract text based on LLM-defined boundaries
+    1. Read source → split into lines
+    2. LLM Analysis: send numbered lines, receive chunk ranges (start ~ end)
+    3. Post-process: extract content from original source using those ranges
+    4. Output: each chunk saved as a separate file
 
     Features:
-    - Clean 1-sentence-per-line format for better LLM understanding
-    - Minimal LLM output (just line numbers)
-    - Exact content extraction without rewrites
-    - Comprehensive error handling and validation
+    - LLM returns only line-number ranges (minimal token output)
+    - Content extracted programmatically from original source (no rewrites)
+    - Individual chunk files in a directory with a manifest.json
+    - Sliding window for large documents with context overlap
     - Graceful fallback to rule-based chunking
     """
 
     def __init__(
         self,
-        chunk_granularity: float = 0.5,
+        chunk_granularity: float = 0.1,
         llm_provider: str = CHUNKING_PROVIDER,
         llm_model: str = CHUNKING_MODEL,
         max_retries: int = 3,
         enable_fallback: bool = True,
     ):
-        """Initialize the semantic chunker.
-
-        Args:
-            chunk_granularity: Threshold for detecting topic changes (0.0-1.0)
-            llm_provider: LLM provider to use (openai, groq, nvidia, openrouter)
-            llm_model: Model to use for LLM analysis
-            max_retries: Maximum number of retry attempts for API calls
-            enable_fallback: Enable fallback to simple chunking if LLM fails
-        """
         self.chunk_granularity = chunk_granularity
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.max_retries = max_retries
         self.enable_fallback = enable_fallback
-        self.context_limit = 50000  # Token limit per section
-        self.CONTEXT_OVERLAP = 50  # Lines to overlap between sections
-        self.SAFETY_MARGIN = 500  # Safety margin for token calculations
+        self.context_limit = 50_000  # Token limit per section
+        self.CONTEXT_OVERLAP = 50    # Lines to overlap between sections
+        self.SAFETY_MARGIN = 500
+
+    # ── Token counting ──────────────────────────────────────────────────
 
     def _count_tokens(self, text: str) -> int:
-        """Count tokens in text using tiktoken.
-
-        Args:
-            text: Text to count tokens for
-
-        Returns:
-            Number of tokens
-        """
         try:
-            # Get encoding for the model
             if "gpt-4" in self.llm_model:
                 encoding = tiktoken.encoding_for_model("gpt-4")
             elif "gpt-3.5" in self.llm_model:
                 encoding = tiktoken.encoding_for_model("gpt-3.5-turbo")
             else:
-                # Default to cl100k_base encoding (works for most models)
                 encoding = tiktoken.get_encoding("cl100k_base")
-
             return len(encoding.encode(text))
         except Exception as e:
             print(f"Warning: Failed to count tokens: {e}")
-            # Fallback: rough estimate (1 token ≈ 4 characters)
             return len(text) // 4
 
-    def _extract_content_between_flags(self, content: str) -> str:
-        """Extract content between <start> and </end> flags.
-
-        Args:
-            content: Text content to extract from
-
-        Returns:
-            Content between flags, or entire content if flags not found
-        """
-        match = re.search(r'<start>(.*?)</end>', content, re.DOTALL)
-        if match:
-            return match.group(1)
-        return content
-
-    def _split_into_sentences(self, text: str) -> List[str]:
-        """Split text into sentences. One sentence per line.
-
-        Args:
-            text: Text to split into sentences
-
-        Returns:
-            List of sentences
-        """
-        # Simple sentence splitting: . ! ? followed by space or end of string
-        # This regex splits on sentence-ending punctuation
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        return [s.strip() for s in sentences if s.strip()]
-
-    def _is_valid_sentence(self, sentence: str) -> bool:
-        """Check if sentence is valid (contains actual words, not just symbols).
-
-        Args:
-            sentence: Sentence to validate
-
-        Returns:
-            True if sentence contains meaningful content
-        """
-        # Remove common non-word characters
-        cleaned = re.sub(r'[^a-zA-Z0-9\s]', '', sentence)
-        # Check if at least 2 words remain
-        words = cleaned.split()
-        return len(words) >= 2
-
-    def _number_and_clean_sentences(self, sentences: List[str]) -> List[str]:
-        """Filter valid sentences and number them as [1], [2], etc.
-
-        Args:
-            sentences: List of sentences to process
-
-        Returns:
-            List of numbered valid sentences
-        """
-        numbered = []
-        line_num = 1
-        for sentence in sentences:
-            if self._is_valid_sentence(sentence):
-                numbered.append(f"[{line_num}] {sentence}")
-                line_num += 1
-        return numbered
-
-    def chunk_markdown(self, file_path: str) -> List[Dict[str, Any]]:
-        """Chunk a markdown file using 3-step LLM-assisted approach.
-
-        Args:
-            file_path: Path to the markdown file to chunk
-
-        Returns:
-            List of chunk dictionaries with chunk_id and content
-
-        Raises:
-            FileNotFoundError: If file doesn't exist
-            ValueError: If document is invalid
-            RuntimeError: If processing fails
-        """
-        path = Path(file_path)
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        # Read the file content
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            raise RuntimeError(f"Failed to read file: {e}")
-
-        # Step 1: Pre-process content
-        print("📋 Step 1: Pre-processing content...")
-        
-        # Extract content between flags
-        extracted = self._extract_content_between_flags(content)
-        
-        # Split into sentences
-        sentences = self._split_into_sentences(extracted)
-        print(f"  📝 Split into {len(sentences)} raw sentences")
-        
-        # Number and clean sentences
-        numbered_lines = self._number_and_clean_sentences(sentences)
-        print(f"  ✅ Cleaned to {len(numbered_lines)} valid sentences")
-        
-        if not numbered_lines:
-            raise ValueError("No valid sentences found in document")
-
-        # Step 2: Get chunk boundaries from LLM
-        print("🧠 Step 2: Analyzing with LLM...")
-        numbered_text = "\n".join(numbered_lines)
-        chunk_boundaries = self._get_chunk_boundaries_from_llm(numbered_text, file_path)
-        
-        if not chunk_boundaries:
-            print("⚠️  LLM returned no chunk boundaries, using fallback...")
-            if self.enable_fallback:
-                return self._fallback_chunking_from_numbered(numbered_lines)
-            else:
-                raise RuntimeError("Failed to get chunk boundaries from LLM")
-
-        # Step 3: Extract chunks programmatically
-        print("📦 Step 3: Extracting chunks...")
-        chunks = self._extract_chunks_from_boundaries(
-            numbered_lines, chunk_boundaries
-        )
-        
-        print(f"✅ Successfully created {len(chunks)} chunks")
-        return chunks
-
-    def _get_chunk_boundaries_from_llm(
-        self, numbered_text: str, file_path: str
-    ) -> List[Dict[str, int]]:
-        """Send numbered text to LLM and get chunk boundaries.
-        
-        Automatically splits large texts into sections if they exceed token limit.
-
-        Args:
-            numbered_text: Text with [N] numbered lines
-            file_path: Path to source file for context
-
-        Returns:
-            List of chunk boundaries: [{"start": 1, "end": 10}, ...]
-        """
-        # Check if text is too large for a single LLM call
-        token_count = self._count_tokens(numbered_text)
-        max_tokens_for_llm = 8000  # Conservative limit for single call
-        
-        print(f"  📊 Token count: {token_count}")
-        
-        if token_count > max_tokens_for_llm:
-            print(f"  ⚠️  Text too large ({token_count} tokens), splitting into sections...")
-            return self._split_and_analyze_sections(numbered_text, file_path)
-        else:
-            # Single LLM call for smaller texts
-            prompt = self._create_boundary_prompt(numbered_text, file_path)
-            try:
-                response = self._get_llm_response_with_retry(prompt)
-                boundaries = self._parse_chunk_boundaries(response)
-                if boundaries:
-                    print(f"  ✅ Got {len(boundaries)} chunk boundaries from LLM")
-                return boundaries
-            except Exception as e:
-                print(f"⚠️  Failed to get LLM response: {e}")
-                return []
-
-    def _split_and_analyze_sections(
-        self, numbered_text: str, file_path: str
-    ) -> List[Dict[str, int]]:
-        """Split large numbered text into sections and analyze each separately.
-
-        Args:
-            numbered_text: Full numbered text (possibly very large)
-            file_path: Path to source file
-
-        Returns:
-            Combined chunk boundaries from all sections
-        """
-        lines = numbered_text.split("\n")
-        max_lines_per_section = 100  # Process ~100 lines per LLM call
-        
-        all_boundaries = []
-        section_num = 1
-        
-        for i in range(0, len(lines), max_lines_per_section):
-            section_lines = lines[i:i + max_lines_per_section]
-            section_text = "\n".join(section_lines)
-            
-            # Extract actual line numbers from the section
-            section_line_numbers = []
-            for line in section_lines:
-                if line.startswith("["):
-                    # Extract number from [N] format
-                    match = re.match(r'\[(\d+)\]', line)
-                    if match:
-                        section_line_numbers.append(int(match.group(1)))
-            
-            if not section_line_numbers:
-                continue
-            
-            section_start = section_line_numbers[0]
-            section_end = section_line_numbers[-1]
-            
-            print(f"  📖 Analyzing section {section_num} (lines {section_start}-{section_end})...")
-            
-            # Create prompt for this section
-            prompt = self._create_boundary_prompt(section_text, file_path)
-            
-            try:
-                response = self._get_llm_response_with_retry(prompt)
-                boundaries = self._parse_chunk_boundaries(response)
-                
-                if boundaries:
-                    print(f"    ✅ Got {len(boundaries)} boundaries from section {section_num}")
-                    all_boundaries.extend(boundaries)
-                    
-            except Exception as e:
-                print(f"    ⚠️  Section {section_num} failed: {e}")
-                continue
-            
-            section_num += 1
-        
-        if all_boundaries:
-            print(f"  ✅ Combined: {len(all_boundaries)} total boundaries from {section_num - 1} sections")
-        
-        return all_boundaries
-
-    def _create_boundary_prompt(self, numbered_text: str, file_path: str) -> str:
-        """Create prompt for LLM to define chunk boundaries.
-
-        Args:
-            numbered_text: Numbered text lines
-            file_path: Source file path
-
-        Returns:
-            Prompt string
-        """
-        prompt = f"""Analyze the following numbered lines and define logical chunks.
-
-**TEXT:**
-{numbered_text}
-
-**TASK:**
-1. Identify logical groupings of lines that form coherent chunks
-2. Return chunk boundaries as JSON with "start" and "end" line numbers (inclusive)
-3. Do NOT rewrite or modify the text, only define boundaries
-
-**RESPONSE FORMAT:**
-Return a JSON object like:
-{{
-  "chunks": [
-    {{"chunk_id": 1, "start": 1, "end": 5}},
-    {{"chunk_id": 2, "start": 6, "end": 12}},
-    {{"chunk_id": 3, "start": 13, "end": 20}}
-  ]
-}}
-
-Return ONLY valid JSON, no markdown code blocks or extra text."""
-        
-        return prompt
-
-    def _get_llm_response_with_retry(self, prompt: str) -> str:
-        """Get LLM response with retry logic.
-
-        Args:
-            prompt: Prompt to send to LLM
-
-        Returns:
-            LLM response text
-
-        Raises:
-            RuntimeError: If all retry attempts fail
-        """
-        for attempt in range(self.max_retries):
-            try:
-                response = self._get_llm_response(prompt)
-                return response
-            except Exception as e:
-                print(f"⚠️  Attempt {attempt + 1} failed: {e}")
-                if attempt < self.max_retries - 1:
-                    import time
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    raise RuntimeError(f"Failed after {self.max_retries} attempts: {e}")
-
-        return ""
-
-    def _get_llm_response(self, prompt: str) -> str:
-        """Get response from LLM.
-
-        Args:
-            prompt: Prompt to send to LLM
-
-        Returns:
-            LLM response text
-        """
-        try:
-            import os
-            from langchain_openai import ChatOpenAI
-            from kg_extractor.utils.parser import (
-                get_api_key,
-                get_groq_api_key,
-                get_openrouter_api_key,
-            )
-
-            # Create LLM based on provider
-            if self.llm_provider == "openai":
-                openai_api_key = os.getenv("OPENAI_API_KEY")
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=openai_api_key,
-                )
-            elif self.llm_provider == "groq":
-                groq_api_key = get_groq_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=groq_api_key,
-                    base_url="https://api.groq.com/openai/v1",
-                )
-            elif self.llm_provider == "nvidia":
-                nvidia_api_key = get_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=nvidia_api_key,
-                    base_url="https://integrate.api.nvidia.com/v1",
-                )
-            else:  # openrouter
-                openrouter_api_key = get_openrouter_api_key()
-                llm = ChatOpenAI(
-                    model=self.llm_model,
-                    temperature=0.3,
-                    api_key=openrouter_api_key,
-                    base_url="https://openrouter.ai/api/v1",
-                )
-
-            # Get response
-            response = llm.invoke(prompt)
-            return response.content
-
-        except Exception as e:
-            # Fallback: return empty response
-            print(f"Warning: Failed to get LLM response: {e}")
-            return '{"chunks": []}'
-
-    def _parse_chunk_boundaries(self, response: str) -> List[Dict[str, int]]:
-        """Parse LLM response to extract chunk boundaries.
-
-        Args:
-            response: LLM response text
-
-        Returns:
-            List of chunk boundaries: [{"chunk_id": 1, "start": 1, "end": 5}, ...]
-        """
-        try:
-            data = parse_json_with_repair(response)
-            if not data:
-                print(f"Warning: Failed to parse JSON from response")
-                return []
-            
-            if "chunks" not in data or not isinstance(data["chunks"], list):
-                print(f"Warning: Invalid response structure: {list(data.keys())}")
-                return []
-            
-            chunks = data["chunks"]
-            
-            # Validate each chunk has start and end
-            valid_chunks = []
-            for chunk in chunks:
-                if isinstance(chunk, dict) and "start" in chunk and "end" in chunk:
-                    valid_chunks.append({
-                        "chunk_id": chunk.get("chunk_id", len(valid_chunks) + 1),
-                        "start": int(chunk["start"]),
-                        "end": int(chunk["end"]),
-                    })
-            
-            return sorted(valid_chunks, key=lambda x: x["start"])
-        
-        except Exception as e:
-            print(f"Warning: Failed to parse chunk boundaries: {e}")
-            return []
-
-    def _extract_chunks_from_boundaries(
-        self, numbered_lines: List[str], boundaries: List[Dict[str, int]]
-    ) -> List[Dict[str, Any]]:
-        """Extract chunks based on LLM-defined boundaries.
-
-        Args:
-            numbered_lines: List of numbered text lines
-            boundaries: List of chunk boundaries with start/end line numbers
-
-        Returns:
-            List of chunk dictionaries
-        """
-        chunks = []
-        
-        for boundary in boundaries:
-            start = boundary["start"]
-            end = boundary["end"]
-            chunk_id = boundary.get("chunk_id", len(chunks) + 1)
-            
-            # Extract lines for this chunk (convert 1-based to 0-based indexing)
-            chunk_lines = numbered_lines[start - 1:end]
-            
-            # Remove line numbers and join content
-            content = " ".join(line.split("] ", 1)[1] if "] " in line else line 
-                              for line in chunk_lines)
-            
-            # Normalize content
-            content = self._normalize_content(content.strip())
-            
-            if content:
-                chunks.append({
-                    "chunk_id": chunk_id,
-                    "content": content,
-                })
-        
-        return chunks
+    # ── Source preparation ──────────────────────────────────────────────
 
     @staticmethod
-    def _normalize_content(content: str) -> str:
-        """Normalize chunk content."""
-        return content.replace("\n", " ").replace('"', "'").strip()
+    def _extract_content_between_flags(content: str) -> str:
+        match = re.search(r'<start>(.*?)</end>', content, re.DOTALL)
+        return match.group(1) if match else content
 
-    def _fallback_chunking_from_numbered(
-        self, numbered_lines: List[str]
-    ) -> List[Dict[str, Any]]:
-        """Fallback chunking using fixed line groups.
+    MAX_LINE_WIDTH = 120  # characters
 
-        Args:
-            numbered_lines: List of numbered lines
-
-        Returns:
-            List of chunk dictionaries
-        """
-        print("📋 Using simple fallback: 5 lines per chunk...")
-        
-        chunks = []
-        lines_per_chunk = 5
-        chunk_id = 1
-        
-        for i in range(0, len(numbered_lines), lines_per_chunk):
-            chunk_lines = numbered_lines[i:i + lines_per_chunk]
-            content = " ".join(line.split("] ", 1)[1] if "] " in line else line 
-                              for line in chunk_lines)
-            content = self._normalize_content(content.strip())
-            
-            if content:
-                chunks.append({
-                    "chunk_id": chunk_id,
-                    "content": content,
-                })
-                chunk_id += 1
-        
-        print(f"✅ Created {len(chunks)} chunks using fallback method")
-        return chunks
-
-    def chunk_markdown(self, file_path: str) -> List[Dict[str, Any]]:
-        """Chunk a markdown file using sliding window approach with context continuity.
-
-        Processes large documents in sections that fit within context window,
-        maintaining continuity by remembering where each section left off.
-
-        Args:
-            file_path: Path to the markdown file to chunk
-
-        Returns:
-            List of chunk dictionaries with chunk_id and content
-
-        Raises:
-            FileNotFoundError: If file doesn't exist
-            ValueError: If document is invalid
-            RuntimeError: If processing fails after retries
-        """
+    def _prepare_source_lines(self, file_path: str) -> List[str]:
+        """Read file, extract content between flags, wrap long lines, return list of lines."""
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {file_path}")
 
-        # Read the file content
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            raise RuntimeError(f"Failed to read file: {e}")
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
 
-        # Extract content between <start> and </end> flags
-        extracted_content = self._extract_content_between_flags(content)
-        if not extracted_content:
-            extracted_content = content
-        
-        # Convert extracted content back to lines for processing
-        lines = extracted_content.split("\n")
-        # Add newlines back to match original format
-        lines = [line + "\n" if i < len(lines) - 1 else line for i, line in enumerate(lines)]
+        extracted = self._extract_content_between_flags(content)
+        if not extracted:
+            extracted = content
 
-        # Use sliding window approach for large documents
-        print(f"🧠 Analyzing document with sliding window (context limit: {self.context_limit} tokens per section)...")
-        chunk_boundaries = self._analyze_with_sliding_window(lines, file_path)
+        raw_lines = extracted.split("\n")
 
-        # Validate LLM response
-        if not chunk_boundaries:
-            print("⚠️  Sliding window returned empty chunks, using fallback...")
-            if self.enable_fallback:
-                return self._fallback_chunking(content, file_path)
+        # Wrap lines that exceed MAX_LINE_WIDTH using textwrap
+        import textwrap
+        wrapped: List[str] = []
+        for line in raw_lines:
+            stripped = line.rstrip("\n")
+            if len(stripped) <= self.MAX_LINE_WIDTH:
+                wrapped.append(stripped)
             else:
-                raise RuntimeError("Sliding window failed to produce valid chunks")
+                # Preserve leading indent style for subsequent wrapped lines
+                indent = " " * (len(stripped) - len(stripped.lstrip()))
+                wrapped.extend(textwrap.wrap(
+                    stripped,
+                    width=self.MAX_LINE_WIDTH,
+                    subsequent_indent=indent,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                ))
+        # Preserve trailing newlines on all but the last line
+        return [
+            line + "\n" if i < len(wrapped) - 1 else line
+            for i, line in enumerate(wrapped)
+        ]
 
-        # _analyze_with_sliding_window now returns fully formed chunks directly
-        chunks = chunk_boundaries
+    # ── Numbered content builder ────────────────────────────────────────
 
-        print(f"✅ Successfully created {len(chunks)} chunks")
-        return chunks
+    @staticmethod
+    def _build_numbered_content(lines: List[str], start_number: int = 1) -> str:
+        """Build numbered-line text for the LLM prompt.
 
-    def _analyze_with_sliding_window(
-        self, lines: List[str], file_path: str
-    ) -> List[Dict[str, int]]:
-        """Analyze document using sliding window approach with context continuity.
-
-        The LLM is shown numbered lines and asked only for the line numbers where
-        new chunks should begin (boundary detection). Actual text is extracted
-        programmatically, ensuring 100% content coverage with minimal LLM output.
-
-        Args:
-            lines: List of lines from the markdown file
-            file_path: Path to the file (for context)
-
-        Returns:
-            List of chunk boundary dictionaries with content
-
-        Raises:
-            RuntimeError: If processing fails after retries
-        """
-        all_chunks = []
-        current_line = 0
-        total_lines = len(lines)
-        section_number = 1
-        chunk_id_counter = 1
-
-        # Overlap lines shown to LLM for context, but boundaries only requested
-        # for the non-overlapping "new" portion to avoid duplicate chunks.
-        context_overlap = self.CONTEXT_OVERLAP
-
-        while current_line < total_lines:
-            # Determine section size
-            section_lines = self._calculate_section_size(
-                lines[current_line:],
-                context_overlap
-            )
-            section_end = current_line + section_lines
-
-            print(f"📖 Processing section {section_number} "
-                  f"(lines {current_line + 1}-{section_end})...")
-
-            section_content_lines = lines[current_line:section_end]
-
-            # Build numbered-line content for the prompt
-            numbered_content = self._build_numbered_content(
-                section_content_lines, start_number=1
-            )
-
-            # Create prompt requesting only split-point line numbers
-            prompt = self._create_chunking_prompt_with_context(
-                numbered_content,
-                file_path,
-                section_number,
-                chunk_id_counter,
-            )
-
-            try:
-                response = self._get_llm_response_with_retry(prompt)
-                # Returns list of relative line numbers (1-based within this section)
-                split_points = self._parse_llm_response(response, len(section_content_lines))
-
-                if not split_points:
-                    print(f"⚠️  Section {section_number} returned no split points, "
-                          "treating section as one chunk...")
-                    split_points = [1]
-
-                # Enforce minimum chunk size: merge any split that is too close to the previous
-                MIN_LINES_PER_CHUNK = 3
-                if len(split_points) > 1:
-                    filtered = [split_points[0]]
-                    for sp in split_points[1:]:
-                        if sp - filtered[-1] >= MIN_LINES_PER_CHUNK:
-                            filtered.append(sp)
-                    if len(filtered) < len(split_points):
-                        print(f"  ℹ️  Merged over-split points: {len(split_points)} → {len(filtered)} splits")
-                    split_points = filtered
-
-                # Convert relative 1-based line numbers to absolute 0-based indices
-                # and build chunks by slicing the lines array
-                abs_splits = [current_line + (sp - 1) for sp in split_points]
-                # Append sentinel for slicing the last chunk
-                abs_splits.append(section_end)
-
-                section_chunks = []
-                for i in range(len(abs_splits) - 1):
-                    start = abs_splits[i]
-                    end = abs_splits[i + 1]
-                    content = self._normalize_content("".join(lines[start:end]).strip())
-                    if content:
-                        section_chunks.append({
-                            "chunk_id": chunk_id_counter,
-                            "content": content,
-                        })
-                        chunk_id_counter += 1
-
-                all_chunks.extend(section_chunks)
-                print(f"✅ Section {section_number} produced {len(section_chunks)} chunks")
-
-            except Exception as e:
-                print(f"⚠️  Section {section_number} failed: {e}")
-                if self.enable_fallback:
-                    fallback_chunks = self._fallback_chunk_section(
-                        section_content_lines,
-                        base_chunk_id=chunk_id_counter,
-                    )
-                    all_chunks.extend(fallback_chunks)
-                    chunk_id_counter += len(fallback_chunks)
-                    print(f"🔄 Used fallback for section {section_number}")
-                else:
-                    raise RuntimeError(f"Failed to process section {section_number}: {e}")
-
-            # Advance by the non-overlapping portion so next section has fresh content.
-            # The overlap lines were shown for context but their chunks are already recorded.
-            advance = max(section_lines - context_overlap, 1)
-            current_line += advance
-            section_number += 1
-
-        return all_chunks
-
-    def _build_numbered_content(self, lines: List[str], start_number: int = 1) -> str:
-        """Build a numbered-line representation for the LLM prompt.
-
-        Args:
-            lines: Lines to number
-            start_number: Starting line number (1-based)
-
-        Returns:
-            String with each line prefixed by its line number
+        Each line becomes ``[NNNN] <text>`` (no trailing newline in the output
+        string — lines are joined with ``\\n``).
         """
         numbered = []
         for i, line in enumerate(lines):
             num = start_number + i
-            numbered.append(f"[{num:04d}] {line}" if line.endswith("\n") else f"[{num:04d}] {line}\n")
-        return "".join(numbered)
+            text = line.rstrip("\n")
+            numbered.append(f"[{num:04d}] {text}")
+        return "\n".join(numbered)
+
+    # ── Section sizing ──────────────────────────────────────────────────
 
     def _calculate_section_size(self, lines: List[str], context_overlap: int) -> int:
-        """Calculate optimal section size based on token limit.
-
-        Args:
-            lines: Available lines for this section
-            context_overlap: Number of lines to overlap with next section
-
-        Returns:
-            Number of lines to include in this section
-        """
-        # Start with all available lines
+        """Return number of lines to include in the current section."""
         section_lines = len(lines)
+        max_section_lines = 1000
 
-        # Maximum section size to ensure good chunking granularity
-        # Even if document fits in context, we want multiple sections for better chunking
-        max_section_lines = 1000  # Process at most 1000 lines per section
-
-        # If we have more lines than the max, limit to max
         if section_lines > max_section_lines:
             section_lines = max_section_lines
 
-        # Calculate tokens for progressively smaller sections
-        while section_lines > 100:  # Minimum section size
+        while section_lines > 100:
             test_content = "".join(lines[:section_lines])
             token_count = self._count_tokens(test_content)
-
-            # Account for prompt overhead (roughly 1000 tokens for instructions)
-            prompt_overhead = 1000
-            total_tokens = token_count + prompt_overhead
-
-            if total_tokens <= self.context_limit:
-                # This section fits, add some buffer for context overlap
+            if token_count + 1000 <= self.context_limit:
                 return min(section_lines + context_overlap, len(lines))
-
-            # Section too large, reduce by 20%
             section_lines = int(section_lines * 0.8)
 
-        # If we get here, use minimum size
         return max(section_lines, 100)
 
-    def _create_chunking_prompt_with_context(
+    # ── LLM interaction ─────────────────────────────────────────────────
+
+    def _get_llm_response_with_retry(self, prompt: str) -> str:
+        for attempt in range(self.max_retries):
+            try:
+                return self._get_llm_response(prompt)
+            except Exception as e:
+                print(f"⚠️  Attempt {attempt + 1} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    import time
+                    time.sleep(2 ** attempt)
+                else:
+                    raise RuntimeError(
+                        f"Failed after {self.max_retries} attempts: {e}"
+                    )
+        return ""
+
+    def _get_llm_response(self, prompt: str) -> str:
+        try:
+            from kg_extractor.utils.model_setup import get_llm_response
+            return get_llm_response(
+                prompt, self.llm_provider, self.llm_model, temperature=0.3
+            )
+        except Exception as e:
+            print(f"Warning: Failed to get LLM response: {e}")
+            return '{"chunks": []}'
+
+    # ── LLM prompt builder ──────────────────────────────────────────────
+
+    def _create_chunking_prompt(
         self,
         numbered_content: str,
         file_path: str,
         section_number: int,
-        start_chunk_id: int,
+        section_line_count: int,
     ) -> str:
-        """Create chunking prompt showing numbered lines and requesting split points.
-
-        Args:
-            numbered_content: Section content with each line prefixed by [NNNN]
-            file_path: Path to the file
-            section_number: Current section number
-            start_chunk_id: Starting chunk ID for this section (informational)
-
-        Returns:
-            Prompt string for the LLM
-        """
         base_prompt = create_chunking_prompt(
             content=numbered_content,
             file_path=file_path,
             chunk_granularity=self.chunk_granularity,
         )
+        return (
+            f"{base_prompt}\n\n"
+            f"**SECTION CONTEXT:**\n"
+            f"- This is section {section_number} of a larger document\n"
+            f"- Section contains {section_line_count} lines\n"
+            f"- Return ONLY line ranges as JSON — no content, no explanation\n\n"
+            f"Respond with ONLY the JSON object:"
+        )
 
-        enhanced_prompt = f"""{base_prompt}
+    # ── Main public API ─────────────────────────────────────────────────
 
-**SECTION CONTEXT:**
-- This is section {section_number} of a larger document
-- Chunks will be numbered starting from {start_chunk_id}
-- Return ONLY line numbers (the [NNNN] values) where new chunks should begin
-"""
-        return enhanced_prompt
+    def chunk_markdown(self, file_path: str) -> List[Dict[str, Any]]:
+        """Chunk a markdown file using LLM line-range approach.
 
-    def _get_llm_response_with_retry(self, prompt: str) -> str:
-        """Get LLM response with retry logic.
-
-        Args:
-            prompt: Prompt to send to LLM
+        1. Read source → prepare lines
+        2. LLM returns explicit line ranges for each chunk
+        3. Post-process: extract content from source using those ranges
 
         Returns:
-            LLM response text
-
-        Raises:
-            RuntimeError: If all retry attempts fail
+            List of chunk dicts with chunk_id, content, start_line, end_line.
         """
-        for attempt in range(self.max_retries):
+        # Step 1 — prepare source lines
+        print("📋 Step 1: Preparing source lines...")
+        source_lines = self._prepare_source_lines(file_path)
+        print(f"  📝 {len(source_lines)} source lines")
+
+        if not source_lines or all(l.strip() == "" for l in source_lines):
+            raise ValueError("No content found in document")
+
+        # Step 2 — get chunk ranges from LLM
+        print("🧠 Step 2: Getting chunk ranges from LLM...")
+        chunk_ranges = self._get_chunk_ranges(source_lines, file_path)
+
+        if not chunk_ranges:
+            print("⚠️  LLM returned no chunk ranges, using fallback...")
+            if self.enable_fallback:
+                return self._fallback_chunking(source_lines, file_path)
+            raise RuntimeError("Failed to get chunk ranges from LLM")
+
+        # Step 3 — post-process: extract content from source using ranges
+        print("📦 Step 3: Post-processing — extracting chunks from source...")
+        chunks = self._post_process_chunks(source_lines, chunk_ranges)
+
+        print(f"✅ Successfully created {len(chunks)} chunks")
+        return chunks
+
+    # ── Step 2: get chunk ranges from LLM (sliding window) ──────────────
+
+    def _get_chunk_ranges(
+        self, source_lines: List[str], file_path: str
+    ) -> List[Dict[str, int]]:
+        """Send numbered lines to LLM and collect chunk ranges across sections.
+
+        Returns:
+            List of ``{"chunk_id": N, "start": M, "end": K}`` where start and
+            end are **0-based** indices into *source_lines* (inclusive).
+        """
+        all_ranges: List[Dict[str, int]] = []
+        current_line = 0
+        total_lines = len(source_lines)
+        section_number = 1
+        chunk_id_counter = 1
+        context_overlap = self.CONTEXT_OVERLAP
+        MIN_LINES_PER_CHUNK = 3
+
+        while current_line < total_lines:
+            section_size = self._calculate_section_size(
+                source_lines[current_line:], context_overlap
+            )
+            section_end = min(current_line + section_size, total_lines)
+
+            print(
+                f"  📖 Section {section_number} "
+                f"(lines {current_line + 1}–{section_end})..."
+            )
+
+            section_lines = source_lines[current_line:section_end]
+            numbered_content = self._build_numbered_content(
+                section_lines, start_number=1
+            )
+
+            prompt = self._create_chunking_prompt(
+                numbered_content, file_path, section_number, len(section_lines)
+            )
+
             try:
-                response = self._get_llm_response(prompt)
-                return response
+                response = self._get_llm_response_with_retry(prompt)
+                print(f"  🤖 LLM response for section {section_number}:\n{response}\n")
+                # [{"id": 1, "start": 1, "end": 10}, ...]  (1-based within section)
+                raw_ranges = parse_chunk_ranges_response(response, len(section_lines))
+
+                if not raw_ranges:
+                    print(
+                        f"  ⚠️  No ranges for section {section_number}, "
+                        "treating as one chunk"
+                    )
+                    raw_ranges = [
+                        {"id": 1, "start": 1, "end": len(section_lines)}
+                    ]
+
+                # Merge ranges that are too small
+                if len(raw_ranges) > 1:
+                    filtered = [raw_ranges[0]]
+                    for r in raw_ranges[1:]:
+                        if r["start"] - filtered[-1]["start"] >= MIN_LINES_PER_CHUNK:
+                            filtered.append(r)
+                        else:
+                            filtered[-1]["end"] = r["end"]
+                    if len(filtered) < len(raw_ranges):
+                        print(
+                            f"  ℹ️  Merged small ranges: "
+                            f"{len(raw_ranges)} → {len(filtered)}"
+                        )
+                    raw_ranges = filtered
+
+                # Convert 1-based-section-relative → 0-based-absolute
+                for r in raw_ranges:
+                    all_ranges.append(
+                        {
+                            "chunk_id": chunk_id_counter,
+                            "start": current_line + (r["start"] - 1),
+                            "end": current_line + r["end"] - 1,  # inclusive
+                        }
+                    )
+                    chunk_id_counter += 1
+
+                print(f"  ✅ Section {section_number}: {len(raw_ranges)} chunks")
+
             except Exception as e:
-                print(f"⚠️  Attempt {attempt + 1} failed: {e}")
-                if attempt < self.max_retries - 1:
-                    import time
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                print(f"  ⚠️  Section {section_number} failed: {e}")
+                if self.enable_fallback:
+                    all_ranges.append(
+                        {
+                            "chunk_id": chunk_id_counter,
+                            "start": current_line,
+                            "end": section_end - 1,
+                        }
+                    )
+                    chunk_id_counter += 1
                 else:
-                    raise RuntimeError(f"Failed after {self.max_retries} attempts: {e}")
+                    raise RuntimeError(f"Failed on section {section_number}: {e}")
 
-        return ""
+            advance = max(section_size - context_overlap, 1)
+            current_line += advance
+            section_number += 1
 
-    @staticmethod
-    def _normalize_content(content: str) -> str:
-        """Normalize chunk content: collapse newlines to spaces, replace double quotes with single quotes."""
-        return content.replace("\n", " ").replace('"', "'")
+        return all_ranges
 
-    def _fallback_chunking(
-        self, content: str, file_path: str
+    # ── Step 3: post-process — extract content from source ──────────────
+
+    def _post_process_chunks(
+        self, source_lines: List[str], chunk_ranges: List[Dict[str, int]]
     ) -> List[Dict[str, Any]]:
-        """Fallback to simple rule-based chunking for entire document.
+        """Extract chunk content from original source lines using LLM ranges.
 
         Args:
-            content: Document content
-            file_path: Path to the file
+            source_lines: Original lines from the source document
+            chunk_ranges: ``[{"chunk_id": N, "start": M, "end": K}]``
+                          (0-based, inclusive)
 
         Returns:
-            List of chunk dictionaries
+            List of chunk dicts ready for saving.
         """
-        print("📋 Using simple rule-based chunking for entire document...")
+        chunks: List[Dict[str, Any]] = []
 
-        # Split by headers
-        chunks = []
-        lines = content.split("\n")
-        current_chunk = []
-        chunk_id = 1
+        for r in chunk_ranges:
+            start = r["start"]
+            end = r["end"] + 1  # inclusive → exclusive
+            content = "".join(source_lines[start:end])
+            content = self._normalize_content(content.strip())
 
-        for line in lines:
-            # Check for header
-            if line.startswith("#") and current_chunk:
-                # Save current chunk
-                chunk_content = self._normalize_content("\n".join(current_chunk).strip())
-                if chunk_content:
-                    chunks.append({
-                        "chunk_id": chunk_id,
-                        "content": chunk_content,
-                        "topic": f"Section {chunk_id}",
-                    })
-                    chunk_id += 1
-                current_chunk = [line]
-            else:
-                current_chunk.append(line)
-
-        # Don't forget the last chunk
-        if current_chunk:
-            chunk_content = self._normalize_content("\n".join(current_chunk).strip())
-            if chunk_content:
-                chunks.append({
-                    "chunk_id": chunk_id,
-                    "content": chunk_content,
-                    "topic": f"Section {chunk_id}",
-                })
-
-        print(f"✅ Created {len(chunks)} chunks using fallback method")
-        return chunks
-
-    def _fallback_chunk_section(
-        self, lines: List[str], base_chunk_id: int
-    ) -> List[Dict[str, Any]]:
-        """Fallback chunking for a single section.
-
-        Args:
-            lines: Lines in the section
-            base_chunk_id: Starting chunk ID
-
-        Returns:
-            List of chunk dictionaries
-        """
-        chunks = []
-        current_chunk = []
-        chunk_id = base_chunk_id
-
-        for line in lines:
-            # Check for header
-            if line.startswith("#") and current_chunk:
-                # Save current chunk
-                chunk_content = self._normalize_content("\n".join(current_chunk).strip())
-                if chunk_content:
-                    chunks.append({
-                        "chunk_id": chunk_id,
-                        "content": chunk_content,
-                        "topic": f"Section {chunk_id}",
-                    })
-                    chunk_id += 1
-                current_chunk = [line]
-            else:
-                current_chunk.append(line)
-
-        # Don't forget the last chunk
-        if current_chunk:
-            chunk_content = self._normalize_content("\n".join(current_chunk).strip())
-            if chunk_content:
-                chunks.append({
-                    "chunk_id": chunk_id,
-                    "content": chunk_content,
-                    "topic": f"Section {chunk_id}",
-                })
+            if content:
+                chunks.append(
+                    {
+                        "chunk_id": r["chunk_id"],
+                        "content": content,
+                        "start_line": start + 1,  # 1-based for display
+                        "end_line": end,           # 1-based for display
+                    }
+                )
 
         return chunks
 
-    def _get_llm_response(self, prompt: str) -> str:
-        """Get response from LLM.
+    # ── Saving ──────────────────────────────────────────────────────────
+
+    def save_chunks(self, chunks: List[Dict[str, Any]], output_dir: str) -> str:
+        """Save chunks as individual files in a directory.
+
+        Creates::
+
+            {output_dir}/
+                manifest.json      — metadata + chunk index
+                chunk_001.txt      — individual chunk content
+                chunk_002.txt
+                ...
 
         Args:
-            prompt: Prompt to send to LLM
+            chunks: List of chunk dicts (with content, start_line, end_line)
+            output_dir: Directory to create chunk files in
 
         Returns:
-            LLM response text
+            Path to ``manifest.json``.
         """
-        try:
-            from kg_extractor.utils.model_setup import get_llm_response
-            return get_llm_response(prompt, self.llm_provider, self.llm_model, temperature=0.3)
-        except Exception as e:
-            # Fallback: return empty response
-            print(f"Warning: Failed to get LLM response: {e}")
-            return '{"chunks": []}'
+        out = Path(output_dir)
+        out.mkdir(parents=True, exist_ok=True)
 
-    def _parse_llm_response(self, response: str, section_line_count: int) -> List[int]:
-        """Parse LLM response to extract chunk split-point line numbers.
-
-        Args:
-            response: LLM response text
-            section_line_count: Total lines in the section (for validation)
-
-        Returns:
-            Sorted list of 1-based relative line numbers where new chunks begin.
-            Always starts with 1.
-        """
-        return parse_chunk_splits_response(response, section_line_count)
-
-    def save_chunks(self, chunks: List[Dict[str, Any]], output_path: str) -> str:
-        """Save chunks to a JSON file with comprehensive metadata.
-
-        Args:
-            chunks: List of chunk dictionaries with chunk_id and content
-            output_path: Path to save the chunks
-
-        Returns:
-            Path to saved file
-        """
-        output_file = Path(output_path)
-        output_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Calculate chunk statistics
-        chunk_sizes = [len(chunk.get("content", "")) for chunk in chunks]
+        chunk_sizes = [len(c.get("content", "")) for c in chunks]
         avg_size = sum(chunk_sizes) / len(chunk_sizes) if chunk_sizes else 0
 
-        # Create output structure with comprehensive metadata
-        output_data = {
-            "source_file": str(output_file),
+        manifest: Dict[str, Any] = {
             "total_chunks": len(chunks),
             "processing_metadata": {
-                "method": "sliding_window",
+                "method": "line_range_sliding_window",
                 "chunk_granularity": self.chunk_granularity,
                 "llm_provider": self.llm_provider,
                 "llm_model": self.llm_model,
                 "context_limit": self.context_limit,
                 "context_overlap": self.CONTEXT_OVERLAP,
-                "max_retries": self.max_retries,
-                "fallback_enabled": self.enable_fallback,
-                "safety_margin": self.SAFETY_MARGIN,
             },
             "chunk_statistics": {
                 "total_characters": sum(chunk_sizes),
@@ -991,53 +418,109 @@ Return ONLY valid JSON, no markdown code blocks or extra text."""
                 "min_chunk_size": min(chunk_sizes) if chunk_sizes else 0,
                 "max_chunk_size": max(chunk_sizes) if chunk_sizes else 0,
             },
-            "chunks": chunks,
+            "chunks": [],
         }
 
-        # Save to file
-        try:
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(output_data, f, indent=2, ensure_ascii=False)
-            print(f"💾 Saved chunks to: {output_file}")
-        except Exception as e:
-            raise RuntimeError(f"Failed to save chunks: {e}")
+        for chunk in chunks:
+            chunk_filename = f"chunk_{chunk['chunk_id']:03d}.txt"
+            chunk_path = out / chunk_filename
+            with open(chunk_path, "w", encoding="utf-8") as f:
+                f.write(chunk["content"])
 
-        return str(output_file)
+            manifest["chunks"].append(
+                {
+                    "chunk_id": chunk["chunk_id"],
+                    "start_line": chunk.get("start_line"),
+                    "end_line": chunk.get("end_line"),
+                    "file": chunk_filename,
+                    "size": len(chunk.get("content", "")),
+                }
+            )
+
+        manifest_path = out / "manifest.json"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+        print(f"💾 Saved {len(chunks)} chunk files to: {out}")
+        return str(manifest_path)
+
+    # ── Utilities ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_content(content: str) -> str:
+        return content
+
+    def _fallback_chunking(
+        self, source_lines: List[str], file_path: str
+    ) -> List[Dict[str, Any]]:
+        """Fallback rule-based chunking by markdown headers."""
+        print("📋 Using rule-based fallback chunking...")
+
+        chunks: List[Dict[str, Any]] = []
+        current_lines: List[str] = []
+        chunk_id = 1
+        chunk_start = 0
+
+        for i, line in enumerate(source_lines):
+            if line.lstrip().startswith("#") and current_lines:
+                content = self._normalize_content(
+                    "".join(current_lines).strip()
+                )
+                if content:
+                    chunks.append(
+                        {
+                            "chunk_id": chunk_id,
+                            "content": content,
+                            "start_line": chunk_start + 1,
+                            "end_line": i,
+                        }
+                    )
+                    chunk_id += 1
+                current_lines = [line]
+                chunk_start = i
+            else:
+                current_lines.append(line)
+
+        if current_lines:
+            content = self._normalize_content(
+                "".join(current_lines).strip()
+            )
+            if content:
+                chunks.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "content": content,
+                        "start_line": chunk_start + 1,
+                        "end_line": len(source_lines),
+                    }
+                )
+
+        print(f"✅ Created {len(chunks)} chunks via fallback")
+        return chunks
+
+
+# ── Public entry point ──────────────────────────────────────────────────
 
 
 def chunk_markdown_file(
     file_path: str,
-    chunk_granularity: float = 0.5,
+    chunk_granularity: float = 0.1,
     llm_provider: str = CHUNKING_PROVIDER,
     llm_model: str = CHUNKING_MODEL,
     output_dir: str = None,
     max_retries: int = 3,
     enable_fallback: bool = True,
 ) -> str:
-    """Chunk a markdown file using LLM analysis with comprehensive error handling.
-
-    Args:
-        file_path: Path to the markdown file to chunk
-        chunk_granularity: Threshold for detecting topic changes (0.0-1.0)
-        llm_provider: LLM provider to use
-        llm_model: Model to use for LLM analysis
-        output_dir: Directory to save chunks (default: project root/output)
-        max_retries: Maximum number of retry attempts for API calls
-        enable_fallback: Enable fallback to simple chunking if LLM fails
+    """Chunk a markdown file into separate chunk files.
 
     Returns:
-        Path to saved chunks file
-
-    Raises:
-        FileNotFoundError: If file doesn't exist
-        ValueError: If document is too large and fallback is disabled
-        RuntimeError: If processing fails after all retries
+        Path to ``manifest.json`` inside the chunks directory.
     """
-    # Set default output directory to project root/output
     if output_dir is None:
-        output_dir = str(Path(__file__).parent.parent.parent.parent.parent.parent / "output")
+        output_dir = str(
+            Path(__file__).parent.parent.parent.parent.parent.parent / "output"
+        )
 
-    # Create chunker with enhanced configuration
     chunker = SemanticChunker(
         chunk_granularity=chunk_granularity,
         llm_provider=llm_provider,
@@ -1046,21 +529,21 @@ def chunk_markdown_file(
         enable_fallback=enable_fallback,
     )
 
-    # Chunk the file with comprehensive error handling
     try:
         chunks = chunker.chunk_markdown(file_path)
     except Exception as e:
         raise RuntimeError(f"Failed to chunk document: {e}")
 
-    # Generate output path
+    # Directory: output/{stem}_chunks/  (strip _analysis suffix from markdown stem)
     input_path = Path(file_path)
-    output_filename = f"{input_path.stem}_chunks.json"
-    output_path = Path(output_dir) / output_filename
+    stem = input_path.stem
+    if stem.endswith("_analysis"):
+        stem = stem[: -len("_analysis")]
+    chunks_dir = Path(output_dir) / f"{stem}_chunks"
 
-    # Save chunks
     try:
-        result_path = chunker.save_chunks(chunks, str(output_path))
+        manifest_path = chunker.save_chunks(chunks, str(chunks_dir))
     except Exception as e:
         raise RuntimeError(f"Failed to save chunks: {e}")
 
-    return result_path
+    return manifest_path

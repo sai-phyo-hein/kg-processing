@@ -5,7 +5,8 @@
   "vector_name": "evidence_quote",
   "vector_name_en": "evidence_quote_en",
   "vector_name_th": "evidence_quote_th",
-  "sparse_vector_name": "evidence_vector",
+  "sparse_vector_name_en": "evidence_vector_en",
+  "sparse_vector_name_th": "evidence_vector_th",
   "vector_config": {
     "datatype": "float32",
     "distance": "Cosine",

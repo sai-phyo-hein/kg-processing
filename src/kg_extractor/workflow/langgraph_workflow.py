@@ -150,7 +150,7 @@ def run_langgraph_workflow(
     input_file: str,
     provider: str = PARSING_PROVIDER,
     model: str = PARSING_MODEL,
-    chunk_granularity: float = 0.5,
+    chunk_granularity: float = 0.1,
     similarity_threshold: float = 0.95,
     chunking_llm_provider: str = CHUNKING_PROVIDER,
     chunking_llm_model: str = CHUNKING_MODEL,
@@ -366,7 +366,7 @@ def run_extract_metadata_only(
 
 def run_chunk_document_only(
     input_file: str,
-    chunk_granularity: float = 0.5,
+    chunk_granularity: float = 0.1,
     chunking_llm_provider: str = CHUNKING_PROVIDER,
     chunking_llm_model: str = CHUNKING_MODEL,
 ) -> Dict[str, Any]:
@@ -448,7 +448,7 @@ def run_extract_triples_only(
     """
     output_dir = str(Path(__file__).parent.parent.parent.parent / "output")
     stem = Path(input_file).stem
-    chunks_path = str(Path(output_dir) / f"{stem}_chunks.json")
+    chunks_path = str(Path(output_dir) / f"{stem}_chunks")
 
     state: WorkflowState = {
         "input_file": input_file,
