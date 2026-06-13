@@ -1478,18 +1478,17 @@ class TripleRefiner:
         th_embeddings = self._get_evidence_embeddings_batch(th_texts)
 
         # ── Compute sparse vectors ────────────────────────────────────────────
+        # FIX 4: Use only the natural-language evidence quote as the sparse
+        # document text.  Entity/predicate labels belong in the dense (semantic)
+        # space; the sparse (keyword) index must share token vocabulary with
+        # the natural-language queries issued at retrieval time.
         en_sparse: List[Dict[str, Any]] = []
         th_sparse: List[Dict[str, Any]] = []
         if sparse_vec_en:
             print(f"Computing sparse vectors ({sparse_vec_en}, {sparse_vec_th})...")
-            en_doc_texts = [
-                " ".join(sorted(r["entities"])) + " " + " ".join(sorted(r["predicates"])) + " " + (r["evidence_quote_en"] or "[no evidence]")
-                for r in records
-            ]
-            th_doc_texts = [
-                " ".join(sorted(r["entities"])) + " " + " ".join(sorted(r["predicates"])) + " " + (r["evidence_quote"] or "[no evidence]")
-                for r in records
-            ]
+            en_doc_texts = [r["evidence_quote_en"] or "[no evidence]" for r in records]
+            th_doc_texts = [r["evidence_quote"]    or "[no evidence]" for r in records]
+
             en_vocab  = self._build_vocab(en_doc_texts)
             th_vocab  = self._build_vocab(th_doc_texts)
             en_sparse = self._compute_sparse_tf_batch(en_doc_texts, en_vocab)

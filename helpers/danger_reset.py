@@ -191,13 +191,17 @@ class DangerReset:
             Success status
         """
         print("\n" + "=" * 60)
-        if collection_type:
+        if collection_type == "neo":
+            print("🚨 DANGER: NEO4J RESET 🚨")
+        elif collection_type:
             print(f"🚨 DANGER: QDRANT {collection_type.upper()} COLLECTION RESET 🚨")
         else:
             print("🚨 DANGER: DATABASE RESET 🚨")
         print("=" * 60)
         print("This will DELETE ALL DATA from:")
-        if collection_type:
+        if collection_type == "neo":
+            print(f"  - Neo4j: {self.neo4j_uri} (all nodes and relationships)")
+        elif collection_type:
             print(f"  - Qdrant: {self.qdrant_url} ({collection_type} collections only)")
         else:
             print(f"  - Qdrant: {self.qdrant_url} (points only, collections preserved)")
@@ -205,8 +209,20 @@ class DangerReset:
         print("=" * 60)
         print()
 
+        # Neo4j-only reset
+        if collection_type == "neo":
+            neo4j_success = self.reset_neo4j()
+            print()
+            print("=" * 60)
+            if neo4j_success:
+                print("✅ NEO4J RESET SUCCESSFULLY")
+            else:
+                print("⚠️  RESET COMPLETED WITH ERRORS")
+            print("=" * 60)
+            return neo4j_success
+
         qdrant_success = self.reset_qdrant(collection_type=collection_type)
-        
+
         # Only reset Neo4j if no specific collection type is specified
         neo4j_success = True
         if not collection_type:
@@ -240,9 +256,9 @@ def main():
     parser.add_argument(
         "--collection",
         type=str,
-        choices=["entity", "predicate", "label", "metadata", "evidence"],
-        help="Specific collection type to delete (entity, predicate, label, metadata, evidence). "
-             "If not specified, deletes all Qdrant collections and Neo4j data."
+        choices=["entity", "predicate", "label", "metadata", "evidence", "neo"],
+        help="Specific collection type to delete (entity, predicate, label, metadata, evidence, neo). "
+             "Use 'neo' to reset Neo4j only. If not specified, deletes all Qdrant collections and Neo4j data."
     )
     args = parser.parse_args()
 

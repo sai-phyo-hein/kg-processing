@@ -491,14 +491,20 @@ class QdrantToolsManager:
         embeddings = self._get_evidence_embeddings(query_texts)
 
         def _search_language(args: tuple):
-            """Run one (query_text, embedding, dense_name) search."""
+            """Run one (query_text, embedding, dense_name) search.
+
+            Returns (search_result, is_rrf) where is_rrf indicates whether the
+            result came from RRF fusion (True) or dense-only fallback (False).
+            RRF scores are rank-based and must not be filtered by a cosine
+            similarity threshold — only limit controls result count for RRF.
+            """
             query_text, embedding, dense_name = args
             suffix = "_en" if dense_name.endswith("_en") else "_th"
             sparse_name = sparse_map.get(suffix, "")
 
-            try:
-                # ── Hybrid: dense + sparse → RRF fusion ──────────────
-                if sparse_name:
+            # ── Attempt 1: Hybrid dense + sparse → RRF fusion ────────
+            if sparse_name:
+                try:
                     query_sparse = compute_query_sparse(query_text)
                     prefetch: list = [
                         qm.Prefetch(
@@ -518,28 +524,34 @@ class QdrantToolsManager:
                                 limit=limit * 4,
                             )
                         )
-                    return self.client.query_points(
+                    result = self.client.query_points(
                         collection_name=collection,
                         prefetch=prefetch,
                         query=qm.FusionQuery(fusion=qm.Fusion.RRF),
                         limit=limit,
                         with_payload=True,
                     )
-                else:
-                    raise ValueError("no sparse vector")
-            except Exception:
-                # ── Fallback: dense-only ─────────────────────────────
-                try:
-                    return self.client.query_points(
-                        collection_name=collection,
-                        query=embedding,
-                        using=dense_name,
-                        limit=limit,
-                        with_payload=True,
-                    )
-                except Exception as e:
-                    print(f"Warning: Evidence search failed for '{query_text}': {e}")
-                    return None
+                    return result, True  # is_rrf=True
+                except Exception as hybrid_err:
+                    # Hybrid failed — fall through to dense-only retry.
+                    print(f"[Evidence] Hybrid search failed for '{query_text}' "
+                          f"({dense_name}), retrying dense-only: {hybrid_err}")
+
+            # ── Attempt 2: Dense-only ─────────────────────────────────
+            # Reached when (a) no sparse name configured, or
+            # (b) the hybrid attempt above raised an exception.
+            try:
+                result = self.client.query_points(
+                    collection_name=collection,
+                    query=embedding,
+                    using=dense_name,
+                    limit=limit,
+                    with_payload=True,
+                )
+                return result, False  # is_rrf=False
+            except Exception as e:
+                print(f"Warning: Evidence search failed for '{query_text}': {e}")
+                return None, False
 
         # Build all (query_text, embedding, dense_name) tasks
         tasks = []
@@ -548,26 +560,32 @@ class QdrantToolsManager:
                 tasks.append((query_text, embedding, dense_name))
 
         # Run all language searches concurrently
-        all_results: List[tuple] = []  # (query_text, search_results)
+        all_results: List[tuple] = []  # (query_text, search_results, is_rrf)
         max_workers = min(len(tasks), 8) or 1
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            for task, result in zip(tasks, pool.map(_search_language, tasks)):
+            for task, (result, is_rrf) in zip(tasks, pool.map(_search_language, tasks)):
                 if result is not None:
-                    all_results.append((task[0], result))
+                    all_results.append((task[0], result, is_rrf))
 
-        # Deduplicate across languages per query text
+        # Deduplicate across languages per query text.
+        # RRF fusion scores are rank-based (typically 0.01–0.03) and must NOT
+        # be compared against the cosine-similarity threshold — doing so drops
+        # nearly every result. Dense-only scores are cosine similarities where
+        # the threshold is meaningful. Use limit to cap RRF result count instead.
         results_map: Dict[str, Dict[str, Any]] = {}  # query_text -> {seen, points_by_id}
-        for query_text, search_results in all_results:
+        for query_text, search_results, is_rrf in all_results:
             if query_text not in results_map:
                 results_map[query_text] = {"seen": {}, "points_by_id": {}}
             entry = results_map[query_text]
 
             for point in search_results.points:
-                if point.score >= threshold:
-                    pid = str(point.id)
-                    if pid not in entry["seen"] or point.score > entry["seen"][pid]:
-                        entry["seen"][pid] = point.score
-                        entry["points_by_id"][pid] = point
+                # Skip threshold for RRF — score is rank position, not similarity.
+                if not is_rrf and point.score < threshold:
+                    continue
+                pid = str(point.id)
+                if pid not in entry["seen"] or point.score > entry["seen"][pid]:
+                    entry["seen"][pid] = point.score
+                    entry["points_by_id"][pid] = point
 
         results = []
         for query_text, entry in results_map.items():

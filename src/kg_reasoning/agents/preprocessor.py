@@ -154,6 +154,10 @@ class PreProcessor:
                 "predicates": [f"{j}. {p}" for j, p in enumerate(predicates)],
                 "_raw_entities": entities,
                 "_raw_predicates": predicates,
+                # FIX 5: store community_id directly on each source so
+                # _restructure_by_indices can read it without positional
+                # indexing into the deduplicated community_ids list.
+                "_community_id": cid,
             }
             if cid and cid not in community_ids:
                 community_ids.append(cid)
@@ -245,13 +249,12 @@ class PreProcessor:
                 if 0 <= idx < len(raw_predicates):
                     predicate_set.add(raw_predicates[idx])
 
-            # Collect community_id for surviving sources
-            src_idx = int(source_key.split("_")[1])
-            # We need the original evidence community_id — stored per source
-            # We passed community_ids from _structure_sources but need per-source mapping
-            # Use the index to check if it's in range
-            if src_idx < len(community_ids):
-                surviving_communities.add(community_ids[src_idx])
+            # FIX 5: read community_id stored directly on the source dict —
+            # the old code used src_idx to index into the deduplicated
+            # community_ids list, which is positionally unrelated to source_N.
+            cid = source_data.get("_community_id")
+            if cid:
+                surviving_communities.add(cid)
 
         # If no source matched, keep all communities as fallback
         if not surviving_communities and community_ids:

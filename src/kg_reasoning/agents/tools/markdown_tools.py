@@ -32,6 +32,124 @@ class MarkdownToolsManager:
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Properties stripped before writing to markdown.
+    # Embedding vectors (~512 floats each) and sparse index arrays are the
+    # primary token-count offenders. A single triple with embeddings on
+    # subject, predicate, and object can exceed 3000 tokens. Raw/source
+    # text duplicates what the predicate name already conveys.
+    # Node properties kept for synthesis — everything else is dropped.
+    # canonical_id and name identify the entity; type describes what it is.
+    _KEEP_NODE_PROPS: frozenset = frozenset([
+        "name", "canonical_id", "type",
+    ])
+
+    # Relationship properties kept for synthesis.
+    # type_name carries the semantic relation; community_id scopes it to a
+    # village. Everything else (chunk_id, updated_at, status, label,
+    # embeddings, sparse arrays, source/raw text) is indexing metadata.
+    _KEEP_REL_PROPS: frozenset = frozenset([
+        "community_id",
+    ])
+
+    @staticmethod
+    def _slim_node(value: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract only name, canonical_id, type from a node."""
+        return {
+            k: v for k, v in value.get("properties", {}).items()
+            if k in MarkdownToolsManager._KEEP_NODE_PROPS
+        }
+
+    @staticmethod
+    def _slim_rel_type(value: Dict[str, Any]) -> str:
+        """Extract predicate name from a relationship."""
+        return value.get("type_name") or value.get("type", "")
+
+    @staticmethod
+    def _slim_rel_community(value: Dict[str, Any]) -> Optional[str]:
+        """Extract community_id from a relationship."""
+        return value.get("properties", {}).get("community_id")
+
+    @staticmethod
+    def _slim_path(value: Dict[str, Any]) -> Dict[str, Any]:
+        """Render a path as an ordered chain: [node, predicate, node, predicate, node, ...].
+
+        This preserves connectivity — the synthesizer can read the chain left-to-right
+        and know exactly which nodes are joined by which predicate, rather than
+        receiving two separate parallel arrays of nodes and relationships.
+        """
+        nodes = value.get("nodes", [])
+        rels  = value.get("relationships", [])
+        if not nodes:
+            return {"chain": []}
+        chain: List[Any] = [MarkdownToolsManager._slim_node(nodes[0])]
+        for i, rel in enumerate(rels):
+            chain.append(MarkdownToolsManager._slim_rel_type(rel))
+            if i + 1 < len(nodes):
+                chain.append(MarkdownToolsManager._slim_node(nodes[i + 1]))
+        community_ids = list({
+            MarkdownToolsManager._slim_rel_community(r)
+            for r in rels
+            if MarkdownToolsManager._slim_rel_community(r)
+        })
+        return {"chain": chain, "community_ids": community_ids}
+
+    @staticmethod
+    def _slim_value(value: Any) -> Any:
+        """Slim a single Neo4j value — used for non-triple row fields."""
+        if not isinstance(value, dict):
+            return value
+        node_type = value.get("type")
+        if node_type == "node":
+            return MarkdownToolsManager._slim_node(value)
+        if node_type == "relationship":
+            return {
+                "predicate":    MarkdownToolsManager._slim_rel_type(value),
+                "community_id": MarkdownToolsManager._slim_rel_community(value),
+            }
+        if node_type == "path":
+            return MarkdownToolsManager._slim_path(value)
+        return {k: MarkdownToolsManager._slim_value(v) for k, v in value.items()}
+
+    @classmethod
+    def _slim_result(cls, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Slim one raw Neo4j result row.
+
+        Detects the common subject/r/object triple shape and renders it as:
+          { subject: {name, canonical_id, type},
+            predicate: "REL_TYPE",
+            object: {name, canonical_id, type},
+            community_id: "..." }
+
+        Path rows (multi-hop expansion) are rendered as a chain list so
+        connectivity is explicit. The redundant "rels" column that
+        accompanies path results is dropped — it duplicates what the chain
+        already contains.
+
+        All other shapes are slimmed field-by-field.
+        """
+        subj = result.get("subject")
+        rel  = result.get("r")
+        obj  = result.get("object")
+        if (
+            subj and rel and obj
+            and isinstance(subj, dict) and subj.get("type") == "node"
+            and isinstance(rel,  dict) and rel.get("type")  == "relationship"
+            and isinstance(obj,  dict) and obj.get("type")  == "node"
+        ):
+            community_id = result.get("community_id") or cls._slim_rel_community(rel)
+            return {
+                "subject":      cls._slim_node(subj),
+                "predicate":    cls._slim_rel_type(rel),
+                "object":       cls._slim_node(obj),
+                "community_id": community_id,
+            }
+        # Path rows: keep only the path key (rendered as a chain), drop "rels"
+        # which is the raw relationships(path) column and duplicates the chain.
+        if "path" in result or "p" in result:
+            path_key = "path" if "path" in result else "p"
+            return {path_key: cls._slim_value(result[path_key])}
+        return {k: cls._slim_value(v) for k, v in result.items()}
+
     def write_query_results(
         self,
         strategy_name: str,
@@ -41,10 +159,16 @@ class MarkdownToolsManager:
     ) -> str:
         """Write query results to a markdown file.
 
+        Raw Neo4j results are slimmed before writing: embedding vectors, sparse
+        index arrays, raw source text, and internal integer IDs are stripped.
+        This keeps each result row to fields that matter for synthesis
+        (names, canonical_ids, labels, predicate type, community_id) and avoids
+        exhausting the synthesizer context window.
+
         Args:
             strategy_name: Name of the query strategy
             query: The Cypher query executed
-            results: List of query results
+            results: List of query results (raw from Neo4j)
             metadata: Optional metadata about the query
 
         Returns:
@@ -80,8 +204,8 @@ class MarkdownToolsManager:
             lines.append("### Error\n")
             lines.append(f"```\n{results[0]['error']}\n```\n")
         else:
-            # Format results as tables or JSON based on structure
-            for i, result in enumerate(results, 1):
+            slimmed = [self._slim_result(r) for r in results]
+            for i, result in enumerate(slimmed, 1):
                 lines.append(f"### Result {i}\n")
                 lines.append("```json")
                 lines.append(json.dumps(result, indent=2, ensure_ascii=False))
