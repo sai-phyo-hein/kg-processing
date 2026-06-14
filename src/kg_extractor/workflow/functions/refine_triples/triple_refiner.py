@@ -110,13 +110,16 @@ DEFAULT_UPSERT_CHUNK_SIZE = 50
 # ---------------------------------------------------------------------------
 ENTITY_RESOLUTION_SYSTEM_PROMPT = """You are an expert in entity resolution and knowledge graph curation.
 
-You will receive a JSON array of entity pairs, each with an "id" and two entity descriptions.
+You will receive a JSON array of pairs, each with an "id" and two entity descriptions:
+  "A" — the existing canonical entity (old)
+  "B" — the incoming entity (new)
+
 For EVERY pair, decide:
 
-**Step 1 – Identity check:** Do both names refer to the *same real-world concept*?
-Set "are_same_entity": true ONLY when they are aliases, abbreviations, or surface variants of
-the same thing.  If one is a sub-component, related metric, or distinct concept of the other,
-set it to false.
+**Step 1 – Identity check:** Do A and B refer to the *same real-world concept*?
+Set "same": true ONLY when they are aliases, abbreviations, or surface variants of the same
+thing.  If one is a sub-component, related metric, or distinct concept of the other, set it
+to false.
 
 **Disambiguation rules — apply strictly:**
 
@@ -133,40 +136,44 @@ set it to false.
 4. **Entity ≠ process involving that entity.** A thing and the activity or method that
    operates on it are distinct concepts.
 
-When in doubt, default to "are_same_entity": false. Merging distinct entities is worse than
-having separate entries that happen to be related.
+When in doubt, default to "same": false. Merging distinct entities is worse than having
+separate entries that happen to be related.
 
-**Step 2 – Canonical selection (only when are_same_entity is true):** Which form should be
-canonical? The existing canonical keeps its status UNLESS the incoming entity is clearly
-superior (more specific name, better evidence, more complete information).
+**Step 2 – Canonical selection (only when "same" is true):** Which form should be canonical —
+"A" (keep the existing) or "B" (promote the incoming)? Keep "A" UNLESS "B" is clearly superior
+(more specific name, better evidence, more complete information). When "same" is false, "canon"
+must be "B".
 
 Return a JSON array — one object per input pair, in the same order, each with:
-  { "id": <same id from input>, "are_same_entity": bool, "new_is_canonical": bool, "reasoning": "brief" }
+  { "id": <same id from input>, "same": bool, "canon": "A" | "B" }
 
 Rules:
-- If "are_same_entity" is false → set "new_is_canonical": true.
-- If "are_same_entity" is true  → set "new_is_canonical" based on which form is superior.
+- "same" is false → "canon": "B".
+- "same" is true  → "canon": "A" or "B" based on which form is superior.
 - Output ONLY the JSON array.  No prose before or after it."""
 
 PREDICATE_RESOLUTION_SYSTEM_PROMPT = """You are an expert in knowledge graph schema design and relationship normalisation.
 
-You will receive a JSON array of predicate pairs, each with an "id" and two predicate strings.
+You will receive a JSON array of pairs, each with an "id" and two predicate strings:
+  "A" — the existing canonical predicate (old)
+  "B" — the incoming predicate (new)
+
 For EVERY pair, decide:
 
-**Step 1 – Semantic equivalence:** Do the two predicates express the *same relationship type*?
+**Step 1 – Semantic equivalence:** Do A and B express the *same relationship type*?
 Synonyms and near-synonyms count as equivalent ("increase"/"grow"/"rise" are equivalent;
 "increase" and "decrease" are NOT, even though they are related).
 
-**Step 2 – Canonical form (only when equivalent):** Choose the most standard, concise,
-domain-neutral English verb form in ALL_CAPS_SNAKE_CASE.
+**Step 2 – Canonical selection (only when equivalent):** Which form should be canonical —
+"A" (keep the existing) or "B" (promote the incoming)? Keep "A" UNLESS "B" is clearly more
+standard or concise. When not equivalent, "canon" must be "B".
 
 Return a JSON array — one object per input pair, in the same order, each with:
-  { "id": <same id from input>, "are_equivalent": bool, "new_is_canonical": bool,
-    "canonical_form": "chosen string", "reasoning": "brief" }
+  { "id": <same id from input>, "same": bool, "canon": "A" | "B" }
 
 Rules:
-- If "are_equivalent" is false → "new_is_canonical": true, "canonical_form": incoming predicate.
-- If "are_equivalent" is true  → "new_is_canonical" based on which form is superior.
+- "same" is false → "canon": "B".
+- "same" is true  → "canon": "A" or "B" based on which form is superior.
 - Output ONLY the JSON array.  No prose before or after it."""
 
 
@@ -747,43 +754,53 @@ class TripleRefiner:
             return '{"canonical": null, "canonical_id": null, "synonyms": [], "reasoning": "LLM error"}'
 
     def _parse_entity_decision(self, response: str) -> Dict[str, Any]:
+        """Parse {id, same, canon} into the internal decision fields.
+
+        Mapping (A = existing canonical, B = incoming):
+          same=false            → B is a new canonical; A untouched.        new_is_canonical=True
+          same=true, canon="A"  → alias: A stays canonical, B points to A.  new_is_canonical=False
+          same=true, canon="B"  → replace: promote B, demote A.            new_is_canonical=True
+        """
         try:
-            data     = parse_json_with_repair(response)
+            data  = parse_json_with_repair(response)
             if not data:
                 raise ValueError("empty parse")
-            are_same = bool(data.get("are_same_entity", True))
+            same  = bool(data.get("same", data.get("are_same_entity", False)))
+            canon = str(data.get("canon", "A")).strip().upper()
+            new_is_canonical = True if not same else canon == "B"
             return {
-                "are_same_entity":  are_same,
-                "new_is_canonical": bool(data.get("new_is_canonical", False)) if are_same else True,
-                "reasoning":        data.get("reasoning", ""),
+                "are_same_entity":  same,
+                "new_is_canonical": new_is_canonical,
             }
         except Exception as e:
             print(f"Warning: Failed to parse entity decision: {e}")
-            # R1 fix: default to "different entity" on parse failure.
-            # The system prompt states "when in doubt, default to are_same_entity: false";
-            # merging unrelated entities is worse than keeping spurious duplicates.
-            return {"are_same_entity": False, "new_is_canonical": True, "reasoning": "parse error — treated as new entity"}
+            # Default to "different entity": treat B as a new canonical.
+            return {"are_same_entity": False, "new_is_canonical": True}
 
     def _parse_predicate_decision(self, response: str, fallback_name: str) -> Dict[str, Any]:
+        """Parse {id, same, canon} for predicates (same mapping as entities).
+
+        canonical_form is the incoming (B) predicate; it is only consumed when B wins
+        (canon="B", replace branch). When A wins, the existing predicate is used instead.
+        """
         try:
-            data     = parse_json_with_repair(response)
+            data  = parse_json_with_repair(response)
             if not data:
                 raise ValueError("empty parse")
-            are_eq   = bool(data.get("are_equivalent", True))
+            same  = bool(data.get("same", data.get("are_equivalent", False)))
+            canon = str(data.get("canon", "A")).strip().upper()
+            new_is_canonical = True if not same else canon == "B"
             return {
-                "are_equivalent":   are_eq,
-                "new_is_canonical": bool(data.get("new_is_canonical", False)) if are_eq else True,
-                "canonical_form":   data.get("canonical_form", fallback_name),
-                "reasoning":        data.get("reasoning", ""),
+                "are_equivalent":   same,
+                "new_is_canonical": new_is_canonical,
+                "canonical_form":   fallback_name,
             }
         except Exception as e:
             print(f"Warning: Failed to parse predicate decision: {e}")
-            # R1 fix: default to "different predicate" on parse failure.
             return {
                 "are_equivalent":   False,
                 "new_is_canonical": True,
                 "canonical_form":   fallback_name,
-                "reasoning":        "parse error — treated as new predicate",
             }
 
     def _run_llm_batch(
@@ -878,13 +895,11 @@ class TripleRefiner:
                                 "are_equivalent":   False,
                                 "new_is_canonical": True,
                                 "canonical_form":   entity.get("name_en") or entity["name"],
-                                "reasoning":        "LLM chunk error — treated as new predicate",
                             }
                             if is_predicate
                             else {
                                 "are_same_entity":  False,
                                 "new_is_canonical": True,
-                                "reasoning":        "LLM chunk error — treated as new entity",
                             }
                         )
 
@@ -899,7 +914,11 @@ class TripleRefiner:
         items: List[Dict[str, Any]],
         entity_type: str,
     ) -> str:
-        """Build a single user message containing all entity pairs as a JSON array."""
+        """Build a single user message containing all entity pairs as a JSON array.
+
+        Each pair is labelled "A" (existing/old canonical) and "B" (incoming/new),
+        matching the LLM output contract {id, same, canon: A | B}.
+        """
         payload = []
         for item in items:
             entity      = item["entity"]
@@ -908,7 +927,7 @@ class TripleRefiner:
             payload.append({
                 "id": item["id"],
                 "entity_type": entity_type,
-                "existing": {
+                "A": {
                     "name":       old_payload.get("name", ""),
                     "name_en":    old_payload.get("name_en"),
                     "label":      old_payload.get("label") or old_payload.get("type", ""),
@@ -916,7 +935,7 @@ class TripleRefiner:
                     "id":         canonical.get("id"),
                     "score":      round(canonical.get("score", 0.0), 3),
                 },
-                "incoming": {
+                "B": {
                     "name":       entity.get("name", ""),
                     "name_en":    entity.get("name_en"),
                     "label":      entity.get("label", ""),
@@ -926,7 +945,10 @@ class TripleRefiner:
         return json.dumps(payload, ensure_ascii=False)
 
     def _make_predicate_batch_message(self, items: List[Dict[str, Any]]) -> str:
-        """Build a single user message containing all predicate pairs as a JSON array."""
+        """Build a single user message containing all predicate pairs as a JSON array.
+
+        Each pair is labelled "A" (existing/old) and "B" (incoming/new).
+        """
         payload = []
         for item in items:
             entity      = item["entity"]
@@ -934,13 +956,13 @@ class TripleRefiner:
             old_payload = canonical.get("payload", {})
             payload.append({
                 "id": item["id"],
-                "existing": {
+                "A": {
                     "predicate":    old_payload.get("name_en") or old_payload.get("name", ""),
                     "predicate_raw": old_payload.get("name", ""),
                     "id":           canonical.get("id"),
                     "score":        round(canonical.get("score", 0.0), 3),
                 },
-                "incoming": {
+                "B": {
                     "predicate":    entity.get("name_en") or entity["name"],
                     "predicate_raw": entity["name"],
                 },
@@ -1269,7 +1291,6 @@ class TripleRefiner:
                     "old_canonical_name": old_payload.get("name"),
                     "new_canonical_id":   new_id,
                     "new_canonical_name": entity["name"],
-                    "reasoning":          decision.get("reasoning", ""),
                 })
                 entity_cache[self._cache_key(collection_name, entity, is_predicate)] = (
                     self._make_cache_entry(
