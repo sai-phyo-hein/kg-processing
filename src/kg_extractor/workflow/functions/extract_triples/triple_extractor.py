@@ -1,20 +1,23 @@
 """Triplet extraction module for knowledge graph construction."""
 
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from hashlib import md5
 
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-from kg_extractor.utils.model_setup import TRIPLET_PROVIDER, TRIPLET_MODEL, get_reasoning_llm
+from kg_extractor.utils.model_setup import TRIPLET_PROVIDER, TRIPLET_MODEL, TRANSLATION_MODEL, get_reasoning_llm
 from kg_extractor.utils.prompts import (
     TRIPLE_EXTRACTION_SYSTEM_PROMPT,
+    TRANSLATION_SYSTEM_PROMPT,
     create_triple_extraction_user_message,
+    create_translation_user_message,
 )
 from kg_extractor.utils.llm_response_parser import parse_triple_extraction_response
 from kg_extractor.workflow.functions.chunk_document.semantic_chunker import SemanticChunker
@@ -29,18 +32,25 @@ except ImportError:
 
 class TripleExtractor:
     """Extract knowledge graph triples from text chunks using LLM analysis.
-    
+
     Consumes chunks produced by SemanticChunker:
     {
         "chunk_id": int,
         "content": str
     }
+
+    Thread safety
+    -------------
+    Each call to _get_llm_response builds a fresh [SystemMessage, HumanMessage]
+    list and invokes the LLM with no shared mutable state.  It is therefore safe
+    to call from multiple threads simultaneously (E1 fix).
     """
 
     def __init__(
         self,
         llm_provider: str = TRIPLET_PROVIDER,
         llm_model: str = TRIPLET_MODEL,
+        translation_model: str = TRANSLATION_MODEL,
         batch_size: int = 1,
         max_workers: int = 20,
     ):
@@ -54,35 +64,39 @@ class TripleExtractor:
         """
         self.llm_provider = llm_provider
         self.llm_model = llm_model
+        self.translation_model = translation_model
         self.batch_size = max(1, batch_size)
         self.max_workers = max(1, max_workers)
-        self._response_cache = {}  # Cache for identical chunks
-        
-        # Initialize stateful agent with persistent system prompt
-        self._init_stateful_agent()
 
-    def _init_stateful_agent(self):
-        """Initialize stateful agent with persistent system prompt.
-        
-        The triple extraction agent maintains the system prompt between calls.
-        User messages (chunk content) are cleared after each response.
-        """
-        from langchain_core.messages import SystemMessage
-        from langchain_core.chat_history import InMemoryChatMessageHistory
-        
-        # Create LLM instance and history
-        # Use high max_tokens for triple extraction: 40-50 triples with long evidence quotes
-        # can easily require many tokens in Thai (which uses more tokens per character)
-        # Claude Sonnet 4.6 supports up to 128K output tokens
-        self.extraction_agent = {
-            'llm': get_reasoning_llm(model=self.llm_model, temperature=0.3, max_tokens=64000),
-            'history': InMemoryChatMessageHistory()
-        }
-        
-        # Add persistent system message
-        self.extraction_agent['history'].add_message(
-            SystemMessage(content=TRIPLE_EXTRACTION_SYSTEM_PROMPT)
+        # E1 fix: single shared LLM instance (stateless — no chat history).
+        # max_tokens=24000: sized to match the 80-triple hard cap in the prompt.
+        # At ~205 tokens/triple (Thai JSON, no _en fields) + 80 wrapper:
+        #   80 triples × 205 + 80 = 16,480 tokens → 24,000 gives 45% headroom.
+        # The prompt enforces the 80-triple cap; max_tokens is a safety net
+        # against prompt non-compliance, not the effective limit.
+        self._llm = get_reasoning_llm(model=self.llm_model, temperature=0.3, max_tokens=24000)
+
+        # Separate cheap model for Thai→English translation.
+        # All _en fields generated here, NOT by the expensive extraction model.
+        # Per-triple output budget:
+        #   names × 3 (~15 tokens) + predicate (~5) + attributes (~20)
+        #   + evidence_quote_en (~200 tokens for a typical Thai paragraph)
+        #   + JSON structure overhead (~30 tokens)
+        #   = ~270 tokens realistic worst case → 1024 gives safe 4× headroom.
+        # (512 caused truncation on long evidence quotes.)
+        self._translation_llm = get_reasoning_llm(
+            model=self.translation_model,
+            temperature=0.1,
+            max_tokens=1024,
         )
+
+        # Rate-limit guard for translation calls.
+        # claude-3-haiku's RPM limit means we cannot fire hundreds of calls at once.
+        # This semaphore caps the number of in-flight translation requests across ALL
+        # concurrent chunk threads.  Adjust translation_max_concurrent to stay under
+        # your tier's RPM limit (e.g. 50 concurrent ≈ ~200 RPM at ~0.25s per call).
+        translation_max_concurrent = 50
+        self._translation_semaphore = threading.Semaphore(translation_max_concurrent)
 
     def extract_triples_from_chunks(
         self,
@@ -177,6 +191,15 @@ class TripleExtractor:
         triples = parsed_data.get("discovered_triples", [])
         triples = self._resolve_evidence_lines(triples, original_lines)
 
+        # Post-process: add all _en fields via cheap translation model.
+        # Only runs when the detected language is Thai (th / mixed-th).
+        detected_lang = parsed_data.get("document_metadata", {}).get("detected_language", "en")
+        # Translate for any detected language that contains Thai script.
+        # "mixed-en" chunks (Thai tables with "not specified" English values)
+        # still have Thai entity names that need _en fields.
+        if detected_lang in ("th", "mixed-th", "mixed-en"):
+            triples = self._translate_chunk_triples(triples)
+
         return {
             "chunk_id": chunk_id,
             "document_metadata": parsed_data.get("document_metadata", {}),
@@ -184,10 +207,11 @@ class TripleExtractor:
         }
 
     def _get_llm_response(self, user_message: str) -> str:
-        """Get response from stateful agent with persistent system prompt.
-        
-        The system prompt persists in the agent's history.
-        User messages are added, processed, then cleared after each call.
+        """Thread-safe LLM call.
+
+        Builds a fresh [SystemMessage, HumanMessage] list on every call so
+        multiple threads can invoke this simultaneously without any shared
+        mutable state (E1 fix — no InMemoryChatMessageHistory).
 
         Args:
             user_message: User-specific content (source + chunk text)
@@ -195,33 +219,211 @@ class TripleExtractor:
         Returns:
             LLM response text
         """
+        from langchain_core.messages import HumanMessage, SystemMessage
+
         try:
-            # Get the agent
-            agent = self.extraction_agent
-            
-            # Add user message to agent's history (system message already persists)
-            agent['history'].add_user_message(user_message)
-            
-            # Get all messages (system + user)
-            messages = agent['history'].messages
-            
-            # Invoke the agent's LLM
-            response = agent['llm'].invoke(messages)
-            
-            # Clear user message to prevent accumulation (keep only system message)
-            while len(agent['history'].messages) > 1:  # Keep only the first message (system)
-                agent['history'].messages.pop()
-            
+            messages = [
+                SystemMessage(content=TRIPLE_EXTRACTION_SYSTEM_PROMPT),
+                HumanMessage(content=user_message),
+            ]
+            response = self._llm.invoke(messages)
             return response.content
 
         except Exception as e:
-            # Fallback: return empty response
             print(f"Warning: Failed to get LLM response: {e}")
             return '{"document_metadata": {"reference_date": null, "source_id": null, "chunk_id": null}, "discovered_triples": []}'
 
     def _parse_llm_response(self, response: str) -> Dict[str, Any]:
         """Parse LLM response to extract triples and metadata."""
         return parse_triple_extraction_response(response)
+
+    def _get_translation_response(self, user_message: str) -> str:
+        """Thread-safe translation call using the cheap Haiku model.
+
+        Acquires the shared semaphore before calling the API so the total number
+        of in-flight translation requests stays within the model's RPM limit.
+        Retries up to 5 times with exponential backoff on rate-limit (429) errors.
+
+        Args:
+            user_message: JSON array of translation items (from
+                create_translation_user_message).
+
+        Returns:
+            Raw LLM response text (expected to be a JSON array).
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        messages = [
+            SystemMessage(content=TRANSLATION_SYSTEM_PROMPT),
+            HumanMessage(content=user_message),
+        ]
+
+        max_attempts = 5
+        wait = 5.0  # seconds before first retry
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with self._translation_semaphore:
+                    response = self._translation_llm.invoke(messages)
+                return response.content
+
+            except Exception as e:
+                err = str(e).lower()
+                is_rate_limit = "429" in err or "rate limit" in err or "rate_limit" in err or "too many" in err
+
+                if is_rate_limit and attempt < max_attempts:
+                    print(f"Warning: Translation rate-limited (attempt {attempt}/{max_attempts}), "
+                          f"retrying in {wait:.0f}s...")
+                    time.sleep(wait)
+                    wait = min(wait * 2, 60)  # exponential backoff, cap at 60s
+                else:
+                    if not is_rate_limit:
+                        print(f"Warning: Failed to get translation response: {e}")
+                    else:
+                        print(f"Warning: Translation rate-limited after {max_attempts} attempts, skipping.")
+                    return "[]"
+
+        return "[]"
+
+    def _translate_single_triple(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        """Translate one triple's Thai fields via a single cheap Haiku call.
+
+        Each call is tiny (~30-50 output tokens for names/predicate/attributes
+        plus ~100-200 for evidence_quote_en), well within claude-3-haiku's
+        4,096 token output limit.
+
+        Args:
+            item: Dict with id + Thai fields (subject_th, predicate_th, etc.)
+
+        Returns:
+            Dict with id + translated _en fields, or just {"id": item["id"]}
+            on failure so the caller can skip gracefully.
+        """
+        import re as _re
+
+        user_message = create_translation_user_message([item])
+        raw_response = self._get_translation_response(user_message)
+
+        try:
+            text = raw_response.strip()
+            # Strip markdown fences if present
+            text = _re.sub(r"^```[a-z]*\n?", "", text)
+            text = _re.sub(r"\n?```$", "", text.strip())
+
+            # Repair: Haiku sometimes outputs ALL_CAPS_SNAKE_CASE predicate values
+            # without quotes — e.g.  "predicate_en": HAS_DETAILS
+            # Fix by quoting any unquoted ALL_CAPS_SNAKE_CASE value after a colon.
+            text = _re.sub(
+                r':\s*([A-Z][A-Z0-9_]{2,})(\s*[,}\]])',
+                r': "\1"\2',
+                text,
+            )
+
+            parsed = json.loads(text)
+            if isinstance(parsed, list) and parsed:
+                return parsed[0]
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as e:
+            print(f"Warning: Failed to parse translation for triple id={item.get('id')}: {e}")
+            print(f"  Raw response (first 300 chars): {repr(raw_response[:300])}")
+        return {"id": item.get("id")}
+
+    def _translate_chunk_triples(self, triples: list) -> list:
+        """Translate all Thai fields in a chunk's triples.
+
+        Fires one Haiku call per triple, all concurrently via ThreadPoolExecutor
+        (reusing the same max_workers as extraction).  Per-triple calls are tiny
+        (~50-200 output tokens each), so claude-3-haiku's 4,096 token output
+        limit is never approached.
+
+        Maps the returned _en values back onto each triple so the output
+        structure matches the original schema:
+            subject.name_en, subject.attributes_en
+            predicate_en
+            object.name_en, object.attributes_en
+            relationship_attributes_en
+            properties.evidence_quote_en
+
+        Args:
+            triples: List of triple dicts (Thai names, no _en fields yet).
+
+        Returns:
+            The same triples list with _en fields populated on every triple.
+        """
+        if not triples:
+            return triples
+
+        def _sanitize(text: str) -> str:
+            """Replace literal newlines/tabs so JSON stays valid."""
+            return text.replace("\n", " ").replace("\r", " ").replace("\t", " ").strip()
+
+        # Build one item per triple
+        items = []
+        for idx, triple in enumerate(triples):
+            subj  = triple.get("subject", {})
+            obj   = triple.get("object",  {})
+            props = triple.get("properties", {})
+
+            item: Dict[str, Any] = {
+                "id":           idx,
+                "subject_th":   _sanitize(subj.get("name", "")),
+                "predicate_th": _sanitize(triple.get("predicate", "")),
+                "object_th":    _sanitize(obj.get("name", "")),
+            }
+            if subj.get("attributes"):
+                item["attributes_th"] = {k: _sanitize(str(v)) for k, v in subj["attributes"].items()}
+            if obj.get("attributes"):
+                item["obj_attributes_th"] = {k: _sanitize(str(v)) for k, v in obj["attributes"].items()}
+            if triple.get("relationship_attributes"):
+                item["rel_attrs_th"] = {k: _sanitize(str(v)) for k, v in triple["relationship_attributes"].items()}
+            if props.get("evidence_quote"):
+                item["evidence_quote_th"] = _sanitize(props["evidence_quote"])
+
+            items.append(item)
+
+        # Fire all translation calls concurrently — one per triple
+        translations: Dict[int, Dict[str, Any]] = {}
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_id = {
+                executor.submit(self._translate_single_triple, item): item["id"]
+                for item in items
+            }
+            for future in as_completed(future_to_id):
+                try:
+                    result = future.result()
+                    if result and "id" in result:
+                        translations[int(result["id"])] = result
+                except Exception as e:
+                    triple_id = future_to_id[future]
+                    print(f"Warning: Translation failed for triple id={triple_id}: {e}")
+
+        # Map translations back onto triples
+        for idx, triple in enumerate(triples):
+            t = translations.get(idx, {})
+            if not t:
+                continue
+
+            subj  = triple.setdefault("subject", {})
+            obj   = triple.setdefault("object",  {})
+            props = triple.setdefault("properties", {})
+
+            if t.get("subject_en"):
+                subj["name_en"] = t["subject_en"]
+            if t.get("attributes_en"):
+                subj["attributes_en"] = t["attributes_en"]
+            if t.get("predicate_en"):
+                triple["predicate_en"] = t["predicate_en"]
+            if t.get("object_en"):
+                obj["name_en"] = t["object_en"]
+            if t.get("obj_attributes_en"):
+                obj["attributes_en"] = t["obj_attributes_en"]
+            if t.get("rel_attrs_en"):
+                triple["relationship_attributes_en"] = t["rel_attrs_en"]
+            if t.get("evidence_quote_en"):
+                props["evidence_quote_en"] = t["evidence_quote_en"]
+
+        return triples
 
     @staticmethod
     def _number_chunk_content(content: str) -> tuple:
@@ -243,10 +445,11 @@ class TripleExtractor:
         """Replace evidence_lines with evidence_quote from source text.
 
         For each triple that has evidence_lines in properties:
-        1. Extract lines from original_lines using start/end (1-based, inclusive).
-        2. Join them into evidence_quote.
-        3. Remove evidence_lines from properties.
-        4. Keep evidence_quote_en as-is (provided by LLM for Thai sources).
+        1. Enforce the minimum 3-line span required by the extraction prompt (E2 fix).
+        2. Extract lines from original_lines using start/end (1-based, inclusive).
+        3. Join them into evidence_quote.
+        4. Remove evidence_lines from properties.
+        5. Keep evidence_quote_en as-is (provided by LLM for Thai sources).
 
         Args:
             triples: List of triple dicts from LLM response.
@@ -255,6 +458,8 @@ class TripleExtractor:
         Returns:
             The same triples list with evidence_quote populated.
         """
+        MIN_SPAN = 3  # mirrors the prompt's MINIMUM requirement
+
         n_lines = len(original_lines)
         for triple in triples:
             props = triple.get("properties", {})
@@ -262,11 +467,15 @@ class TripleExtractor:
 
             if evidence_lines and isinstance(evidence_lines, dict):
                 start = int(evidence_lines.get("start", 1))
-                end = int(evidence_lines.get("end", start))
+                end   = int(evidence_lines.get("end", start))
+
+                # E2: enforce minimum span before clamping
+                if (end - start + 1) < MIN_SPAN:
+                    end = start + MIN_SPAN - 1
 
                 # Clamp to valid range (1-based, inclusive)
                 start = max(1, min(start, n_lines))
-                end = max(start, min(end, n_lines))
+                end   = max(start, min(end, n_lines))
 
                 # Extract text (convert 1-based to 0-based index)
                 extracted = original_lines[start - 1:end]
@@ -298,34 +507,30 @@ class TripleExtractor:
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Update triples in chunks and flatten all triples
-        all_triples = []
+        # Stamp each triple with chunk_id and optional community_id.
+        # E3 fix: the redundant top-level all_triples flat list has been removed.
+        # The refiner (and all downstream consumers) read from chunks[].triples,
+        # so the flat list provided no value and roughly doubled the file size.
+        total_triples = 0
         for result in triple_results:
             chunk_id = result["chunk_id"]
             for triple in result.get("triples", []):
-                # Add chunk_id to each triple for backward compatibility
                 triple["chunk_id"] = chunk_id
-
-                # Add community_id to properties if provided
                 if community_id:
                     if "properties" not in triple:
                         triple["properties"] = {}
                     triple["properties"]["community_id"] = community_id
+                total_triples += 1
 
-                all_triples.append(triple)
-
-        # Create output structure
         output_data = {
-            "source_file": str(output_file),
-            "total_chunks": len(triple_results),
-            "total_triples": len(all_triples),
-            "llm_provider": self.llm_provider,
-            "llm_model": self.llm_model,
-            "chunks": triple_results,
-            "all_triples": all_triples,
+            "source_file":   str(output_file),
+            "total_chunks":  len(triple_results),
+            "total_triples": total_triples,
+            "llm_provider":  self.llm_provider,
+            "llm_model":     self.llm_model,
+            "chunks":        triple_results,
         }
 
-        # Save to file
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
 

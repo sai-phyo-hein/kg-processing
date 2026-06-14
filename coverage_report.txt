@@ -1,0 +1,1152 @@
+
+======================================================================
+CHUNK 1
+======================================================================
+Chunk size:    161 words, 2802 chars
+Lines:         1–42
+File:          chunk_001.txt
+Triples:       88
+Evidence:      88 quotes (74 duplicates)
+  Unique:      14 quotes, 449 words, 8220 chars
+Coverage:      293.4%
+
+Evidence quote lengths (chars):
+  1. 1164 chars
+  2. 908 chars
+  3. 719 chars
+  4. 700 chars
+  5. 641 chars
+  ... and 9 more
+
+======================================================================
+CHUNK 2
+======================================================================
+Chunk size:    235 words, 3310 chars
+Lines:         43–86
+File:          chunk_002.txt
+Triples:       91
+Evidence:      91 quotes (67 duplicates)
+  Unique:      24 quotes, 924 words, 10623 chars
+Coverage:      320.9%
+
+Evidence quote lengths (chars):
+  1. 683 chars
+  2. 681 chars
+  3. 676 chars
+  4. 676 chars
+  5. 676 chars
+  ... and 19 more
+
+======================================================================
+CHUNK 3
+======================================================================
+Chunk size:    294 words, 5121 chars
+Lines:         87–149
+File:          chunk_003.txt
+Triples:       119
+Evidence:      119 quotes (82 duplicates)
+  Unique:      37 quotes, 1165 words, 20841 chars
+Coverage:      407.0%
+
+Evidence quote lengths (chars):
+  1. 1369 chars
+  2. 1306 chars
+  3. 1258 chars
+  4. 1190 chars
+  5. 1108 chars
+  ... and 32 more
+
+======================================================================
+CHUNK 4
+======================================================================
+Chunk size:    151 words, 3114 chars
+Lines:         150–185
+File:          chunk_004.txt
+Triples:       81
+Evidence:      81 quotes (69 duplicates)
+  Unique:      12 quotes, 378 words, 8167 chars
+Coverage:      262.3%
+
+Evidence quote lengths (chars):
+  1. 1407 chars
+  2. 769 chars
+  3. 745 chars
+  4. 740 chars
+  5. 735 chars
+  ... and 7 more
+
+======================================================================
+CHUNK 5
+======================================================================
+Chunk size:    232 words, 4849 chars
+Lines:         186–256
+File:          chunk_005.txt
+Triples:       137
+Evidence:      137 quotes (112 duplicates)
+  Unique:      25 quotes, 309 words, 5966 chars
+Coverage:      123.0%
+
+Evidence quote lengths (chars):
+  1. 337 chars
+  2. 333 chars
+  3. 332 chars
+  4. 331 chars
+  5. 326 chars
+  ... and 20 more
+
+======================================================================
+CHUNK 6
+======================================================================
+Chunk size:    232 words, 6186 chars
+Lines:         257–331
+File:          chunk_006.txt
+Triples:       115
+Evidence:      115 quotes (103 duplicates)
+  Unique:      12 quotes, 538 words, 16375 chars
+Coverage:      264.7%
+
+Evidence quote lengths (chars):
+  1. 2461 chars
+  2. 2094 chars
+  3. 1841 chars
+  4. 1589 chars
+  5. 1363 chars
+  ... and 7 more
+
+======================================================================
+CHUNK 7
+======================================================================
+Chunk size:    159 words, 2049 chars
+Lines:         332–356
+File:          chunk_007.txt
+Triples:       67
+Evidence:      67 quotes (57 duplicates)
+  Unique:      10 quotes, 428 words, 5710 chars
+Coverage:      278.7%
+
+Evidence quote lengths (chars):
+  1. 1210 chars
+  2. 827 chars
+  3. 787 chars
+  4. 667 chars
+  5. 655 chars
+  ... and 5 more
+
+======================================================================
+CHUNK 8
+======================================================================
+Chunk size:    145 words, 5618 chars
+Lines:         357–429
+File:          chunk_008.txt
+Triples:       56
+Evidence:      56 quotes (44 duplicates)
+  Unique:      12 quotes, 143 words, 5663 chars
+Coverage:      100.8%
+
+Evidence quote lengths (chars):
+  1. 886 chars
+  2. 762 chars
+  3. 741 chars
+  4. 738 chars
+  5. 618 chars
+  ... and 7 more
+
+======================================================================
+CHUNK 9
+======================================================================
+Chunk size:    160 words, 3067 chars
+Lines:         430–478
+File:          chunk_009.txt
+Triples:       69
+Evidence:      69 quotes (59 duplicates)
+  Unique:      10 quotes, 229 words, 4600 chars
+Coverage:      150.0%
+
+Evidence quote lengths (chars):
+  1. 896 chars
+  2. 878 chars
+  3. 684 chars
+  4. 344 chars
+  5. 322 chars
+  ... and 5 more
+
+======================================================================
+CHUNK 10
+======================================================================
+Chunk size:    351 words, 6510 chars
+Lines:         479–554
+File:          chunk_010.txt
+Triples:       138
+Evidence:      138 quotes (119 duplicates)
+  Unique:      19 quotes, 961 words, 19414 chars
+Coverage:      298.2%
+
+Evidence quote lengths (chars):
+  1. 2715 chars
+  2. 2026 chars
+  3. 1721 chars
+  4. 1613 chars
+  5. 1502 chars
+  ... and 14 more
+
+======================================================================
+CHUNK 11
+======================================================================
+Chunk size:    399 words, 10772 chars
+Lines:         555–690
+File:          chunk_011.txt
+Triples:       76
+Evidence:      76 quotes (64 duplicates)
+  Unique:      12 quotes, 402 words, 10503 chars
+Coverage:      97.5%
+
+Evidence quote lengths (chars):
+  1. 1629 chars
+  2. 1617 chars
+  3. 1212 chars
+  4. 1176 chars
+  5. 1005 chars
+  ... and 7 more
+
+======================================================================
+CHUNK 12
+======================================================================
+Chunk size:    23 words, 620 chars
+Lines:         641–647
+File:          chunk_012.txt
+Triples:       19
+Evidence:      19 quotes (18 duplicates)
+  Unique:      1 quotes, 23 words, 620 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 620 chars
+
+======================================================================
+CHUNK 13
+======================================================================
+Chunk size:    24 words, 609 chars
+Lines:         648–655
+File:          chunk_013.txt
+Triples:       24
+Evidence:      24 quotes (22 duplicates)
+  Unique:      2 quotes, 38 words, 990 chars
+Coverage:      162.6%
+
+Evidence quote lengths (chars):
+  1. 609 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 14
+======================================================================
+Chunk size:    23 words, 625 chars
+Lines:         656–663
+File:          chunk_014.txt
+Triples:       17
+Evidence:      17 quotes (16 duplicates)
+  Unique:      1 quotes, 23 words, 625 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 625 chars
+
+======================================================================
+CHUNK 15
+======================================================================
+Chunk size:    20 words, 583 chars
+Lines:         664–670
+File:          chunk_015.txt
+Triples:       23
+Evidence:      23 quotes (21 duplicates)
+  Unique:      2 quotes, 34 words, 964 chars
+Coverage:      165.4%
+
+Evidence quote lengths (chars):
+  1. 583 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 16
+======================================================================
+Chunk size:    21 words, 581 chars
+Lines:         671–677
+File:          chunk_016.txt
+Triples:       20
+Evidence:      20 quotes (18 duplicates)
+  Unique:      2 quotes, 35 words, 962 chars
+Coverage:      165.6%
+
+Evidence quote lengths (chars):
+  1. 581 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 17
+======================================================================
+Chunk size:    23 words, 625 chars
+Lines:         678–685
+File:          chunk_017.txt
+Triples:       21
+Evidence:      21 quotes (20 duplicates)
+  Unique:      1 quotes, 23 words, 625 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 625 chars
+
+======================================================================
+CHUNK 18
+======================================================================
+Chunk size:    20 words, 581 chars
+Lines:         686–692
+File:          chunk_018.txt
+Triples:       22
+Evidence:      22 quotes (20 duplicates)
+  Unique:      2 quotes, 34 words, 962 chars
+Coverage:      165.6%
+
+Evidence quote lengths (chars):
+  1. 581 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 19
+======================================================================
+Chunk size:    24 words, 609 chars
+Lines:         693–699
+File:          chunk_019.txt
+Triples:       25
+Evidence:      25 quotes (23 duplicates)
+  Unique:      2 quotes, 38 words, 990 chars
+Coverage:      162.6%
+
+Evidence quote lengths (chars):
+  1. 609 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 20
+======================================================================
+Chunk size:    23 words, 625 chars
+Lines:         700–707
+File:          chunk_020.txt
+Triples:       22
+Evidence:      22 quotes (21 duplicates)
+  Unique:      1 quotes, 23 words, 625 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 625 chars
+
+======================================================================
+CHUNK 21
+======================================================================
+Chunk size:    20 words, 583 chars
+Lines:         708–714
+File:          chunk_021.txt
+Triples:       22
+Evidence:      22 quotes (21 duplicates)
+  Unique:      1 quotes, 20 words, 583 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 583 chars
+
+======================================================================
+CHUNK 22
+======================================================================
+Chunk size:    21 words, 581 chars
+Lines:         715–721
+File:          chunk_022.txt
+Triples:       20
+Evidence:      20 quotes (18 duplicates)
+  Unique:      2 quotes, 35 words, 962 chars
+Coverage:      165.6%
+
+Evidence quote lengths (chars):
+  1. 581 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 23
+======================================================================
+Chunk size:    23 words, 625 chars
+Lines:         722–729
+File:          chunk_023.txt
+Triples:       19
+Evidence:      19 quotes (18 duplicates)
+  Unique:      1 quotes, 23 words, 625 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 625 chars
+
+======================================================================
+CHUNK 24
+======================================================================
+Chunk size:    20 words, 581 chars
+Lines:         730–736
+File:          chunk_024.txt
+Triples:       26
+Evidence:      26 quotes (24 duplicates)
+  Unique:      2 quotes, 34 words, 962 chars
+Coverage:      165.6%
+
+Evidence quote lengths (chars):
+  1. 581 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 25
+======================================================================
+Chunk size:    24 words, 609 chars
+Lines:         737–743
+File:          chunk_025.txt
+Triples:       22
+Evidence:      22 quotes (20 duplicates)
+  Unique:      2 quotes, 38 words, 990 chars
+Coverage:      162.6%
+
+Evidence quote lengths (chars):
+  1. 609 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 26
+======================================================================
+Chunk size:    24 words, 643 chars
+Lines:         744–751
+File:          chunk_026.txt
+Triples:       25
+Evidence:      25 quotes (24 duplicates)
+  Unique:      1 quotes, 24 words, 643 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 643 chars
+
+======================================================================
+CHUNK 27
+======================================================================
+Chunk size:    20 words, 583 chars
+Lines:         752–758
+File:          chunk_027.txt
+Triples:       22
+Evidence:      22 quotes (21 duplicates)
+  Unique:      1 quotes, 20 words, 583 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 583 chars
+
+======================================================================
+CHUNK 28
+======================================================================
+Chunk size:    21 words, 581 chars
+Lines:         759–765
+File:          chunk_028.txt
+Triples:       21
+Evidence:      21 quotes (19 duplicates)
+  Unique:      2 quotes, 35 words, 962 chars
+Coverage:      165.6%
+
+Evidence quote lengths (chars):
+  1. 581 chars
+  2. 381 chars
+
+======================================================================
+CHUNK 29
+======================================================================
+Chunk size:    23 words, 625 chars
+Lines:         766–773
+File:          chunk_029.txt
+Triples:       25
+Evidence:      25 quotes (24 duplicates)
+  Unique:      1 quotes, 23 words, 625 chars
+Coverage:      100.0%
+
+Evidence quote lengths (chars):
+  1. 625 chars
+
+======================================================================
+CHUNK 30
+======================================================================
+Chunk size:    14 words, 443 chars
+Lines:         774–781
+File:          chunk_030.txt
+Triples:       14
+Evidence:      14 quotes (12 duplicates)
+  Unique:      2 quotes, 20 words, 676 chars
+Coverage:      152.6%
+
+Evidence quote lengths (chars):
+  1. 438 chars
+  2. 238 chars
+
+======================================================================
+CHUNK 31
+======================================================================
+Chunk size:    53 words, 1280 chars
+Lines:         782–795
+File:          chunk_031.txt
+Triples:       33
+Evidence:      33 quotes (25 duplicates)
+  Unique:      8 quotes, 154 words, 3531 chars
+Coverage:      275.9%
+
+Evidence quote lengths (chars):
+  1. 733 chars
+  2. 546 chars
+  3. 528 chars
+  4. 428 chars
+  5. 410 chars
+  ... and 3 more
+
+======================================================================
+CHUNK 32
+======================================================================
+Chunk size:    81 words, 1417 chars
+Lines:         796–813
+File:          chunk_032.txt
+Triples:       23
+Evidence:      23 quotes (15 duplicates)
+  Unique:      8 quotes, 188 words, 3399 chars
+Coverage:      239.9%
+
+Evidence quote lengths (chars):
+  1. 627 chars
+  2. 612 chars
+  3. 579 chars
+  4. 494 chars
+  5. 400 chars
+  ... and 3 more
+
+======================================================================
+CHUNK 33
+======================================================================
+Chunk size:    99 words, 2200 chars
+Lines:         814–843
+File:          chunk_033.txt
+Triples:       32
+Evidence:      32 quotes (19 duplicates)
+  Unique:      13 quotes, 320 words, 6868 chars
+Coverage:      312.2%
+
+Evidence quote lengths (chars):
+  1. 1156 chars
+  2. 1047 chars
+  3. 981 chars
+  4. 698 chars
+  5. 507 chars
+  ... and 8 more
+
+======================================================================
+CHUNK 34
+======================================================================
+Chunk size:    54 words, 1513 chars
+Lines:         844–862
+File:          chunk_034.txt
+Triples:       34
+Evidence:      34 quotes (21 duplicates)
+  Unique:      13 quotes, 210 words, 5680 chars
+Coverage:      375.4%
+
+Evidence quote lengths (chars):
+  1. 847 chars
+  2. 660 chars
+  3. 568 chars
+  4. 557 chars
+  5. 541 chars
+  ... and 8 more
+
+======================================================================
+CHUNK 35
+======================================================================
+Chunk size:    69 words, 1189 chars
+Lines:         863–876
+File:          chunk_035.txt
+Triples:       23
+Evidence:      23 quotes (14 duplicates)
+  Unique:      9 quotes, 305 words, 4992 chars
+Coverage:      419.8%
+
+Evidence quote lengths (chars):
+  1. 684 chars
+  2. 657 chars
+  3. 581 chars
+  4. 564 chars
+  5. 564 chars
+  ... and 4 more
+
+======================================================================
+CHUNK 36
+======================================================================
+Chunk size:    196 words, 4434 chars
+Lines:         877–939
+File:          chunk_036.txt
+Triples:       95
+Evidence:      95 quotes (86 duplicates)
+  Unique:      9 quotes, 218 words, 4979 chars
+Coverage:      112.3%
+
+Evidence quote lengths (chars):
+  1. 757 chars
+  2. 682 chars
+  3. 569 chars
+  4. 561 chars
+  5. 553 chars
+  ... and 4 more
+
+======================================================================
+CHUNK 37
+======================================================================
+Chunk size:    72 words, 1853 chars
+Lines:         940–961
+File:          chunk_037.txt
+Triples:       43
+Evidence:      43 quotes (30 duplicates)
+  Unique:      13 quotes, 160 words, 4269 chars
+Coverage:      230.4%
+
+Evidence quote lengths (chars):
+  1. 506 chars
+  2. 427 chars
+  3. 405 chars
+  4. 336 chars
+  5. 332 chars
+  ... and 8 more
+
+======================================================================
+CHUNK 38
+======================================================================
+Chunk size:    118 words, 2084 chars
+Lines:         962–985
+File:          chunk_038.txt
+Triples:       49
+Evidence:      49 quotes (44 duplicates)
+  Unique:      5 quotes, 117 words, 2075 chars
+Coverage:      99.6%
+
+Evidence quote lengths (chars):
+  1. 555 chars
+  2. 508 chars
+  3. 359 chars
+  4. 336 chars
+  5. 317 chars
+
+======================================================================
+CHUNK 39
+======================================================================
+Chunk size:    88 words, 1869 chars
+Lines:         986–1006
+File:          chunk_039.txt
+Triples:       54
+Evidence:      54 quotes (45 duplicates)
+  Unique:      9 quotes, 131 words, 2790 chars
+Coverage:      149.3%
+
+Evidence quote lengths (chars):
+  1. 425 chars
+  2. 324 chars
+  3. 322 chars
+  4. 311 chars
+  5. 311 chars
+  ... and 4 more
+
+======================================================================
+CHUNK 40
+======================================================================
+Chunk size:    77 words, 2358 chars
+Lines:         1007–1035
+File:          chunk_040.txt
+Triples:       54
+Evidence:      54 quotes (44 duplicates)
+  Unique:      10 quotes, 182 words, 5379 chars
+Coverage:      228.1%
+
+Evidence quote lengths (chars):
+  1. 684 chars
+  2. 646 chars
+  3. 610 chars
+  4. 592 chars
+  5. 577 chars
+  ... and 5 more
+
+======================================================================
+CHUNK 41
+======================================================================
+Chunk size:    206 words, 3601 chars
+Lines:         1036–1076
+File:          chunk_041.txt
+Triples:       42
+Evidence:      42 quotes (29 duplicates)
+  Unique:      13 quotes, 262 words, 4476 chars
+Coverage:      124.3%
+
+Evidence quote lengths (chars):
+  1. 446 chars
+  2. 432 chars
+  3. 357 chars
+  4. 351 chars
+  5. 348 chars
+  ... and 8 more
+
+======================================================================
+CHUNK 42
+======================================================================
+Chunk size:    55 words, 1067 chars
+Lines:         1077–1091
+File:          chunk_042.txt
+Triples:       36
+Evidence:      36 quotes (32 duplicates)
+  Unique:      4 quotes, 142 words, 2749 chars
+Coverage:      257.6%
+
+Evidence quote lengths (chars):
+  1. 1062 chars
+  2. 706 chars
+  3. 557 chars
+  4. 424 chars
+
+======================================================================
+CHUNK 43
+======================================================================
+Chunk size:    127 words, 1709 chars
+Lines:         1092–1110
+File:          chunk_043.txt
+Triples:       45
+Evidence:      45 quotes (41 duplicates)
+  Unique:      4 quotes, 207 words, 2825 chars
+Coverage:      165.3%
+
+Evidence quote lengths (chars):
+  1. 1123 chars
+  2. 580 chars
+  3. 579 chars
+  4. 543 chars
+
+======================================================================
+CHUNK 44
+======================================================================
+Chunk size:    82 words, 1560 chars
+Lines:         1111–1128
+File:          chunk_044.txt
+Triples:       36
+Evidence:      36 quotes (33 duplicates)
+  Unique:      3 quotes, 96 words, 1788 chars
+Coverage:      114.6%
+
+Evidence quote lengths (chars):
+  1. 651 chars
+  2. 651 chars
+  3. 486 chars
+
+======================================================================
+CHUNK 45
+======================================================================
+Chunk size:    98 words, 2611 chars
+Lines:         1129–1161
+File:          chunk_045.txt
+Triples:       40
+Evidence:      40 quotes (36 duplicates)
+  Unique:      4 quotes, 164 words, 4064 chars
+Coverage:      155.6%
+
+Evidence quote lengths (chars):
+  1. 1361 chars
+  2. 1243 chars
+  3. 983 chars
+  4. 477 chars
+
+======================================================================
+CHUNK 46
+======================================================================
+Chunk size:    156 words, 2768 chars
+Lines:         1162–1209
+File:          chunk_046.txt
+Triples:       64
+Evidence:      64 quotes (49 duplicates)
+  Unique:      15 quotes, 417 words, 7242 chars
+Coverage:      261.6%
+
+Evidence quote lengths (chars):
+  1. 575 chars
+  2. 553 chars
+  3. 550 chars
+  4. 550 chars
+  5. 536 chars
+  ... and 10 more
+
+======================================================================
+CHUNK 47
+======================================================================
+Chunk size:    71 words, 1491 chars
+Lines:         1210–1229
+File:          chunk_047.txt
+Triples:       25
+Evidence:      25 quotes (20 duplicates)
+  Unique:      5 quotes, 80 words, 1776 chars
+Coverage:      119.1%
+
+Evidence quote lengths (chars):
+  1. 422 chars
+  2. 421 chars
+  3. 351 chars
+  4. 294 chars
+  5. 288 chars
+
+======================================================================
+CHUNK 48
+======================================================================
+Chunk size:    104 words, 2484 chars
+Lines:         1230–1260
+File:          chunk_048.txt
+Triples:       46
+Evidence:      46 quotes (41 duplicates)
+  Unique:      5 quotes, 128 words, 2910 chars
+Coverage:      117.1%
+
+Evidence quote lengths (chars):
+  1. 885 chars
+  2. 600 chars
+  3. 521 chars
+  4. 464 chars
+  5. 440 chars
+
+======================================================================
+CHUNK 49
+======================================================================
+Chunk size:    78 words, 1756 chars
+Lines:         1261–1284
+File:          chunk_049.txt
+Triples:       33
+Evidence:      33 quotes (20 duplicates)
+  Unique:      13 quotes, 236 words, 5564 chars
+Coverage:      316.9%
+
+Evidence quote lengths (chars):
+  1. 564 chars
+  2. 556 chars
+  3. 544 chars
+  4. 538 chars
+  5. 532 chars
+  ... and 8 more
+
+======================================================================
+CHUNK 50
+======================================================================
+Chunk size:    362 words, 4483 chars
+Lines:         1285–1330
+File:          chunk_050.txt
+Triples:       67
+Evidence:      67 quotes (57 duplicates)
+  Unique:      10 quotes, 492 words, 6200 chars
+Coverage:      138.3%
+
+Evidence quote lengths (chars):
+  1. 1122 chars
+  2. 890 chars
+  3. 771 chars
+  4. 672 chars
+  5. 664 chars
+  ... and 5 more
+
+======================================================================
+CHUNK 51
+======================================================================
+Chunk size:    35 words, 616 chars
+Lines:         1281–1290
+File:          chunk_051.txt
+Triples:       19
+Evidence:      19 quotes (16 duplicates)
+  Unique:      3 quotes, 48 words, 787 chars
+Coverage:      127.8%
+
+Evidence quote lengths (chars):
+  1. 513 chars
+  2. 173 chars
+  3. 101 chars
+
+======================================================================
+CHUNK 52
+======================================================================
+Chunk size:    342 words, 4066 chars
+Lines:         1291–1334
+File:          chunk_052.txt
+Triples:       69
+Evidence:      69 quotes (61 duplicates)
+  Unique:      8 quotes, 340 words, 4047 chars
+Coverage:      99.5%
+
+Evidence quote lengths (chars):
+  1. 672 chars
+  2. 573 chars
+  3. 564 chars
+  4. 552 chars
+  5. 548 chars
+  ... and 3 more
+
+======================================================================
+CHUNK 53
+======================================================================
+Chunk size:    277 words, 2855 chars
+Lines:         1335–1371
+File:          chunk_053.txt
+Triples:       45
+Evidence:      45 quotes (30 duplicates)
+  Unique:      15 quotes, 719 words, 7166 chars
+Coverage:      251.0%
+
+Evidence quote lengths (chars):
+  1. 702 chars
+  2. 683 chars
+  3. 641 chars
+  4. 591 chars
+  5. 568 chars
+  ... and 10 more
+
+======================================================================
+CHUNK 54
+======================================================================
+Chunk size:    55 words, 869 chars
+Lines:         1372–1382
+File:          chunk_054.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 55
+======================================================================
+Chunk size:    233 words, 2890 chars
+Lines:         1383–1413
+File:          chunk_055.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 56
+======================================================================
+Chunk size:    126 words, 2698 chars
+Lines:         1414–1454
+File:          chunk_056.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 57
+======================================================================
+Chunk size:    28 words, 676 chars
+Lines:         1455–1466
+File:          chunk_057.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 58
+======================================================================
+Chunk size:    71 words, 1986 chars
+Lines:         1467–1493
+File:          chunk_058.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 59
+======================================================================
+Chunk size:    128 words, 2911 chars
+Lines:         1494–1527
+File:          chunk_059.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 60
+======================================================================
+Chunk size:    134 words, 2144 chars
+Lines:         1528–1559
+File:          chunk_060.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 61
+======================================================================
+Chunk size:    65 words, 1845 chars
+Lines:         1560–1585
+File:          chunk_061.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 62
+======================================================================
+Chunk size:    124 words, 2525 chars
+Lines:         1586–1622
+File:          chunk_062.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 63
+======================================================================
+Chunk size:    231 words, 3492 chars
+Lines:         1623–1672
+File:          chunk_063.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 64
+======================================================================
+Chunk size:    209 words, 2381 chars
+Lines:         1673–1698
+File:          chunk_064.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 65
+======================================================================
+Chunk size:    80 words, 2339 chars
+Lines:         1699–1724
+File:          chunk_065.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 66
+======================================================================
+Chunk size:    77 words, 1742 chars
+Lines:         1725–1751
+File:          chunk_066.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 67
+======================================================================
+Chunk size:    178 words, 4035 chars
+Lines:         1752–1808
+File:          chunk_067.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 68
+======================================================================
+Chunk size:    221 words, 3351 chars
+Lines:         1809–1849
+File:          chunk_068.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 69
+======================================================================
+Chunk size:    154 words, 3273 chars
+Lines:         1850–1900
+File:          chunk_069.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 70
+======================================================================
+Chunk size:    37 words, 717 chars
+Lines:         1851–1860
+File:          chunk_070.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 71
+======================================================================
+Chunk size:    41 words, 881 chars
+Lines:         1861–1873
+File:          chunk_071.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 72
+======================================================================
+Chunk size:    36 words, 833 chars
+Lines:         1874–1885
+File:          chunk_072.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 73
+======================================================================
+Chunk size:    37 words, 812 chars
+Lines:         1886–1896
+File:          chunk_073.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+CHUNK 74
+======================================================================
+Chunk size:    1 words, 3 chars
+Lines:         1897–1900
+File:          chunk_074.txt
+Triples:       0
+Evidence:      0 quotes (0 duplicates)
+  Unique:      0 quotes, 0 words, 0 chars
+Coverage:      0.0%
+
+======================================================================
+SUMMARY
+======================================================================
+Chunks:              74
+Total triples:       2453
+Avg triples/chunk:   33.1
+Total evidence:      2453 (2038 duplicates)
+Avg coverage:        132.7%
+Chunks w/o evidence: 21
+Chunks < 30% cover:  0
+
+Best coverage:       chunk 35 (419.8%)
+Worst coverage:      chunk 54 (0.0%)

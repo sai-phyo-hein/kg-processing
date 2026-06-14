@@ -319,7 +319,12 @@ class TripleRefiner:
                 self.qdrant_client.get_collection(qdrant_name)
                 print(f"Collection '{qdrant_name}' already exists.")
             except Exception as e:
-                raise e
+                # R4 fix: surface actionable context instead of a bare re-raise.
+                raise RuntimeError(
+                    f"Collection '{qdrant_name}' (spec key: '{spec_key}') does not exist "
+                    f"in Qdrant at {self.qdrant_url}. Create it before running the refiner. "
+                    f"Original error: {e}"
+                ) from e
 
             if spec_key == evidence_spec:
                 print(f"  Skipping payload indexes for evidence collection '{qdrant_name}'")
@@ -469,7 +474,7 @@ class TripleRefiner:
 
     def _query_qdrant_canonical_batch(
         self,
-        collection_name: str,
+        spec_key: str,                              # R5 fix: was "collection_name" — misleading
         query_vectors: List[List[float]],
         limit: int = 1,
         community_ids: Optional[List[Optional[str]]] = None,
@@ -477,11 +482,15 @@ class TripleRefiner:
     ) -> Dict[int, List[Dict[str, Any]]]:
         """Batch vector search against the canonical index.
 
+        Args:
+            spec_key: Registry spec key (e.g. "entity_registry"), NOT the raw
+                Qdrant collection name.  Use _qdrant_name(spec_key) for that.
+
         Returns a dict mapping query index → list of matches.
         """
         from qdrant_client.http import models as qm
 
-        vec_en, _ = self._vector_names(collection_name)
+        vec_en, _ = self._vector_names(spec_key)
         threshold = score_threshold if score_threshold is not None else self.similarity_threshold
         results: Dict[int, List[Dict[str, Any]]] = {}
 
@@ -512,7 +521,7 @@ class TripleRefiner:
             for attempt in range(1, max_attempts + 1):
                 try:
                     batch_results = self.qdrant_client.query_batch_points(
-                        collection_name=self._qdrant_name(collection_name),
+                        collection_name=self._qdrant_name(spec_key),
                         requests=requests,
                     )
                     for local_idx, qr in enumerate(batch_results):
@@ -543,18 +552,23 @@ class TripleRefiner:
 
     def _query_qdrant(
         self,
-        collection_name: str,
+        spec_key: str,          # R5 fix: was "collection_name" — misleading
         query_text: str,
         limit: int = 5,
         lang: str = "en",
     ) -> List[Dict[str, Any]]:
-        """General-purpose non-filtered similarity search."""
+        """General-purpose non-filtered similarity search.
+
+        Args:
+            spec_key: Registry spec key (e.g. "entity_registry"), NOT the raw
+                Qdrant collection name.
+        """
         try:
             query_vector        = self._get_embedding(query_text)
-            vec_en, vec_th      = self._vector_names(collection_name)
+            vec_en, vec_th      = self._vector_names(spec_key)
             vector_name         = vec_en if lang == "en" else vec_th
             search_results      = self.qdrant_client.query_points(
-                collection_name=self._qdrant_name(collection_name),
+                collection_name=self._qdrant_name(spec_key),
                 query=query_vector,
                 using=vector_name,
                 limit=limit,
@@ -745,7 +759,10 @@ class TripleRefiner:
             }
         except Exception as e:
             print(f"Warning: Failed to parse entity decision: {e}")
-            return {"are_same_entity": True, "new_is_canonical": False, "reasoning": "parse error"}
+            # R1 fix: default to "different entity" on parse failure.
+            # The system prompt states "when in doubt, default to are_same_entity: false";
+            # merging unrelated entities is worse than keeping spurious duplicates.
+            return {"are_same_entity": False, "new_is_canonical": True, "reasoning": "parse error — treated as new entity"}
 
     def _parse_predicate_decision(self, response: str, fallback_name: str) -> Dict[str, Any]:
         try:
@@ -761,11 +778,12 @@ class TripleRefiner:
             }
         except Exception as e:
             print(f"Warning: Failed to parse predicate decision: {e}")
+            # R1 fix: default to "different predicate" on parse failure.
             return {
-                "are_equivalent":   True,
-                "new_is_canonical": False,
+                "are_equivalent":   False,
+                "new_is_canonical": True,
                 "canonical_form":   fallback_name,
-                "reasoning":        "parse error",
+                "reasoning":        "parse error — treated as new predicate",
             }
 
     def _run_llm_batch(
@@ -850,21 +868,23 @@ class TripleRefiner:
                     for entity_name, decision in future.result():
                         results[entity_name] = decision
                 except Exception as e:
-                    # Whole chunk failed — apply safe defaults for every pair in it
+                    # Whole chunk failed — apply safe "treat as new" defaults for every
+                    # pair in it.  R2 fix: defaulting to "same entity / merge" on error
+                    # is dangerous; "new entity" is the safer fallback.
                     print(f"Warning: LLM chunk failed: {e}")
                     for entity, _ in chunk:
                         results[entity["name"]] = (
                             {
-                                "are_equivalent":   True,
-                                "new_is_canonical": False,
+                                "are_equivalent":   False,
+                                "new_is_canonical": True,
                                 "canonical_form":   entity.get("name_en") or entity["name"],
-                                "reasoning":        "LLM chunk error",
+                                "reasoning":        "LLM chunk error — treated as new predicate",
                             }
                             if is_predicate
                             else {
-                                "are_same_entity":  True,
-                                "new_is_canonical": False,
-                                "reasoning":        "LLM chunk error",
+                                "are_same_entity":  False,
+                                "new_is_canonical": True,
+                                "reasoning":        "LLM chunk error — treated as new entity",
                             }
                         )
 
@@ -1700,7 +1720,12 @@ class TripleRefiner:
 
                 refined_triples.append(refined_triple)
 
-            refined_chunks.append({"chunk_id": chunk_id, "triples": refined_triples})
+            # R3 fix: preserve document_metadata (detected_language, source_id, etc.)
+            # that was silently dropped from every chunk in the original implementation.
+            chunk_out: Dict[str, Any] = {"chunk_id": chunk_id, "triples": refined_triples}
+            if chunk_data.get("document_metadata"):
+                chunk_out["document_metadata"] = chunk_data["document_metadata"]
+            refined_chunks.append(chunk_out)
 
         return {
             "source_file":        triples_data.get("source_file"),

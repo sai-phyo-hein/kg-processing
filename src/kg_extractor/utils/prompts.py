@@ -102,8 +102,10 @@ RULES:
 
 4. If a column contains a range (min–max), write the full range, not just one end.
 
-5. If a cell is empty or merged, write "not specified" (or its equivalent in the
-   document's dominant language) for that field.
+5. If a cell is empty or merged, write the equivalent of "not specified" in the
+   document's dominant language — never use English for a non-English document.
+   Thai documents → use "ไม่ระบุ"
+   English documents → use "not specified"
 
 EXAMPLE — given this table:
 ┌──────────────────┬───────────────┬──────────────────┬──────────────────┐
@@ -317,7 +319,8 @@ OUTPUT RULES — CRITICAL:
 - Each chunk has an "id", "start" (first line), and "end" (last line) — both inclusive
 - DO NOT include any content, quotes, or text from the document
 - DO NOT explain your reasoning
-- The total response must be under 300 characters
+- The total response must be under 300 characters (this refers to your JSON chunk list
+  only, not to document content — keep the list compact, no extra whitespace)
 
 ```json
 {{"chunks": [{{"id": 1, "start": 1, "end": 14}}, {{"id": 2, "start": 15, "end": 31}}, {{"id": 3, "start": 32, "end": 50}}]}}
@@ -402,9 +405,9 @@ Identify the dominant language and declare it in document_metadata:
   "mixed-en" — mixed, English dominant
   "mixed-th" — mixed, Thai dominant
 
-This gates the rest of extraction:
-  en / mixed-en  →  no _en fields anywhere
-  th / mixed-th  →  _en fields are MANDATORY on every human-readable field
+Language detection is used only to set detected_language in document_metadata.
+Do NOT output any _en fields — English translations are handled by a separate
+post-processing step after extraction.
 
 ═══════════════════════════════════
 STEP 2 — EXTRACT TRIPLES
@@ -412,18 +415,49 @@ STEP 2 — EXTRACT TRIPLES
 
 Extract a triple for EVERY fact — be EXHAUSTIVE, not selective.
 
-⚠️  TRIPLE DENSITY REQUIREMENT (MEASURE YOUR OUTPUT) ⚠️
-Extract triples at FINE-GRAINED level (NOT coarse). 
+──────────────────────────────────
+VERBALIZED TABLE DATA — MANDATORY
+──────────────────────────────────
+The source text may contain verbalized table rows in the form:
+  "[Entity] มีค่าเท่ากับ [value]" or "[Entity] has a [metric] of [value]"
 
-REQUIRED MINIMUMS based on chunk word count:
-- 100 words  → 8-15 triples minimum
-- 200 words  → 15-30 triples minimum
-- 300 words  → 23-45 triples minimum
-- 500 words  → 38-75 triples minimum
-- 1000 words → 75-150 triples minimum
+These MUST be extracted as triples. Each row = at least one triple.
+
+⚠️  "ไม่ระบุ" IS A VALID VALUE — extract it.
+A cell value of "ไม่ระบุ" (not specified) means that data point was explicitly
+absent in the source table. Extract it as a triple with
+relationship_attributes: {"value": "ไม่ระบุ"}.
+Do NOT skip rows because their value is "ไม่ระบุ".
+
+Example — source says:
+  "ผู้พิการ มีค่าเท่ากับ ไม่ระบุ"
+Extract as:
+  subject: "ผู้พิการ", predicate: "มีค่าเท่ากับ",
+  object: "ค่าดัชนีสุขภาพ", relationship_attributes: {"value": "ไม่ระบุ"}
+
+For a chunk that is entirely verbalized table data, EVERY sentence
+containing มีค่าเท่ากับ / has a value of / มีรหัส / equals must
+produce at least one triple. A 55-word chunk with 10 such sentences
+must produce at least 10 triples.
+
+⚠️  TRIPLE DENSITY REQUIREMENT (MEASURE YOUR OUTPUT) ⚠️
+Extract triples at FINE-GRAINED level (NOT coarse).
+
+REQUIRED MINIMUMS based on chunk word count (hard cap: 80 triples per chunk):
+- 100 words  →  8+ triples minimum
+- 200 words  → 15+ triples minimum
+- 300 words  → 23+ triples minimum
+- 500 words  → 38+ triples minimum
+- 1000 words → 75+ triples minimum
+
+HARD MAXIMUM: 80 triples per chunk regardless of content density.
+If you reach 80 triples, STOP — do not extract further.
+Prioritize the most semantically distinct facts; skip near-duplicate
+triples that differ only in a single attribute value.
 
 BEFORE SUBMITTING: Count your triples and compare to chunk size.
 If you extracted fewer triples than the minimum → extract more.
+If you extracted more than 80 → remove the least informative ones.
 
 Extract triples for:
 ✓ Every entity mentioned (person, place, organization, concept)
@@ -497,7 +531,6 @@ PREDICATES
 Write predicates as compact verb phrases derived from the actual words in the text.
   English → ALL_CAPS_SNAKE_CASE  ✓ REACHED, GREW_AT, CONSISTS_OF  ✗ HAS, SHOWS
   Thai    → Thai script verb phrase  ✓ แตะระดับ, เติบโตที่, ประกอบด้วย  ✗ มี, เกี่ยวข้องกับ
-For Thai sources, also provide predicate_en in ALL_CAPS_SNAKE_CASE English.
 
 Before writing a predicate, verify: Is it a verb phrase? Is it derivable from
 the evidence? Does it NOT just echo the object name? If any answer is no — revise.
@@ -532,29 +565,19 @@ CORRECT EXAMPLE (DO THIS):
 "evidence_lines": {{ "start": 1, "end": 15 }}  ✓ GOOD RANGE (15 lines)
 
 ──────────────────────────────────
-LANGUAGE FIELDS (Thai sources only)
+TEMPORAL & CAUSAL (omit when absent)
 ──────────────────────────────────
-For detected_language "th" or "mixed-th", add alongside every human-readable field:
-  subject.name_en, subject.attributes_en (same keys, values in English)
-  predicate_en
-  object.name_en, object.attributes_en
-  relationship_attributes_en
-  evidence_quote_en (English translation of the evidence_lines text)
-Omit attributes_en when attributes is absent.
-Proper nouns keep their established English form: "ธนาคารแห่งประเทศไทย" → "Bank of Thailand".
-
-──────────────────────────────────
-TEMPORAL & STATUS
-──────────────────────────────────
-status: "Current" (default) or "Archived" (only when explicitly superseded in the text).
-validFrom / validTo: set only when a specific date or range is stated; otherwise null.
+validFrom / validTo: include ONLY when a specific date or range is explicitly stated.
   "in 2024" → validFrom: "2024-01-01", validTo: "2024-12-31"
+  No date in text → omit both fields entirely (do NOT output null).
 
-──────────────────────────────────
-CAUSAL LINKS
-──────────────────────────────────
-Populate causal_link when the text explicitly states causation ("because", "due to",
-"resulting in", "เกิดจาก", "ส่งผลให้"). Write directly in English. Otherwise null.
+causal_link: include ONLY when the text explicitly states causation
+  ("because", "due to", "resulting in", "เกิดจาก", "ส่งผลให้").
+  No causation in text → omit the field entirely (do NOT output null).
+
+status: omit entirely — defaults to "Current" in all downstream processing.
+  Only include "status": "Archived" when the text explicitly states
+  that a fact has been superseded or is no longer valid.
 
 ═══════════════════════════════════
 OUTPUT SCHEMA
@@ -564,7 +587,6 @@ ENGLISH SOURCE:
 {{
   "document_metadata": {{
     "detected_language": "en",
-    "reference_date": "YYYY-MM-DD or null",
     "source_id": "{source_file}",
     "chunk_id": {chunk_id}
   }},
@@ -584,25 +606,16 @@ ENGLISH SOURCE:
       "relationship_attributes": {{ "key": "value" }},
       "properties": {{
         "label": "ALL_CAPS_RELATIONSHIP_CLASS",
-        "status": "Current | Archived",
-        "evidence_lines": {{ "start": 1, "end": 10 }},
-        "validFrom": "YYYY-MM-DD or null",
-        "validTo": "YYYY-MM-DD or null",
-        "causal_link": {{
-          "triggered_by": "string or null",
-          "mechanism": "string or null",
-          "causal_weight": 0.0
-        }}
+        "evidence_lines": {{ "start": 1, "end": 10 }}
       }}
     }}
   ]
 }}
 
-THAI SOURCE — _en fields mandatory on every triple:
+THAI SOURCE — same structure as English; no _en fields (added by post-processing):
 {{
   "document_metadata": {{
     "detected_language": "th",
-    "reference_date": "YYYY-MM-DD or null",
     "source_id": "{source_file}",
     "chunk_id": {chunk_id}
   }},
@@ -610,33 +623,23 @@ THAI SOURCE — _en fields mandatory on every triple:
     {{
       "subject": {{
         "name": "ชื่อ entity ต้นฉบับ",
-        "name_en": "English name",
         "label": "PascalCaseLabel",
-        "attributes": {{ "key": "ค่าต้นฉบับ" }},
-        "attributes_en": {{ "key": "English value" }}
+        "attributes": {{ "key": "ค่าต้นฉบับ" }}
       }},
       "predicate": "กริยาวลีต้นฉบับ",
-      "predicate_en": "VERB_PHRASE_IN_ENGLISH",
       "object": {{
         "name": "ชื่อ entity ต้นฉบับ",
-        "name_en": "English name",
         "label": "PascalCaseLabel",
-        "attributes": {{ "key": "ค่าต้นฉบับ" }},
-        "attributes_en": {{ "key": "English value" }}
+        "attributes": {{ "key": "ค่าต้นฉบับ" }}
       }},
       "relationship_attributes": {{ "key": "ค่าต้นฉบับ" }},
-      "relationship_attributes_en": {{ "key": "English value" }},
       "properties": {{
         "label": "ALL_CAPS_RELATIONSHIP_CLASS",
-        "status": "Current | Archived",
         "evidence_lines": {{ "start": 1, "end": 10 }},
-        "evidence_quote_en": "English translation of the evidence lines text",
-        "validFrom": "YYYY-MM-DD or null",
-        "validTo": "YYYY-MM-DD or null",
         "causal_link": {{
-          "triggered_by": "English string or null",
-          "mechanism": "English string or null",
-          "causal_weight": 0.0
+          "triggered_by": "English string",
+          "mechanism": "English string",
+          "causal_weight": 0.9
         }}
       }}
     }}
@@ -645,8 +648,12 @@ THAI SOURCE — _en fields mandatory on every triple:
 
 FIELD NOTES:
 - attributes, relationship_attributes: omit entirely when empty — never output {{}}
-- attributes_en / relationship_attributes_en: omit when parent field is omitted
-- causal_link: null when no explicit causation is stated
+- validFrom, validTo: omit entirely when no specific date in text — never output null
+- causal_link: omit entirely when no explicit causation — never output null
+- status: omit entirely — only include "status": "Archived" when explicitly superseded
+- Do NOT output any _en fields (name_en, predicate_en, attributes_en,
+  relationship_attributes_en, evidence_quote_en) — these are added by a
+  separate post-processing translation step after extraction.
 
 ═══════════════════════════════════
 EXAMPLES
@@ -665,10 +672,13 @@ ENGLISH — Numbered source content:
 COVERAGE STRATEGY: 2 lines → extract 5+ triples → all use lines 1-2
 = 100% line coverage = excellent
 
+NOTE: This is a minimal 2-line example for illustration only.  For a real
+50-line chunk you must use wide overlapping ranges such as {"start": 1, "end": 30}
+for most triples — NOT {"start": N, "end": N+1} for every triple.
+
 {{
   "document_metadata": {{
     "detected_language": "en",
-    "reference_date": null,
     "source_id": "example.pdf",
     "chunk_id": 1
   }},
@@ -686,11 +696,7 @@ COVERAGE STRATEGY: 2 lines → extract 5+ triples → all use lines 1-2
       }},
       "properties": {{
         "label": "CLASSIFICATION",
-        "status": "Current",
-        "evidence_lines": {{ "start": 1, "end": 2 }},
-        "validFrom": null,
-        "validTo": null,
-        "causal_link": null
+        "evidence_lines": {{ "start": 1, "end": 2 }}
       }}
     }},
     {{
@@ -707,11 +713,9 @@ COVERAGE STRATEGY: 2 lines → extract 5+ triples → all use lines 1-2
       "relationship_attributes": {{ "value": "฿1.1 trillion", "reference_year": "2024" }},
       "properties": {{
         "label": "MARKET_PERFORMANCE",
-        "status": "Current",
         "evidence_lines": {{ "start": 1, "end": 2 }},
         "validFrom": "2024-01-01",
-        "validTo": "2024-12-31",
-        "causal_link": null
+        "validTo": "2024-12-31"
       }}
     }},
     {{
@@ -727,11 +731,9 @@ COVERAGE STRATEGY: 2 lines → extract 5+ triples → all use lines 1-2
       "relationship_attributes": {{ "value": "14%", "period": "year-over-year", "reference_year": "2024" }},
       "properties": {{
         "label": "MARKET_PERFORMANCE",
-        "status": "Current",
         "evidence_lines": {{ "start": 1, "end": 2 }},
         "validFrom": "2024-01-01",
-        "validTo": "2024-12-31",
-        "causal_link": null
+        "validTo": "2024-12-31"
       }}
     }},
     {{
@@ -748,11 +750,9 @@ COVERAGE STRATEGY: 2 lines → extract 5+ triples → all use lines 1-2
       "relationship_attributes": {{ "reference_year": "2024" }},
       "properties": {{
         "label": "MEASUREMENT",
-        "status": "Current",
         "evidence_lines": {{ "start": 1, "end": 2 }},
         "validFrom": "2024-01-01",
-        "validTo": "2024-12-31",
-        "causal_link": null
+        "validTo": "2024-12-31"
       }}
     }}
   ]
@@ -767,7 +767,7 @@ IMPORTANT: This 2-line example demonstrates the REQUIRED extraction density.
 COVERAGE STRATEGY: 2 lines → extract 8+ fine-grained triples → all use lines 1-2
 = 100% line coverage = excellent coverage
 
-For a 50-line chunk, you should extract 75-120 triples with similar density.
+For a 50-line chunk, you should extract 75+ triples with similar density — there is no upper limit.
 
 {{
   "document_metadata": {{
@@ -780,21 +780,17 @@ For a 50-line chunk, you should extract 75-120 triples with similar density.
     {{
       "subject": {{
         "name": "ศักยภาพของชุมชนท้องถิ่น",
-        "name_en": "Local Community Capacity",
         "label": "CommunityCapacity"
       }},
       "predicate": "เกิดจาก",
-      "predicate_en": "IS_DERIVED_FROM",
       "object": {{
         "name": "ทุนทางสังคมในชุมชน",
-        "name_en": "Community Social Capital",
         "label": "SocialCapital"
       }},
       "properties": {{
         "label": "CAUSATION",
         "status": "Current",
-        "evidence_lines": {{ "start": 1, "end": 2 }},
-        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "evidence_lines": {{ "start": 1, "end": 5 }},
         "validFrom": null,
         "validTo": null,
         "causal_link": {{
@@ -807,21 +803,17 @@ For a 50-line chunk, you should extract 75-120 triples with similar density.
     {{
       "subject": {{
         "name": "ทุนทางสังคม",
-        "name_en": "Social Capital",
         "label": "SocialCapital"
       }},
       "predicate": "ประกอบด้วย",
-      "predicate_en": "CONSISTS_OF",
       "object": {{
         "name": "องค์ประกอบทุนทางสังคม",
-        "name_en": "Social Capital Components",
         "label": "SocialCapitalComponent"
       }},
       "properties": {{
         "label": "COMPOSITION",
         "status": "Current",
-        "evidence_lines": {{ "start": 1, "end": 2 }},
-        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "evidence_lines": {{ "start": 1, "end": 5 }},
         "validFrom": null,
         "validTo": null,
         "causal_link": null
@@ -830,23 +822,18 @@ For a 50-line chunk, you should extract 75-120 triples with similar density.
     {{
       "subject": {{
         "name": "ทุนทางสังคม",
-        "name_en": "Social Capital",
         "label": "SocialCapital"
       }},
       "predicate": "ประกอบด้วย",
-      "predicate_en": "INCLUDES",
       "object": {{
         "name": "บุคคล",
-        "name_en": "Individuals",
         "label": "Actor",
-        "attributes": {{ "category": "องค์ประกอบที่ 1" }},
-        "attributes_en": {{ "category": "Component 1" }}
+        "attributes": {{ "category": "องค์ประกอบที่ 1" }}
       }},
       "properties": {{
         "label": "COMPOSITION",
         "status": "Current",
-        "evidence_lines": {{ "start": 1, "end": 2 }},
-        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "evidence_lines": {{ "start": 1, "end": 5 }},
         "validFrom": null,
         "validTo": null,
         "causal_link": null
@@ -855,23 +842,18 @@ For a 50-line chunk, you should extract 75-120 triples with similar density.
     {{
       "subject": {{
         "name": "บุคคล",
-        "name_en": "Individuals",
         "label": "Actor"
       }},
       "predicate": "รวมถึง",
-      "predicate_en": "INCLUDES_ROLE",
       "object": {{
         "name": "ผู้นำ",
-        "name_en": "Leaders",
         "label": "CommunityRole",
-        "attributes": {{ "type": "leadership" }},
-        "attributes_en": {{ "type": "leadership" }}
+        "attributes": {{ "type": "ผู้นำ" }}
       }},
       "properties": {{
         "label": "CLASSIFICATION",
         "status": "Current",
-        "evidence_lines": {{ "start": 1, "end": 2 }},
-        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "evidence_lines": {{ "start": 1, "end": 5 }},
         "validFrom": null,
         "validTo": null,
         "causal_link": null
@@ -880,23 +862,18 @@ For a 50-line chunk, you should extract 75-120 triples with similar density.
     {{
       "subject": {{
         "name": "บุคคล",
-        "name_en": "Individuals",
         "label": "Actor"
       }},
       "predicate": "รวมถึง",
-      "predicate_en": "INCLUDES_ROLE",
       "object": {{
         "name": "นักสู้",
-        "name_en": "Fighters",
         "label": "CommunityRole",
-        "attributes": {{ "type": "activism" }},
-        "attributes_en": {{ "type": "activism" }}
+        "attributes": {{ "type": "นักกิจกรรม" }}
       }},
       "properties": {{
         "label": "CLASSIFICATION",
         "status": "Current",
-        "evidence_lines": {{ "start": 1, "end": 2 }},
-        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "evidence_lines": {{ "start": 1, "end": 5 }},
         "validFrom": null,
         "validTo": null,
         "causal_link": null
@@ -905,23 +882,18 @@ For a 50-line chunk, you should extract 75-120 triples with similar density.
     {{
       "subject": {{
         "name": "บุคคล",
-        "name_en": "Individuals",
         "label": "Actor"
       }},
       "predicate": "รวมถึง",
-      "predicate_en": "INCLUDES_ROLE",
       "object": {{
         "name": "ปราชญ์",
-        "name_en": "Scholars",
         "label": "CommunityRole",
-        "attributes": {{ "type": "knowledge" }},
-        "attributes_en": {{ "type": "knowledge" }}
+        "attributes": {{ "type": "ผู้มีความรู้" }}
       }},
       "properties": {{
         "label": "CLASSIFICATION",
         "status": "Current",
-        "evidence_lines": {{ "start": 1, "end": 2 }},
-        "evidence_quote_en": "Local community capacity is derived from the utilisation of all social capital in the community. Social capital consists of 1) individuals, namely leaders, fighters, scholars",
+        "evidence_lines": {{ "start": 1, "end": 5 }},
         "validFrom": null,
         "validTo": null,
         "causal_link": null
@@ -939,7 +911,8 @@ STOP. Before you submit your JSON response, verify these requirements:
 ✓ TRIPLE COUNT CHECK:
   - Count the source text words
   - Count your triples
-  - Ratio should be at least 1 triple per 13 words (e.g., 300 words → 23+ triples)
+  - Minimum ratio: 1 triple per 13 words (e.g., 300 words → 23+ triples)
+  - Hard maximum: 80 triples per chunk — stop and remove duplicates if over
   - If too few triples → go back and extract more fine-grained facts
 
 ✓ EVIDENCE LINES RANGE CHECK:
@@ -972,11 +945,7 @@ def create_triple_extraction_prompt(
     source_file: str,
     chunk_id: int,
 ) -> str:
-    """Create the full combined prompt (backwards compatibility).
-    
-    Note: For new code using stateful agents, use
-    create_triple_extraction_user_message() instead.
-    """
+    """Create the full combined prompt (backwards compatibility)."""
     return TRIPLE_EXTRACTION_SYSTEM_PROMPT + "\n\n" + create_triple_extraction_user_message(content, source_file, chunk_id)
 
 
@@ -1053,3 +1022,63 @@ IMPORTANT: location_moo and location_village are MANDATORY fields. You MUST find
 Return ONLY valid JSON with the above fields. Use empty strings for missing optional string fields and 0 for missing integer fields.
 """
     return prompt
+
+
+# ---------------------------------------------------------------------------
+# Translation prompt — used by TripleExtractor._translate_chunk_triples()
+# Runs against anthropic/claude-3-haiku (cheap model).
+# ---------------------------------------------------------------------------
+
+TRANSLATION_SYSTEM_PROMPT = """You are a precise Thai-to-English translator for a knowledge graph pipeline.
+
+You will receive a JSON array of translation items extracted from Thai documents.
+Each item has an "id" and one or more Thai-language fields to translate.
+
+Translate EVERY field that ends with "_th" suffix into an English equivalent:
+  subject_th        → subject_en        (entity name, preserve proper nouns)
+  predicate_th      → predicate_en      (ALL_CAPS_SNAKE_CASE verb phrase — see rules below)
+  object_th         → object_en         (entity name, preserve proper nouns)
+  attributes_th     → attributes_en     (same keys, translate values only)
+  obj_attributes_th → obj_attributes_en (same keys, translate values only)
+  rel_attrs_th      → rel_attrs_en      (same keys, translate values only)
+  evidence_quote_th → evidence_quote_en (complete translation, preserve all facts)
+
+Translation rules:
+- Proper nouns keep their established English form:
+    "ธนาคารแห่งประเทศไทย" → "Bank of Thailand"
+    "บ้านป่าสักยาว"       → "Ban Pa Sak Yao"
+- predicate_en MUST be ALL_CAPS_SNAKE_CASE (e.g. IS_DERIVED_FROM, CONSISTS_OF, HAS_DETAILS)
+- attributes_en and rel_attrs_en: translate dict values, keep keys unchanged
+- evidence_quote_en: translate the full Thai text completely — do not summarise,
+  do not truncate, preserve every fact and number
+
+CRITICAL JSON OUTPUT RULE:
+Every value in the output — including predicate_en — MUST be a quoted JSON string.
+NEVER output an unquoted identifier as a value.
+
+  ✗ WRONG:  "predicate_en": HAS_DETAILS
+  ✓ CORRECT: "predicate_en": "HAS_DETAILS"
+
+  ✗ WRONG:  "predicate_en": IS_ORGANIZED
+  ✓ CORRECT: "predicate_en": "IS_ORGANIZED"
+
+Return a JSON array — one object per input item, same order, each with:
+  { "id": <same id>, <translated fields> }
+
+Output ONLY the JSON array. No prose before or after it."""
+
+
+def create_translation_user_message(items: list) -> str:
+    """Build the user message for a batch translation call.
+
+    Args:
+        items: List of dicts with keys:
+            id, subject_th, predicate_th, object_th,
+            attributes_th (optional), rel_attrs_th (optional),
+            evidence_quote_th (optional)
+
+    Returns:
+        JSON string to send as the user message to the translation LLM.
+    """
+    import json as _json
+    return _json.dumps(items, ensure_ascii=False)
