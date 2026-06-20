@@ -1063,8 +1063,7 @@ class PreProcessor:
         chunk_id from _restructure_by_indices / _all_from_sources — the
         community_id there is exactly the S3 key prefix, and chunk_id is
         the same integer the evidence_registry payload stores in its
-        "chunk_id" field (see qdrant_tools.get_evidence_by_ids /
-        search_evidence chunk_id resolution) and that neo4j_graph_builder.py
+        "chunk_id" field and that neo4j_graph_builder.py
         writes onto relationship properties. No ID translation is needed —
         this just builds (community_id, chunk_id) refs and calls
         chunk_tools.fetch_s3_chunks directly, in Python, no LLM involved.
