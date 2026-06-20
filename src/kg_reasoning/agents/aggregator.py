@@ -388,17 +388,27 @@ def _canonical_link_lines(
     entity_details: Dict[str, Any],
     predicate_details: Dict[str, Any],
 ) -> List[str]:
-    """Render 'raw name -> (linked) -> canonical name' lines for one result.
+    """Render 'raw name -> (linked) -> canonical name [canonical_en]' lines
+    for one result.
 
     entity_details / predicate_details come straight from the preprocessor
     (state["preprocessor_entity_details"] / state["preprocessor_predicate_details"]):
-    canonical_id -> {"name": <canonical name>, "raw_names": [<raw surface
-    forms>], "score": <float>}. A result's subject/object only carry
-    canonical_id + canonical name (that's all Neo4j nodes store) — this
-    looks up the SAME canonical_id in entity_details to recover every raw
-    surface form that resolved to it, giving the synthesizer the link the
-    preprocessor already established between what was actually extracted
-    from text and what the graph calls it.
+    canonical_id -> {"name": <canonical name>, "name_en": <English
+    translation, if any>, "raw_names": [<raw surface forms>], "score":
+    <float>}. A result's subject/object only carry canonical_id +
+    canonical name (that's all Neo4j nodes store) — this looks up the SAME
+    canonical_id in entity_details to recover every raw surface form that
+    resolved to it, giving the synthesizer the link the preprocessor
+    already established between what was actually extracted from text and
+    what the graph calls it.
+
+    The "[canonical_en]" suffix is appended ONLY when the canonical record
+    actually has a name_en — most registry entries won't, since this
+    depends on whether the live Qdrant schema populates that field. There
+    is no raw-side English equivalent rendered (e.g. "raw [raw_en]") since
+    raw names come from evidence_registry's plain extracted strings, which
+    have no parallel translation field anywhere in the pipeline — only
+    curated canonical entries plausibly carry one.
 
     One line per (raw_name, canonical_name) pair, deduplicated across a
     single result (a triple touches up to 3 canonical things: subject,
@@ -407,20 +417,32 @@ def _canonical_link_lines(
     lines: List[str] = []
     seen_pairs: Set[Tuple[str, str]] = set()
 
+    def _format_canonical(canonical_name: str, canonical_name_en: str = "") -> str:
+        """'canonical name [canonical_en]' when name_en exists, else just 'canonical name'."""
+        if canonical_name_en:
+            return f"{canonical_name} [{canonical_name_en}]"
+        return canonical_name
+
     def _add_for(canonical_id: str, details: Dict[str, Any]) -> None:
         info = details.get(canonical_id)
         if not info:
             return
         canonical_name = info.get("name", "")
+        canonical_display = _format_canonical(canonical_name, info.get("name_en", ""))
         for raw_name in info.get("raw_names", []):
             if not raw_name or raw_name == canonical_name:
                 # Skip when the raw form and canonical form are identical —
                 # there is nothing to link, it would just be noise.
                 continue
+            # Dedup key uses the raw canonical name (not the display
+            # string with the [en] suffix) — the suffix is cosmetic, not
+            # part of identity, so two results linking the same
+            # (raw_name, canonical_name) pair still dedupe correctly
+            # regardless of whether name_en is present.
             pair = (raw_name, canonical_name)
             if pair not in seen_pairs:
                 seen_pairs.add(pair)
-                lines.append(f"{raw_name} -> (linked) -> {canonical_name}")
+                lines.append(f"{raw_name} -> (linked) -> {canonical_display}")
 
     subj = result.get("subject")
     if isinstance(subj, dict) and subj.get("canonical_id"):
@@ -437,12 +459,13 @@ def _canonical_link_lines(
     if predicate_name:
         for pid, info in predicate_details.items():
             if info.get("name") == predicate_name:
+                predicate_display = _format_canonical(predicate_name, info.get("name_en", ""))
                 for raw_name in info.get("raw_names", []):
                     if raw_name and raw_name != predicate_name:
                         pair = (raw_name, predicate_name)
                         if pair not in seen_pairs:
                             seen_pairs.add(pair)
-                            lines.append(f"{raw_name} -> (linked) -> {predicate_name}")
+                            lines.append(f"{raw_name} -> (linked) -> {predicate_display}")
                 break
 
     # Path chains: walk node entries for subject/object-style canonical links.

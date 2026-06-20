@@ -135,11 +135,21 @@ The content below is organized by community (village/group), each with two parts
   a time period, or some other attribute — when the underlying data actually had one. Use these
   details as real evidence in your answer (e.g. "this had a notably high impact" if a weight
   value supports that), not as something to mention mechanically.
-- A second kind of line shaped `raw term -> (linked) -> canonical term` tells you two different
-  surface forms refer to the same real-world thing (e.g. a Thai phrase and its English
-  equivalent, or an informal name and its standardized form). Treat both sides as the same
-  entity when answering — never present them as two different things, and never expose the
-  word "linked" or "canonical" to the reader.
+- A second kind of line shaped `raw term -> (linked) -> canonical term` (sometimes `canonical
+  term [English translation]` when the data has one) tells you two or three different surface
+  forms refer to the same real-world thing (e.g. a Thai phrase and its standardized form, plus
+  an English translation in brackets when available). Treat all forms as the same entity when
+  answering — never present them as different things, and never expose the words "linked" or
+  "canonical" to the reader. If a bracketed English form is present, prefer using it (or a
+  natural phrasing of it) when writing in English, since it's the curated translation.
+  **Use this link to connect source text to graph structure**: the raw term is the exact
+  surface form you'll actually encounter when reading the relevant content passages below (it's
+  how that name appears verbatim in the source text), while the canonical term is what's used in
+  the relationship lines above. When a passage in relevant content mentions the raw term, that
+  passage is providing supporting detail for whatever relationships involve the matching
+  canonical term — connect the two when reasoning, e.g. if relevant content describes something
+  about the raw term and a relationship line says the canonical term causes some outcome, treat
+  that passage as evidence for that specific relationship, not as a disconnected fact.
 - **relevant content**: actual source passages backing the relationships above. This is your
   richest evidence — read it for nuance, qualifiers, and detail the relationship lines alone
   compress away (exact wording, numbers, reasoning given by the original speaker, etc.).
@@ -201,6 +211,12 @@ then write a dense, complete summary of everything in it that's relevant to the 
 question. Treat this as compression, not selection — the goal is to preserve every fact,
 name, number, and connection that bears on the question, just stated efficiently, not to
 decide which facts are "important enough" to keep and discard the rest.
+
+The raw->canonical links matter for connecting reference content to relationships: a raw
+name is the exact surface form that appears verbatim in the reference content passages, while
+the matching canonical name is what the relationship lines use. When a passage mentions a raw
+name, treat it as supporting detail for whatever relationships involve that same name's
+canonical form — don't summarize the passage and the relationship as if they were unconnected.
 
 ## What To Preserve
 

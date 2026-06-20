@@ -840,6 +840,11 @@ class PreProcessor:
             for rec in canonical_records
             if rec.get("canonical_id")
         }
+        canonical_name_en_by_cid: Dict[str, str] = {
+            rec["canonical_id"]: rec.get("name_en", "")
+            for rec in canonical_records
+            if rec.get("canonical_id")
+        }
 
         ids: List[str] = []
         details: Dict[str, Dict[str, Any]] = {}
@@ -851,6 +856,10 @@ class PreProcessor:
                 # (e.g. transient fetch failure) so we never silently drop
                 # a canonical_id that call 1 already confirmed exists.
                 "name": canonical_name_by_cid.get(cid, ""),
+                # English translation of the canonical name, when the
+                # registry payload actually has one — empty string
+                # otherwise, never fabricated or duplicated from "name".
+                "name_en": canonical_name_en_by_cid.get(cid, ""),
                 "score": best_score_by_cid.get(cid, 0.0),
                 "raw_names": raw_names_by_cid[cid],
             }
@@ -904,6 +913,11 @@ class PreProcessor:
             for rec in canonical_records
             if rec.get("canonical_id")
         }
+        canonical_name_en_by_cid: Dict[str, str] = {
+            rec["canonical_id"]: rec.get("name_en", "")
+            for rec in canonical_records
+            if rec.get("canonical_id")
+        }
 
         ids: List[str] = []
         details: Dict[str, Dict[str, Any]] = {}
@@ -911,6 +925,7 @@ class PreProcessor:
             ids.append(cid)
             details[cid] = {
                 "name": canonical_name_by_cid.get(cid, ""),
+                "name_en": canonical_name_en_by_cid.get(cid, ""),
                 "score": best_score_by_cid.get(cid, 0.0),
                 "raw_names": raw_names_by_cid[cid],
             }
@@ -1063,7 +1078,8 @@ class PreProcessor:
         chunk_id from _restructure_by_indices / _all_from_sources — the
         community_id there is exactly the S3 key prefix, and chunk_id is
         the same integer the evidence_registry payload stores in its
-        "chunk_id" field and that neo4j_graph_builder.py
+        "chunk_id" field (see qdrant_tools.get_evidence_by_ids /
+        search_evidence chunk_id resolution) and that neo4j_graph_builder.py
         writes onto relationship properties. No ID translation is needed —
         this just builds (community_id, chunk_id) refs and calls
         chunk_tools.fetch_s3_chunks directly, in Python, no LLM involved.

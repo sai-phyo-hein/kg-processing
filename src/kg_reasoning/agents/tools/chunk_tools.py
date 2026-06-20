@@ -3,8 +3,8 @@
 NEW MODULE.
 
 Chunks are stored in S3 at:
-    s3://{S3_BUCKET}/{community_id}/chunk_{chunk_id:03d}.txt
-    s3://{S3_BUCKET}/{community_id}/manifest.json
+    s3://{SOURCE_DOC_BUCKET}/{community_id}/chunk_{chunk_id:03d}.txt
+    s3://{SOURCE_DOC_BUCKET}/{community_id}/manifest.json
 
 The community_id and chunk_id both live as properties on Neo4j relationship
 edges (stored by neo4j_graph_builder.py: edge_props["chunk_id"] = chunk_id,
@@ -57,7 +57,7 @@ def _get_s3_client():
 
 
 def _get_bucket() -> str:
-    return os.getenv("S3_BUCKET", "document")
+    return os.getenv("SOURCE_DOC_BUCKET", "document")
 
 
 def _s3_key(community_id: str, chunk_id: int) -> str:

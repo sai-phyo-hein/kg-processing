@@ -592,7 +592,7 @@ def upload_chunks_to_s3(
     Args:
         chunks_dir: Local directory holding the saved chunk files.
         community_id: S3 key prefix (the community/document unique_id).
-        bucket: S3 bucket name. Defaults to env ``S3_BUCKET`` or ``"document"``.
+        bucket: S3 bucket name. Defaults to env ``SOURCE_DOC_BUCKET`` or ``"document"``.
 
     Returns:
         Number of files successfully uploaded.
@@ -612,7 +612,7 @@ def upload_chunks_to_s3(
         return 0
 
     if bucket is None:
-        bucket = os.getenv("S3_BUCKET", "document")
+        bucket = os.getenv("SOURCE_DOC_BUCKET", "document")
 
     src_dir = Path(chunks_dir)
     files = sorted(p for p in src_dir.iterdir() if p.is_file())
