@@ -33,7 +33,6 @@ EVIDENCE_VECTOR_DIM = int(os.getenv("EVIDENCE_VECTOR_DIM", "3072"))
 # Reasoning agents
 REASONING_PROVIDER = os.getenv("REASONING_PROVIDER", "openai")
 ORCHESTRATOR_MODEL = os.getenv("ORCHESTRATOR_MODEL", "gpt-4o")
-WORKER_MODEL = os.getenv("WORKER_MODEL", "gpt-4o-mini")
 SYNTHESIZER_MODEL = os.getenv("SYNTHESIZER_MODEL", "gpt-4o")
 PREPROCESSING_MODEL = os.getenv("PREPROCESSING_MODEL", "gpt-4o-mini")
 

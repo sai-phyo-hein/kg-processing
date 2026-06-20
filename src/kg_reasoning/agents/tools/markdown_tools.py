@@ -32,58 +32,254 @@ class MarkdownToolsManager:
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Properties stripped before writing to markdown.
-    # Embedding vectors (~512 floats each) and sparse index arrays are the
-    # primary token-count offenders. A single triple with embeddings on
-    # subject, predicate, and object can exceed 3000 tokens. Raw/source
-    # text duplicates what the predicate name already conveys.
-    # Node properties kept for synthesis — everything else is dropped.
-    # canonical_id and name identify the entity; type describes what it is.
-    _KEEP_NODE_PROPS: frozenset = frozenset([
-        "name", "canonical_id", "type",
-    ])
-
-    # Relationship properties kept for synthesis.
-    # type_name carries the semantic relation; community_id scopes it to a
-    # village. Everything else (chunk_id, updated_at, status, label,
-    # embeddings, sparse arrays, source/raw text) is indexing metadata.
-    _KEEP_REL_PROPS: frozenset = frozenset([
-        "community_id",
-    ])
+    # ── Sentence rendering ──────────────────────────────────────────────
+    # All result shapes are rendered as human-readable sentences so the
+    # synthesizer reads structured text rather than raw JSON. The LLM never
+    # needs to parse JSON fields — it reads sentences like:
+    #
+    #   [Water User Group] --(IMPACT_ON)--> [Health Impact of Tap Water Users]
+    #     community: หมู่-1_village-1  chunk: 5
+    #
+    #   PATH: [A] --(CAUSES)--> [B] --(LEADS_TO)--> [C]
+    #
+    #   EVIDENCE: "original source quote here"  (EN: "english translation")
+    #     entities: X, Y  predicates: CAUSES, LEADS_TO
+    #
+    # Each renderer returns a plain string. write_query_results calls the
+    # right renderer for each result shape and writes one sentence block
+    # per result — no JSON fences in the output.
 
     @staticmethod
+    def _render_triple(result: Dict[str, Any]) -> str:
+        """Render a subject-predicate-object triple as a sentence."""
+        subj = result.get("subject") or {}
+        obj  = result.get("object") or {}
+        pred = result.get("predicate", "?")
+        community = result.get("community_id", "")
+        chunk_id  = result.get("chunk_id", "")
+        properties = result.get("properties") or {}
+
+        subj_name = subj.get("name", "?") if isinstance(subj, dict) else str(subj)
+        subj_type = subj.get("type", "")  if isinstance(subj, dict) else ""
+        obj_name  = obj.get("name", "?")  if isinstance(obj, dict)  else str(obj)
+        obj_type  = obj.get("type", "")   if isinstance(obj, dict)  else ""
+
+        subj_str = f"[{subj_name}]" + (f" ({subj_type})" if subj_type else "")
+        obj_str  = f"[{obj_name}]"  + (f" ({obj_type})"  if obj_type  else "")
+
+        line = f"{subj_str} --({pred})--> {obj_str}"
+
+        meta_parts = []
+        if community:
+            meta_parts.append(f"community: {community}")
+        if chunk_id:
+            meta_parts.append(f"chunk: {chunk_id}")
+        if meta_parts:
+            line += "\n  " + "  ".join(meta_parts)
+
+        # Any other edge property — attribute, causal_link/weight,
+        # temporal_link, etc. — rendered as its own line so it's visible to
+        # a human/LLM reader without guessing a fixed property name.
+        if properties:
+            prop_parts = [f"{k}: {v}" for k, v in properties.items() if v is not None]
+            if prop_parts:
+                line += "\n  " + "  ".join(prop_parts)
+
+        return line
+
+    @staticmethod
+    def _render_path(result: Dict[str, Any]) -> str:
+        """Render a path chain as a sentence: [A] --(P)--> [B] --(Q)--> [C]."""
+        path_data = result.get("path") or result.get("p") or result
+        chain = path_data.get("chain", []) if isinstance(path_data, dict) else []
+        community_ids = path_data.get("community_ids", []) if isinstance(path_data, dict) else []
+
+        if not chain:
+            return "[empty path]"
+
+        parts = []
+        edge_notes = []
+        for item in chain:
+            if isinstance(item, dict) and "predicate" in item:
+                # Relationship entry from _slim_path: {"predicate": ...,
+                # "properties": {...}?}. Render the predicate inline like
+                # the old plain-string format, and collect any extra
+                # properties as a footnote rather than breaking the
+                # arrow-chain line with embedded key:value text.
+                parts.append(f"--({item['predicate']})-->")
+                props = item.get("properties") or {}
+                if props:
+                    prop_str = ", ".join(f"{k}: {v}" for k, v in props.items() if v is not None)
+                    if prop_str:
+                        edge_notes.append(f"[{item['predicate']}] {prop_str}")
+            elif isinstance(item, dict):
+                name = item.get("name", "?")
+                typ  = item.get("type", "")
+                parts.append(f"[{name}]" + (f" ({typ})" if typ else ""))
+            elif isinstance(item, str):
+                # Backward-compatible: older slim format emitted a plain
+                # predicate string between nodes.
+                parts.append(f"--({item})-->")
+            else:
+                parts.append(str(item))
+
+        line = " ".join(parts)
+        if community_ids:
+            line += f"\n  communities: {', '.join(community_ids)}"
+        if edge_notes:
+            line += "\n  " + "  ".join(edge_notes)
+        return f"PATH: {line}"
+
+    @staticmethod
+    def _render_evidence(result: Dict[str, Any]) -> str:
+        """Render an evidence chunk (from Qdrant or S3) as a sentence block."""
+        quote    = result.get("evidence_quote", "")
+        quote_en = result.get("evidence_quote_en", "")
+        entities  = result.get("entities", [])
+        predicates = result.get("predicates", [])
+        community = result.get("community_id", "")
+        chunk_id  = result.get("chunk_id", "")
+
+        lines = []
+
+        # Primary quote — prefer English translation when available
+        if quote_en:
+            lines.append(f'EVIDENCE (EN): "{quote_en}"')
+            if quote and quote != quote_en:
+                lines.append(f'EVIDENCE (original): "{quote}"')
+        elif quote:
+            lines.append(f'EVIDENCE: "{quote}"')
+
+        # S3 full chunk text
+        text = result.get("text", "")
+        if text and text != quote:
+            # Truncate very long S3 chunks for display
+            display = text if len(text) <= 600 else text[:600] + "…"
+            lines.append(f'SOURCE TEXT: "{display}"')
+
+        meta = []
+        if entities:
+            meta.append(f"entities: {', '.join(entities)}")
+        if predicates:
+            meta.append(f"predicates: {', '.join(predicates)}")
+        if community:
+            meta.append(f"community: {community}")
+        if chunk_id:
+            meta.append(f"chunk: {chunk_id}")
+        if meta:
+            lines.append("  " + "  |  ".join(meta))
+
+        return "\n".join(lines) if lines else "[empty evidence]"
+
+    @staticmethod
+    def _render_result(result: Dict[str, Any]) -> str:
+        """Dispatch to the right renderer based on result shape."""
+        # Triple shape: subject / predicate / object
+        if (
+            "subject" in result
+            and "predicate" in result
+            and "object" in result
+            and isinstance(result.get("subject"), dict)
+            and isinstance(result.get("object"), dict)
+        ):
+            return MarkdownToolsManager._render_triple(result)
+
+        # Path shape
+        if "path" in result or "p" in result or (
+            isinstance(result.get("chain"), list)
+        ):
+            return MarkdownToolsManager._render_path(result)
+
+        # Evidence chunk shape (from Qdrant or S3)
+        if "evidence_quote" in result or "evidence_quote_en" in result or "text" in result:
+            return MarkdownToolsManager._render_evidence(result)
+
+        # Generic fallback: render key: value lines
+        lines = []
+        for k, v in result.items():
+            if isinstance(v, dict):
+                v_str = ", ".join(f"{kk}: {vv}" for kk, vv in v.items() if vv)
+            elif isinstance(v, list):
+                v_str = ", ".join(str(i) for i in v)
+            else:
+                v_str = str(v) if v is not None else ""
+            if v_str:
+                lines.append(f"{k}: {v_str}")
+        return "\n".join(lines) if lines else "[empty result]"
+
+    # Legacy slim methods kept so any external callers don't break —
+    # write_query_results no longer calls these internally.
+    @staticmethod
     def _slim_node(value: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract only name, canonical_id, type from a node."""
-        return {
-            k: v for k, v in value.get("properties", {}).items()
-            if k in MarkdownToolsManager._KEEP_NODE_PROPS
-        }
+        return {k: v for k, v in value.get("properties", {}).items()
+                if k in ("name", "canonical_id", "type")}
 
     @staticmethod
     def _slim_rel_type(value: Dict[str, Any]) -> str:
-        """Extract predicate name from a relationship."""
         return value.get("type_name") or value.get("type", "")
 
     @staticmethod
     def _slim_rel_community(value: Dict[str, Any]) -> Optional[str]:
-        """Extract community_id from a relationship."""
         return value.get("properties", {}).get("community_id")
+
+    # Properties excluded from the surfaced "properties" dict:
+    #   - community_id, chunk_id: already surfaced as their own top-level
+    #     fields elsewhere in the slimmed result, so kept out here to avoid
+    #     duplication.
+    #   - updated_at, label, status: graph-builder bookkeeping rather than
+    #     semantic content. In observed data, updated_at carries the literal
+    #     unevaluated string "datetime()" (not an actual timestamp — a bug
+    #     upstream in whatever wrote it, not something to surface as if it
+    #     were real temporal data), label is an internal edge-category tag
+    #     duplicating the predicate's own type, and status is a lifecycle
+    #     flag ("Current") rather than a fact about the relationship. None
+    #     of these are the attribute/causal-link/temporal-link content this
+    #     method exists to preserve.
+    _REL_PROPERTY_EXCLUDE = {
+        "community_id", "chunk_id",
+        "updated_at", "label", "status",
+    }
+
+    @classmethod
+    def _slim_rel_properties(cls, value: Dict[str, Any]) -> Dict[str, Any]:
+        """Return every relationship property NOT already broken out
+        separately (community_id, chunk_id) and not graph-builder
+        bookkeeping (updated_at, label, status) — e.g. attribute,
+        causal_link/weight, temporal_link, or any other genuine edge
+        property the graph builder wrote, whatever its name. This is what
+        carries predicate attributes, causal-link weights, and temporal
+        links through to the aggregator; without it, only the predicate
+        type name and community_id survived past this slimming step, and
+        any other edge property was silently dropped before a worker's
+        markdown file was even written.
+
+        Deliberately unconditional beyond the exclude list above — edges
+        carry these properties inconsistently (some triples have a causal
+        weight, some don't; field names aren't guaranteed to match an
+        orchestrator-requested key exactly), so this passes through
+        whatever actually exists rather than guessing names.
+        """
+        props = value.get("properties", {}) or {}
+        return {
+            k: v for k, v in props.items()
+            if k not in cls._REL_PROPERTY_EXCLUDE
+        }
 
     @staticmethod
     def _slim_path(value: Dict[str, Any]) -> Dict[str, Any]:
-        """Render a path as an ordered chain: [node, predicate, node, predicate, node, ...].
-
-        This preserves connectivity — the synthesizer can read the chain left-to-right
-        and know exactly which nodes are joined by which predicate, rather than
-        receiving two separate parallel arrays of nodes and relationships.
-        """
         nodes = value.get("nodes", [])
         rels  = value.get("relationships", [])
         if not nodes:
             return {"chain": []}
         chain: List[Any] = [MarkdownToolsManager._slim_node(nodes[0])]
         for i, rel in enumerate(rels):
-            chain.append(MarkdownToolsManager._slim_rel_type(rel))
+            rel_entry: Dict[str, Any] = {
+                "predicate": MarkdownToolsManager._slim_rel_type(rel),
+            }
+            extra_props = MarkdownToolsManager._slim_rel_properties(rel)
+            if extra_props:
+                rel_entry["properties"] = extra_props
+            chain.append(rel_entry)
             if i + 1 < len(nodes):
                 chain.append(MarkdownToolsManager._slim_node(nodes[i + 1]))
         community_ids = list({
@@ -95,38 +291,27 @@ class MarkdownToolsManager:
 
     @staticmethod
     def _slim_value(value: Any) -> Any:
-        """Slim a single Neo4j value — used for non-triple row fields."""
         if not isinstance(value, dict):
             return value
         node_type = value.get("type")
         if node_type == "node":
             return MarkdownToolsManager._slim_node(value)
         if node_type == "relationship":
-            return {
+            entry: Dict[str, Any] = {
                 "predicate":    MarkdownToolsManager._slim_rel_type(value),
                 "community_id": MarkdownToolsManager._slim_rel_community(value),
             }
+            extra_props = MarkdownToolsManager._slim_rel_properties(value)
+            if extra_props:
+                entry["properties"] = extra_props
+            return entry
         if node_type == "path":
             return MarkdownToolsManager._slim_path(value)
         return {k: MarkdownToolsManager._slim_value(v) for k, v in value.items()}
 
     @classmethod
     def _slim_result(cls, result: Dict[str, Any]) -> Dict[str, Any]:
-        """Slim one raw Neo4j result row.
-
-        Detects the common subject/r/object triple shape and renders it as:
-          { subject: {name, canonical_id, type},
-            predicate: "REL_TYPE",
-            object: {name, canonical_id, type},
-            community_id: "..." }
-
-        Path rows (multi-hop expansion) are rendered as a chain list so
-        connectivity is explicit. The redundant "rels" column that
-        accompanies path results is dropped — it duplicates what the chain
-        already contains.
-
-        All other shapes are slimmed field-by-field.
-        """
+        """Convert raw Neo4j result to slimmed triple/path/evidence dict."""
         subj = result.get("subject")
         rel  = result.get("r")
         obj  = result.get("object")
@@ -137,14 +322,23 @@ class MarkdownToolsManager:
             and isinstance(obj,  dict) and obj.get("type")  == "node"
         ):
             community_id = result.get("community_id") or cls._slim_rel_community(rel)
-            return {
+            chunk_id = (rel.get("properties") or {}).get("chunk_id")
+            slimmed: Dict[str, Any] = {
                 "subject":      cls._slim_node(subj),
                 "predicate":    cls._slim_rel_type(rel),
                 "object":       cls._slim_node(obj),
                 "community_id": community_id,
+                "chunk_id":     chunk_id,
             }
-        # Path rows: keep only the path key (rendered as a chain), drop "rels"
-        # which is the raw relationships(path) column and duplicates the chain.
+            # Any other edge property — attribute, causal_link/weight,
+            # temporal_link, or anything else the graph builder wrote —
+            # passed through unconditionally rather than dropped. Only
+            # added when non-empty so triples without extra properties
+            # don't carry a noisy empty dict through to the aggregator.
+            extra_props = cls._slim_rel_properties(rel)
+            if extra_props:
+                slimmed["properties"] = extra_props
+            return slimmed
         if "path" in result or "p" in result:
             path_key = "path" if "path" in result else "p"
             return {path_key: cls._slim_value(result[path_key])}

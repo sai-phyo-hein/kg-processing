@@ -21,6 +21,7 @@ from .nodes import (
     extract_metadata_node,
     chunk_document_node,
     extract_triples_node,
+    translate_triples_node,
     refine_triples_node,
     build_graph_node,
 )
@@ -46,10 +47,11 @@ class WorkflowState(TypedDict):
     refinement_llm_model: str
     build_graph: bool
     output_dir: str
-    until_step: Literal["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_refining", "graph_building"] | None
+    until_step: Literal["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_translation", "triple_refining", "graph_building"] | None
     pages: List[int] | None
     location_moo: str | None
     location_village: str | None
+    chunk_id: int | None
 
     # Intermediate results
     markdown_path: str | None
@@ -78,6 +80,7 @@ def should_continue_to_next_step(state: WorkflowState, current_step: str) -> str
         "extract_metadata": "metadata_extraction",
         "chunk_document": "semantic_chunking",
         "extract_triples": "triple_extraction",
+        "translate_triples": "triple_translation",
         "refine_triples": "triple_refining",
         "build_graph": "graph_building",
     }
@@ -101,6 +104,7 @@ def create_langgraph_workflow() -> StateGraph:
     workflow.add_node("extract_metadata", extract_metadata_node)
     workflow.add_node("chunk_document", chunk_document_node)
     workflow.add_node("extract_triples", extract_triples_node)
+    workflow.add_node("translate_triples", translate_triples_node)
     workflow.add_node("refine_triples", refine_triples_node)
     workflow.add_node("build_graph", build_graph_node)
 
@@ -128,6 +132,12 @@ def create_langgraph_workflow() -> StateGraph:
     workflow.add_conditional_edges(
         "extract_triples",
         lambda state: should_continue_to_next_step(state, "extract_triples"),
+        {"continue": "translate_triples", "complete": END, "error": END},
+    )
+
+    workflow.add_conditional_edges(
+        "translate_triples",
+        lambda state: should_continue_to_next_step(state, "translate_triples"),
         {"continue": "refine_triples", "complete": END, "error": END},
     )
 
@@ -158,7 +168,7 @@ def run_langgraph_workflow(
     triplet_llm_model: str = TRIPLET_MODEL,
     refinement_llm_provider: str = REFINEMENT_PROVIDER,
     refinement_llm_model: str = REFINEMENT_MODEL,
-    until_step: Literal["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_refining", "graph_building"] | None = None,
+    until_step: Literal["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_translation", "triple_refining", "graph_building"] | None = None,
     pages: List[int] | None = None,
     location_moo: str | None = None,
     location_village: str | None = None,
@@ -209,6 +219,7 @@ def run_langgraph_workflow(
         "refinement_llm_model": refinement_llm_model,
         "build_graph": True,
         "output_dir": output_dir,
+        "chunk_id": None,
         "until_step": until_step,
         "pages": pages,
         "location_moo": location_moo,
@@ -241,11 +252,35 @@ def run_langgraph_workflow(
     }
 
 
+def _metadata_from_location(
+    location_moo: str | None,
+    location_village: str | None,
+) -> Dict[str, Any] | None:
+    """Build a metadata dict (with unique_id) from CLI location overrides.
+
+    Mirrors extract_metadata_node so single-node runners derive the same
+    community_id (== metadata unique_id) as the full pipeline. community_id is
+    constructed from location_moo + location_village via the shared
+    extract_metadata helper (mandatory fields joined with "_"). Returns None
+    when either value is missing, leaving metadata unset for the node.
+    """
+    if not location_moo or not location_village:
+        return None
+    from kg_extractor.workflow.functions.extract_metadata import extract_metadata
+    return extract_metadata(
+        markdown_path="",
+        location_moo_override=location_moo,
+        location_village_override=location_village,
+    )
+
+
 def run_parse_document_only(
     input_file: str,
     provider: str = PARSING_PROVIDER,
     model: str = PARSING_MODEL,
     pages: List[int] | None = None,
+    location_moo: str | None = None,
+    location_village: str | None = None,
 ) -> Dict[str, Any]:
     """Debug mode: run only the parse-document node.
 
@@ -275,6 +310,7 @@ def run_parse_document_only(
         "refinement_llm_model": "",
         "build_graph": False,
         "output_dir": output_dir,
+        "chunk_id": None,
         "until_step": None,
         "pages": pages,
         "markdown_path": None,
@@ -287,6 +323,8 @@ def run_parse_document_only(
         "error": None,
         "current_step": "process_document",
     }
+
+    state["metadata"] = _metadata_from_location(location_moo, location_village)
 
     final_state = process_document_node(state)
 
@@ -328,8 +366,8 @@ def run_extract_metadata_only(
         "model": "",
         "chunk_granularity": 0.0,
         "similarity_threshold": 0.0,
-        "chunking_llm_provider": chunking_llm_provider,
-        "chunking_llm_model": chunking_llm_model,
+        "chunking_llm_provider": CHUNKING_PROVIDER,
+        "chunking_llm_model": CHUNKING_MODEL,
         "triplet_llm_provider": "",
         "triplet_llm_model": "",
         "refine_triples": False,
@@ -337,6 +375,7 @@ def run_extract_metadata_only(
         "refinement_llm_model": "",
         "build_graph": False,
         "output_dir": output_dir,
+        "chunk_id": None,
         "until_step": None,
         "pages": None,
         "location_moo": location_moo,
@@ -369,6 +408,8 @@ def run_chunk_document_only(
     chunk_granularity: float = 0.1,
     chunking_llm_provider: str = CHUNKING_PROVIDER,
     chunking_llm_model: str = CHUNKING_MODEL,
+    location_moo: str | None = None,
+    location_village: str | None = None,
 ) -> Dict[str, Any]:
     """Debug mode: run only the chunk-document node.
 
@@ -403,6 +444,7 @@ def run_chunk_document_only(
         "refinement_llm_model": "",
         "build_graph": False,
         "output_dir": output_dir,
+        "chunk_id": None,
         "until_step": None,
         "pages": None,
         "markdown_path": markdown_path,
@@ -415,6 +457,8 @@ def run_chunk_document_only(
         "error": None,
         "current_step": "chunk_document",
     }
+
+    state["metadata"] = _metadata_from_location(location_moo, location_village)
 
     final_state = chunk_document_node(state)
 
@@ -432,6 +476,9 @@ def run_extract_triples_only(
     input_file: str,
     triplet_llm_provider: str = TRIPLET_PROVIDER,
     triplet_llm_model: str = TRIPLET_MODEL,
+    location_moo: str | None = None,
+    location_village: str | None = None,
+    chunk_id: int | None = None,
 ) -> Dict[str, Any]:
     """Debug mode: run only the extract-triples node.
 
@@ -442,6 +489,9 @@ def run_extract_triples_only(
         input_file: Original document path (used to locate the existing chunks file).
         triplet_llm_provider: LLM provider for triple extraction.
         triplet_llm_model: Model for triple extraction.
+        chunk_id: Optional single chunk_id to (re-)extract. When set, only that
+            chunk is processed and its result is merged into the existing triples
+            file in place; all other chunks are preserved.
 
     Returns:
         Dictionary with triples_output, status, and error keys.
@@ -465,6 +515,7 @@ def run_extract_triples_only(
         "refinement_llm_model": "",
         "build_graph": False,
         "output_dir": output_dir,
+        "chunk_id": chunk_id,
         "until_step": None,
         "pages": None,
         "markdown_path": None,
@@ -478,7 +529,78 @@ def run_extract_triples_only(
         "current_step": "extract_triples",
     }
 
+    state["metadata"] = _metadata_from_location(location_moo, location_village)
+
     final_state = extract_triples_node(state)
+
+    if final_state["status"] != "error":
+        final_state["status"] = "success"
+
+    return {
+        "triples_output": final_state["triples_path"],
+        "status": final_state["status"],
+        "error": final_state["error"],
+    }
+
+
+def run_translate_triples_only(
+    input_file: str,
+    location_moo: str | None = None,
+    location_village: str | None = None,
+    chunk_id: int | None = None,
+) -> Dict[str, Any]:
+    """Debug mode: run only the translate-triples node.
+
+    Resolves the triples file from a previous extraction run using the naming
+    convention ``output/{stem}_triples.json``, translates the Thai/mixed chunks'
+    triples in place, then stops.
+
+    Args:
+        input_file: Original document path (used to locate the existing triples file).
+        location_moo: Optional location_moo value from CLI.
+        location_village: Optional location_village value from CLI.
+        chunk_id: Optional single chunk_id to (re-)translate.  When set, only
+            that chunk is translated in place; all other chunks are preserved.
+
+    Returns:
+        Dictionary with triples_output, status, and error keys.
+    """
+    output_dir = str(Path(__file__).parent.parent.parent.parent / "output")
+    stem = Path(input_file).stem
+    triples_path = str(Path(output_dir) / f"{stem}_triples.json")
+
+    state: WorkflowState = {
+        "input_file": input_file,
+        "provider": "",
+        "model": "",
+        "chunk_granularity": 0.0,
+        "similarity_threshold": 0.0,
+        "chunking_llm_provider": "",
+        "chunking_llm_model": "",
+        "triplet_llm_provider": "",
+        "triplet_llm_model": "",
+        "refine_triples": False,
+        "refinement_llm_provider": "",
+        "refinement_llm_model": "",
+        "build_graph": False,
+        "output_dir": output_dir,
+        "chunk_id": chunk_id,
+        "until_step": None,
+        "pages": None,
+        "markdown_path": None,
+        "metadata": None,
+        "chunks_path": None,
+        "triples_path": triples_path,
+        "refined_path": None,
+        "graph_stats": None,
+        "status": "in_progress",
+        "error": None,
+        "current_step": "translate_triples",
+    }
+
+    state["metadata"] = _metadata_from_location(location_moo, location_village)
+
+    final_state = translate_triples_node(state)
 
     if final_state["status"] != "error":
         final_state["status"] = "success"
@@ -495,6 +617,8 @@ def run_refine_triples_only(
     refinement_llm_provider: str = REFINEMENT_PROVIDER,
     refinement_llm_model: str = REFINEMENT_MODEL,
     similarity_threshold: float = 0.95,
+    location_moo: str | None = None,
+    location_village: str | None = None,
 ) -> Dict[str, Any]:
     """Debug mode: run only the refine-triples node.
 
@@ -529,6 +653,7 @@ def run_refine_triples_only(
         "refinement_llm_model": refinement_llm_model,
         "build_graph": False,
         "output_dir": output_dir,
+        "chunk_id": None,
         "until_step": None,
         "pages": None,
         "markdown_path": None,
@@ -541,6 +666,8 @@ def run_refine_triples_only(
         "error": None,
         "current_step": "refine_triples",
     }
+
+    state["metadata"] = _metadata_from_location(location_moo, location_village)
 
     final_state = refine_triples_node(state)
 
@@ -556,6 +683,8 @@ def run_refine_triples_only(
 
 def run_build_graph_only(
     input_file: str,
+    location_moo: str | None = None,
+    location_village: str | None = None,
 ) -> Dict[str, Any]:
     """Debug mode: run only the build-graph node.
 
@@ -588,6 +717,7 @@ def run_build_graph_only(
         "refinement_llm_model": "",
         "build_graph": True,
         "output_dir": output_dir,
+        "chunk_id": None,
         "until_step": None,
         "pages": None,
         "markdown_path": None,
@@ -600,6 +730,8 @@ def run_build_graph_only(
         "error": None,
         "current_step": "build_graph",
     }
+
+    state["metadata"] = _metadata_from_location(location_moo, location_village)
 
     final_state = build_graph_node(state)
 

@@ -103,29 +103,19 @@ def parse_json_with_repair(response: str) -> Optional[Dict[str, Any]]:
 
 def parse_triple_extraction_response(response: str) -> Dict[str, Any]:
     """Parse LLM response for triple extraction.
-    
+
     Expected format:
     {
-        "document_metadata": {
-            "reference_date": str | null,
-            "source_id": str | null,
-            "chunk_id": int | null
-        },
         "discovered_triples": [...]
     }
-    
+
     Args:
         response: LLM response text
-        
+
     Returns:
-        Dictionary with document_metadata and discovered_triples keys
+        Dictionary with a discovered_triples key
     """
     empty = {
-        "document_metadata": {
-            "reference_date": None,
-            "source_id": None,
-            "chunk_id": None,
-        },
         "discovered_triples": [],
     }
 
@@ -160,8 +150,8 @@ def parse_triple_extraction_response(response: str) -> Dict[str, Any]:
         return empty
     
     # Validate structure
-    if "document_metadata" not in data or "discovered_triples" not in data:
-        print(f"⚠️  Invalid response structure — expected 'document_metadata' and 'discovered_triples', found: {list(data.keys())}")
+    if "discovered_triples" not in data:
+        print(f"⚠️  Invalid response structure — expected 'discovered_triples', found: {list(data.keys())}")
         return empty
 
     # Validate evidence_lines ranges in discovered_triples

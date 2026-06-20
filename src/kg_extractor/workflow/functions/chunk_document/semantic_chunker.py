@@ -6,6 +6,7 @@ source text using those ranges and writes each chunk to its own file.
 """
 
 import json
+import os
 import re
 import tiktoken
 from pathlib import Path
@@ -19,6 +20,16 @@ load_dotenv()
 from kg_extractor.utils.model_setup import CHUNKING_PROVIDER, CHUNKING_MODEL
 from kg_extractor.utils.prompts import create_chunking_prompt
 from kg_extractor.utils.llm_response_parser import parse_chunk_ranges_response
+
+# Optional S3 upload of chunk files (boto3). Soft-imported so chunking still
+# runs in environments without boto3 — the upload is a best-effort side-effect.
+try:
+    import boto3
+    from botocore.exceptions import ClientError, NoCredentialsError
+
+    HAS_BOTO3 = True
+except ImportError:  # pragma: no cover
+    HAS_BOTO3 = False
 
 
 class SemanticChunker:
@@ -510,8 +521,15 @@ def chunk_markdown_file(
     output_dir: str = None,
     max_retries: int = 3,
     enable_fallback: bool = True,
+    community_id: str = None,
 ) -> str:
     """Chunk a markdown file into separate chunk files.
+
+    Args:
+        community_id: Optional community/document unique_id. When set, every
+            chunk file (chunk_001.txt, chunk_002.txt, ... plus manifest.json)
+            is uploaded to ``s3://<bucket>/<community_id>/`` after saving.
+            Upload is best-effort and never aborts chunking.
 
     Returns:
         Path to ``manifest.json`` inside the chunks directory.
@@ -546,4 +564,81 @@ def chunk_markdown_file(
     except Exception as e:
         raise RuntimeError(f"Failed to save chunks: {e}")
 
+    # Best-effort S3 upload of the chunk files, keyed by community_id.
+    if community_id:
+        try:
+            upload_chunks_to_s3(str(chunks_dir), community_id)
+        except Exception as e:
+            print(f"⚠️  S3 chunk upload failed: {e}")
+
     return manifest_path
+
+
+def upload_chunks_to_s3(
+    chunks_dir: str,
+    community_id: str,
+    bucket: str = None,
+) -> int:
+    """Upload chunk files to ``s3://<bucket>/<community_id>/``.
+
+    Uploads every file in ``chunks_dir`` (chunk_001.txt, chunk_002.txt, ... and
+    manifest.json) under the ``<community_id>/`` key prefix, preserving the
+    original filenames.
+
+    AWS credentials are read from the environment (``AWS_ACCESS_KEY_ID``,
+    ``AWS_SECRET_ACCESS_KEY``, ``AWS_REGION``) — already loaded at module import
+    via ``load_dotenv()``.
+
+    Args:
+        chunks_dir: Local directory holding the saved chunk files.
+        community_id: S3 key prefix (the community/document unique_id).
+        bucket: S3 bucket name. Defaults to env ``S3_BUCKET`` or ``"document"``.
+
+    Returns:
+        Number of files successfully uploaded.
+    """
+    if not HAS_BOTO3:
+        print("⚠️  boto3 not installed — skipping S3 chunk upload")
+        return 0
+
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    region = os.getenv("AWS_REGION")
+    if not (access_key and secret_key):
+        print(
+            "⚠️  AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY not set — "
+            "skipping S3 chunk upload"
+        )
+        return 0
+
+    if bucket is None:
+        bucket = os.getenv("S3_BUCKET", "document")
+
+    src_dir = Path(chunks_dir)
+    files = sorted(p for p in src_dir.iterdir() if p.is_file())
+    if not files:
+        print(f"⚠️  No chunk files found in {src_dir} — skipping S3 upload")
+        return 0
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+
+    uploaded = 0
+    for fp in files:
+        key = f"{community_id}/{fp.name}"
+        try:
+            s3.upload_file(str(fp), bucket, key)
+            uploaded += 1
+            print(f"☁️  Uploaded {fp.name} → s3://{bucket}/{key}")
+        except (ClientError, NoCredentialsError) as e:
+            print(f"⚠️  Failed to upload {fp.name} to S3: {e}")
+
+    print(
+        f"☁️  Uploaded {uploaded}/{len(files)} chunk files "
+        f"to s3://{bucket}/{community_id}/"
+    )
+    return uploaded

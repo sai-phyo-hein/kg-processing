@@ -21,13 +21,19 @@ def chunk_document_node(state: "WorkflowState") -> "WorkflowState":
         if not path.exists():
             raise FileNotFoundError(f"Markdown file not found: {state['markdown_path']}")
 
-        # Perform chunking
+        # community_id (metadata unique_id) keys the S3 upload of chunk files.
+        community_id = None
+        if state["metadata"]:
+            community_id = state["metadata"].get("unique_id")
+
+        # Perform chunking (uploads chunks to S3 when community_id is set)
         output_path = chunk_markdown_file(
             file_path=state["markdown_path"],
             chunk_granularity=state["chunk_granularity"],
             llm_provider=state["chunking_llm_provider"],
             llm_model=state["chunking_llm_model"],
             output_dir=state["output_dir"],
+            community_id=community_id,
         )
 
         state["chunks_path"] = output_path

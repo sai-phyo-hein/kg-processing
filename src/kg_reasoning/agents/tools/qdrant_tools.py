@@ -228,6 +228,99 @@ class QdrantToolsManager:
             embeddings=embeddings,
         )
 
+    def _get_by_canonical_ids(
+        self, registry_key: str, canonical_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Fetch canonical records directly by canonical_id payload filter.
+
+        This is a SEPARATE action from get_canonical_entities/get_canonical_predicates:
+        those two embed a RAW name and vector-search the registry, landing on
+        whichever canonical point is closest — the raw name itself is never
+        guaranteed to be the same string as the canonical record's own name.
+        This method instead takes the canonical_id values already produced by
+        that search and fetches those exact canonical records by ID, so the
+        caller can hold both forms side by side: the raw surface form (from
+        the name-search call) and the canonical record fetched here directly
+        — together giving an explicit raw -> (linked) -> canonical mapping
+        rather than assuming the name-search payload's "name" field alone is
+        sufficient.
+
+        No embedding call — this is a payload filter (canonical_id is an
+        indexed keyword field on every entity_registry/predicate_registry
+        point), not a vector search.
+
+        Args:
+            registry_key: "entity_registry" or "predicate_registry"
+            canonical_ids: canonical_id values to fetch
+
+        Returns:
+            List of {"canonical_id", "name", "metadata"} dicts, one per
+            canonical_id found. Missing IDs are simply absent from the
+            result (not an error) — callers should check which IDs they
+            asked for vs. which came back.
+        """
+        if not canonical_ids:
+            return []
+
+        from qdrant_client.http import models as qm
+
+        spec = self._registry_specs[registry_key]
+        collection = spec["collection_name"]
+
+        try:
+            scroll_result = self.client.scroll(
+                collection_name=collection,
+                scroll_filter=qm.Filter(
+                    must=[
+                        qm.FieldCondition(
+                            key="canonical_id",
+                            match=qm.MatchAny(any=canonical_ids),
+                        )
+                    ]
+                ),
+                limit=len(canonical_ids),
+                with_payload=True,
+            )
+            points = scroll_result[0]
+        except Exception as e:
+            print(f"Warning: get_by_canonical_ids filter failed on {registry_key}: {e}")
+            return []
+
+        results = []
+        for point in points:
+            payload = point.payload or {}
+            results.append({
+                "canonical_id": payload.get("canonical_id", ""),
+                "name": payload.get("name", ""),
+                "metadata": payload,
+            })
+        return results
+
+    def get_entities_by_canonical_ids(
+        self, canonical_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Fetch canonical entity records directly by canonical_id.
+
+        This is the second of the two lookups the preprocessor needs for
+        raw -> canonical linkage: get_canonical_entities (name search) gives
+        you the canonical_id a raw name resolved to; this method fetches
+        that canonical entity's own record (its actual canonical name,
+        which can differ in wording from the raw surface form even though
+        they're semantically close).
+        """
+        return self._get_by_canonical_ids("entity_registry", canonical_ids)
+
+    def get_predicates_by_canonical_ids(
+        self, canonical_ids: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Fetch canonical predicate records directly by canonical_id.
+
+        Same purpose as get_entities_by_canonical_ids, for predicates —
+        these are the canonical relationship types Neo4j edges use, which
+        can differ in wording from the raw extracted predicate phrase.
+        """
+        return self._get_by_canonical_ids("predicate_registry", canonical_ids)
+
     def get_community_metadata(
         self, community_ids: Optional[List[str]] = None, limit: int = 100
     ) -> List[Dict[str, Any]]:
@@ -448,6 +541,362 @@ class QdrantToolsManager:
 
         return results
 
+    def get_evidence_by_ids(self, chunk_ids: List[str]) -> List[Dict[str, Any]]:
+        """Fetch full evidence payloads for specific chunk/point IDs.
+
+        Args:
+            chunk_ids: Qdrant point IDs (or chunk_id payload values) to retrieve
+
+        Returns:
+            List of evidence records
+        """
+        if not chunk_ids:
+            return []
+
+        spec = self._registry_specs["evidence_registry"]
+        collection = spec["collection_name"]
+
+        # Qdrant point IDs may be integers or UUIDs depending on ingestion.
+        # Try integer cast first; fall back to passing as-is (UUID strings).
+        def _cast_id(cid: str):
+            try:
+                return int(cid)
+            except (ValueError, TypeError):
+                return cid
+
+        typed_ids = [_cast_id(cid) for cid in chunk_ids]
+
+        points = []
+        try:
+            points = self.client.retrieve(
+                collection_name=collection,
+                ids=typed_ids,
+                with_payload=True,
+            )
+        except Exception as e:
+            print(f"Warning: direct retrieve failed for chunk_ids, "
+                  f"falling back to payload filter: {e}")
+
+        found_ids = {str(p.id) for p in points}
+        missing = [cid for cid in chunk_ids if cid not in found_ids]
+
+        # Fallback: filter by chunk_id payload field only — source_id and
+        # source_ref are not indexed and will cause a 400 on most collections.
+        if missing:
+            try:
+                from qdrant_client.http import models as qm
+
+                scroll_result = self.client.scroll(
+                    collection_name=collection,
+                    scroll_filter=qm.Filter(
+                        should=[
+                            qm.FieldCondition(
+                                key="chunk_id",
+                                match=qm.MatchAny(any=missing),
+                            )
+                        ]
+                    ),
+                    limit=len(missing) * 2,
+                    with_payload=True,
+                )
+                points.extend(scroll_result[0])
+            except Exception as e:
+                print(f"Warning: payload filter fallback also failed: {e}")
+
+        results = []
+        for point in points:
+            payload = point.payload or {}
+            chunk_id = (
+                payload.get("chunk_id")
+                or payload.get("source_id")
+                or payload.get("source_ref")
+                or str(point.id)
+            )
+            results.append({
+                "chunk_id": chunk_id,
+                "point_id": str(point.id),
+                "entities": payload.get("entities", []),
+                "predicates": payload.get("predicates", []),
+                "evidence_quote": payload.get("evidence_quote", ""),
+                "evidence_quote_en": payload.get("evidence_quote_en", ""),
+                "community_id": payload.get("community_id"),
+            })
+
+        return results
+
+    def get_surrounding_chunks(
+        self,
+        chunk_id: str,
+        window: int = 2,
+        limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        """Fetch chunks adjacent to an anchor chunk for discourse continuity.
+
+        IMPORTANT DEPENDENCY: this requires the evidence registry payload to
+        carry an ordering field — e.g. `chunk_index` (an integer position
+        within its source document) and `source_doc_id` (grouping chunks
+        from the same document). If your ingestion pipeline does not yet
+        write these fields, this method falls back to returning chunks that
+        merely share the same community_id as the anchor, which is a much
+        weaker notion of "surrounding" — it's topical proximity, not
+        positional proximity. Add chunk_index/source_doc_id to the evidence
+        registry payload at ingestion time to get true surrounding-chunk
+        behavior.
+
+        Args:
+            chunk_id: The anchor chunk's point ID or chunk_id payload value
+            window: How many chunks before/after the anchor to include
+            limit: Hard cap on total chunks returned
+
+        Returns:
+            List of evidence records ordered by chunk_index if available,
+            otherwise an unordered same-community fallback set
+        """
+        anchor = self.get_evidence_by_ids([chunk_id])
+        if not anchor:
+            return []
+
+        spec = self._registry_specs["evidence_registry"]
+        collection = spec["collection_name"]
+
+        # Re-fetch the anchor's raw payload to check for ordering fields —
+        # get_evidence_by_ids already slims the payload down.
+        try:
+            raw_points = self.client.retrieve(
+                collection_name=collection, ids=[chunk_id], with_payload=True,
+            )
+        except Exception:
+            raw_points = []
+
+        anchor_payload = raw_points[0].payload if raw_points else {}
+        doc_id = anchor_payload.get("source_doc_id")
+        chunk_index = anchor_payload.get("chunk_index")
+
+        if doc_id is not None and chunk_index is not None:
+            # True positional surrounding-chunk fetch.
+            try:
+                from qdrant_client.http import models as qm
+
+                scroll_result = self.client.scroll(
+                    collection_name=collection,
+                    scroll_filter=qm.Filter(
+                        must=[
+                            qm.FieldCondition(key="source_doc_id", match=qm.MatchValue(value=doc_id)),
+                            qm.FieldCondition(
+                                key="chunk_index",
+                                range=qm.Range(
+                                    gte=max(0, chunk_index - window),
+                                    lte=chunk_index + window,
+                                ),
+                            ),
+                        ]
+                    ),
+                    limit=min(limit, window * 2 + 1),
+                    with_payload=True,
+                )
+                points = scroll_result[0]
+                points.sort(key=lambda p: p.payload.get("chunk_index", 0))
+                return [
+                    {
+                        "chunk_id": p.payload.get("chunk_id") or str(p.id),
+                        "chunk_index": p.payload.get("chunk_index"),
+                        "entities": p.payload.get("entities", []),
+                        "predicates": p.payload.get("predicates", []),
+                        "evidence_quote": p.payload.get("evidence_quote", ""),
+                        "evidence_quote_en": p.payload.get("evidence_quote_en", ""),
+                        "community_id": p.payload.get("community_id"),
+                    }
+                    for p in points
+                ]
+            except Exception as e:
+                print(f"Warning: positional surrounding-chunk fetch failed, "
+                      f"falling back to community match: {e}")
+
+        # Weak fallback: same-community chunks, unordered. Flag this clearly
+        # in the result so callers (and ultimately the synthesizer) know
+        # the context isn't a true contiguous passage.
+        community_id = anchor[0].get("community_id")
+        if not community_id:
+            return anchor  # nothing better to return than the anchor itself
+
+        try:
+            from qdrant_client.http import models as qm
+
+            scroll_result = self.client.scroll(
+                collection_name=collection,
+                scroll_filter=qm.Filter(
+                    must=[qm.FieldCondition(key="community_id", match=qm.MatchValue(value=community_id))]
+                ),
+                limit=limit,
+                with_payload=True,
+            )
+            return [
+                {
+                    "chunk_id": p.payload.get("chunk_id") or str(p.id),
+                    "ordering": "approximate_same_community",
+                    "entities": p.payload.get("entities", []),
+                    "predicates": p.payload.get("predicates", []),
+                    "evidence_quote": p.payload.get("evidence_quote", ""),
+                    "evidence_quote_en": p.payload.get("evidence_quote_en", ""),
+                    "community_id": p.payload.get("community_id"),
+                }
+                for p in scroll_result[0]
+            ]
+        except Exception as e:
+            print(f"Warning: community-fallback surrounding-chunk fetch failed: {e}")
+            return anchor
+
+    def get_all_community_metadata(self) -> List[Dict[str, Any]]:
+        """Scroll all points from metadata_registry and return their payloads.
+
+        Used by the preprocessor's LLM-based community resolution step: all
+        community metadata records are fetched in one pass and handed to the
+        LLM, which decides which ones are relevant to the user's query.  This
+        avoids embedding-based search entirely — the metadata_registry vectors
+        are not text embeddings and cannot be used for semantic similarity
+        against a free-form query.
+
+        Returns:
+            List of payload dicts, one per metadata_registry point.
+            Each dict contains at minimum ``unique_id`` (the community
+            identifier used as the filter key throughout the pipeline).
+        """
+        try:
+            spec = self._registry_specs["metadata_registry"]
+            collection = spec["collection_name"]
+            results: List[Dict[str, Any]] = []
+            offset = None
+
+            while True:
+                scroll_result = self.client.scroll(
+                    collection_name=collection,
+                    limit=100,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                for point in scroll_result[0]:
+                    if point.payload:
+                        results.append(point.payload)
+
+                offset = scroll_result[1]
+                if offset is None:
+                    break
+
+            return results
+
+        except Exception as e:
+            print(f"Warning: Failed to scroll metadata_registry: {e}")
+            return []
+
+    def get_evidence_by_raw_names(
+        self,
+        raw_entity_names: Optional[List[str]] = None,
+        raw_predicate_names: Optional[List[str]] = None,
+        community_ids: Optional[List[str]] = None,
+        match_all: bool = False,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Fetch evidence points by exact keyword match on entities/predicates.
+
+        This is a payload FILTER, not a vector search — no embedding call,
+        no LLM, no similarity threshold. entities and predicates are
+        keyword-indexed arrays on evidence_registry points (see
+        triple_refiner.py's _upsert_evidence_triples: groups[...]["entities"]
+        is built from the raw, pre-canonicalization triple text), so any
+        raw name the preprocessor already filtered down to in steps 5-6 can
+        be matched directly here with zero additional API cost.
+
+        Use this instead of a semantic re-search whenever the preprocessor
+        has already identified which raw entity/predicate names are
+        relevant — querying evidence_registry by exact name match is both
+        cheaper and more precise than re-embedding a query string.
+
+        Args:
+            raw_entity_names: Raw extracted entity name strings to match
+                against the entities[] keyword array (OR'd together).
+            raw_predicate_names: Raw extracted predicate name strings to
+                match against the predicates[] keyword array (OR'd together).
+            community_ids: Optional community_id filter, ANDed on top.
+            match_all: If True, a point must match ALL of the entity/predicate
+                names given (AND); if False (default), it must match ANY (OR).
+                Use match_all=True for "find evidence mentioning both X and Y".
+            limit: Maximum points to return.
+
+        Returns:
+            List of evidence records: chunk_id, entities, predicates,
+            evidence_quote, evidence_quote_en, community_id.
+        """
+        from qdrant_client.http import models as qm
+
+        raw_entity_names = raw_entity_names or []
+        raw_predicate_names = raw_predicate_names or []
+
+        if not raw_entity_names and not raw_predicate_names:
+            return []
+
+        spec = self._registry_specs["evidence_registry"]
+        collection = spec["collection_name"]
+
+        name_conditions = []
+        if raw_entity_names:
+            name_conditions.append(
+                qm.FieldCondition(key="entities", match=qm.MatchAny(any=raw_entity_names))
+            )
+        if raw_predicate_names:
+            name_conditions.append(
+                qm.FieldCondition(key="predicates", match=qm.MatchAny(any=raw_predicate_names))
+            )
+
+        must_conditions = []
+        should_conditions = []
+
+        if match_all:
+            must_conditions.extend(name_conditions)
+        else:
+            # Plain `should=[...]` already gives OR semantics in Qdrant —
+            # a point matches if it satisfies at least one should condition.
+            # No need for the min_should/MinShould wrapper, which is only
+            # required for "at least N of M" logic (N > 1).
+            should_conditions.extend(name_conditions)
+
+        if community_ids:
+            must_conditions.append(
+                qm.FieldCondition(key="community_id", match=qm.MatchAny(any=community_ids))
+            )
+
+        filter_kwargs: Dict[str, Any] = {}
+        if must_conditions:
+            filter_kwargs["must"] = must_conditions
+        if should_conditions:
+            filter_kwargs["should"] = should_conditions
+
+        try:
+            scroll_result = self.client.scroll(
+                collection_name=collection,
+                scroll_filter=qm.Filter(**filter_kwargs),
+                limit=limit,
+                with_payload=True,
+            )
+            points = scroll_result[0]
+        except Exception as e:
+            print(f"Warning: get_evidence_by_raw_names filter failed: {e}")
+            return []
+
+        results = []
+        for point in points:
+            payload = point.payload or {}
+            results.append({
+                "chunk_id": payload.get("chunk_id") or str(point.id),
+                "entities": payload.get("entities", []),
+                "predicates": payload.get("predicates", []),
+                "evidence_quote": payload.get("evidence_quote", ""),
+                "evidence_quote_en": payload.get("evidence_quote_en", ""),
+                "community_id": payload.get("community_id"),
+            })
+
+        return results
+
     @staticmethod
     def _sparse_vector_names(spec: Dict[str, Any]) -> Dict[str, str]:
         """Map dense vector suffix ('_en' or '_th') to its sparse vector name.
@@ -589,10 +1038,24 @@ class QdrantToolsManager:
 
         results = []
         for query_text, entry in results_map.items():
-            for point in entry["points_by_id"].values():
+            for pid, point in entry["points_by_id"].items():
+                # chunk_id resolution order:
+                # 1. an explicit chunk/source reference in the payload, if the
+                #    ingestion pipeline has been updated to store one (e.g. an
+                #    S3 key or document ref) — this is the long-term correct field
+                # 2. fall back to the Qdrant point ID itself, which is stable
+                #    and already unique per evidence record even though it
+                #    carries no inherent ordering for "surrounding" chunks
+                chunk_id = (
+                    point.payload.get("chunk_id")
+                    or point.payload.get("source_id")
+                    or point.payload.get("source_ref")
+                    or pid
+                )
                 results.append({
                     "query": query_text,
                     "score": point.score,
+                    "chunk_id": chunk_id,
                     "entities": point.payload.get("entities", []),
                     "predicates": point.payload.get("predicates", []),
                     "evidence_quote": point.payload.get("evidence_quote", ""),
@@ -666,6 +1129,52 @@ def get_canonical_predicates(
     manager = _get_manager()
     names = [name.strip() for name in predicate_names.split(",") if name.strip()]
     results = manager.get_canonical_predicates(names, limit, threshold)
+    return json.dumps(results, indent=2)
+
+
+@tool
+def get_entities_by_canonical_ids(canonical_ids: str) -> str:
+    """Fetch canonical entity records directly by canonical_id, from Qdrant entity_registry.
+
+    Use this AFTER get_canonical_entities, not instead of it. get_canonical_entities
+    takes raw surface-form names and vector-searches for the closest canonical match —
+    the raw name and the canonical record's own name can differ in wording even when
+    they refer to the same thing. This tool takes the canonical_id values that search
+    already produced and fetches those exact canonical records by ID (a payload filter,
+    no embedding call), so you can see the canonical entity's own name explicitly rather
+    than relying on the name field returned alongside the search match.
+
+    Args:
+        canonical_ids: Comma-separated canonical_id (UUID) values to fetch
+
+    Returns:
+        JSON string with one record per found canonical_id: "canonical_id" (uuid)
+        and "name" (keyword) from the payload.
+    """
+    manager = _get_manager()
+    ids = [cid.strip() for cid in canonical_ids.split(",") if cid.strip()]
+    results = manager.get_entities_by_canonical_ids(ids)
+    return json.dumps(results, indent=2)
+
+
+@tool
+def get_predicates_by_canonical_ids(canonical_ids: str) -> str:
+    """Fetch canonical predicate records directly by canonical_id, from Qdrant predicate_registry.
+
+    Same purpose as get_entities_by_canonical_ids, for predicates — fetches the
+    canonical relationship type's own record by ID, distinct from the name-search
+    that produced the canonical_id in the first place.
+
+    Args:
+        canonical_ids: Comma-separated canonical_id (UUID) values to fetch
+
+    Returns:
+        JSON string with one record per found canonical_id: "canonical_id" (uuid)
+        and "name" (keyword) from the payload.
+    """
+    manager = _get_manager()
+    ids = [cid.strip() for cid in canonical_ids.split(",") if cid.strip()]
+    results = manager.get_predicates_by_canonical_ids(ids)
     return json.dumps(results, indent=2)
 
 
@@ -754,33 +1263,4 @@ def get_all_community_ids() -> str:
     """
     manager = _get_manager()
     results = manager.get_all_community_ids()
-    return json.dumps(results, indent=2)
-
-
-@tool
-def search_evidence(query_texts: str, limit: int = 5, threshold: float = 0.7) -> str:
-    """Search evidence registry for evidence quotes matching the query.
-
-    Use this tool to find source evidence quotes and their associated entities
-    and predicates. Useful for answering questions about what evidence supports
-    particular claims or relationships.
-
-    Payload schema:
-    - evidence_quote (text): Original source evidence text
-    - evidence_quote_en (text): English translation of evidence
-    - entities (keyword[]): List of entity names mentioned in evidence
-    - predicates (keyword[]): List of predicate names in evidence
-    - community_id (keyword): Community identifier
-
-    Args:
-        query_texts: Comma-separated list of query texts to search for evidence
-        limit: Maximum number of results per query (default: 5)
-        threshold: Minimum similarity threshold 0-1 (default: 0.7)
-
-    Returns:
-        JSON string with matching evidence records
-    """
-    manager = _get_manager()
-    queries = [q.strip() for q in query_texts.split(",") if q.strip()]
-    results = manager.search_evidence(queries, limit, threshold)
     return json.dumps(results, indent=2)

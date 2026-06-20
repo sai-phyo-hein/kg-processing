@@ -7,7 +7,7 @@ import sys
 from kg_extractor.utils.model_setup import (
     REASONING_PROVIDER,
     ORCHESTRATOR_MODEL,
-    WORKER_MODEL,
+    PREPROCESSING_MODEL,
     SYNTHESIZER_MODEL,
 )
 from kg_reasoning.workflows.multi_agent_workflow import run_multi_agent_workflow
@@ -18,8 +18,8 @@ def query_command(args) -> None:
     print("🚀 Starting Multi-Agent KG Reasoning Workflow...")
     print(f"❓ Query: {args.query}")
     print(f"🤖 LLM Provider: {REASONING_PROVIDER}")
+    print(f"🧩 PreProcessor Model: {PREPROCESSING_MODEL}")
     print(f"🎯 Orchestrator Model: {ORCHESTRATOR_MODEL}")
-    print(f"⚙️  Worker Model: {WORKER_MODEL}")
     print(f"📝 Synthesizer Model: {SYNTHESIZER_MODEL}")
     print()
 
@@ -96,7 +96,7 @@ Examples:
   %(prog)s query "What are the main causes of market volatility?" --output result.json
 
 Model configuration is done via environment variables (see .env):
-  REASONING_PROVIDER, ORCHESTRATOR_MODEL, WORKER_MODEL, SYNTHESIZER_MODEL
+  REASONING_PROVIDER, ORCHESTRATOR_MODEL, PREPROCESSING_MODEL, SYNTHESIZER_MODEL
   OPENAI_EMBEDDING_MODEL
         """,
     )

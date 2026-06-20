@@ -183,7 +183,6 @@ cp .env.example .env
 # Reasoning agents
 # REASONING_PROVIDER=
 # ORCHESTRATOR_MODEL=
-# WORKER_MODEL=
 # SYNTHESIZER_MODEL=
 ```
 

@@ -76,6 +76,12 @@ def extract_triples_node(state: "WorkflowState") -> "WorkflowState":
         chunks = _load_chunks_from_manifest(state["chunks_path"])
         print(f"📄 Found {len(chunks)} chunks for triple extraction")
 
+        # Optional single-chunk (re-)extraction: only this chunk is processed and
+        # its result is merged back into the existing triples file in place.
+        chunk_id = state.get("chunk_id")
+        if chunk_id is not None:
+            print(f"🎯 Extracting only chunk_id {chunk_id} (other chunks preserved)")
+
         # Get community_id from metadata
         community_id = None
         if state["metadata"]:
@@ -89,10 +95,12 @@ def extract_triples_node(state: "WorkflowState") -> "WorkflowState":
             llm_model=state["triplet_llm_model"],
             output_dir=state["output_dir"],
             community_id=community_id,
+            chunk_id=chunk_id,
         )
 
         state["triples_path"] = output_path
-        state["current_step"] = "refine_triples" if state["refine_triples"] else "build_graph"
+        # Translation always follows extraction (no-op for non-Thai docs).
+        state["current_step"] = "translate_triples"
         print(f"✅ Triple extraction completed: {output_path}")
 
     except Exception as e:

@@ -1,6 +1,22 @@
 """Multi-agent workflow using LangGraph.
 
-Orchestrates the flow: Orchestrator → Workers (parallel) → Synthesizer
+Orchestrates the flow:
+  Preprocessor → Orchestrator → Workers (parallel) → Aggregator → Synthesizer
+
+CHANGES FROM ORIGINAL:
+- Added aggregator_node between workers and synthesizer. Workers write N
+  individual markdown files; the aggregator deduplicates and ranks them into
+  one clean file; the synthesizer reads exactly that one file. This removes
+  the synthesizer's need to decide which files to read (it was doing so via
+  a tool call inside a ReAct loop — now it's a plain Python pass with no
+  LLM involved).
+- Workers now dispatch on state["worker_specs"] (new WorkerSpec shape) but
+  also accept state["strategies"] (legacy shape) as a fallback, since the
+  ReAct-based orchestrator path still emits the latter. WorkerAgent._normalize
+  handles the translation so the execution path is identical either way.
+- Synthesizer now receives aggregated_filepath from state and makes a single
+  non-agentic LLM call. create_react_agent wrapper is gone.
+- update_state_from_aggregator is threaded into the workflow state.
 """
 
 import os
@@ -13,7 +29,6 @@ from langgraph.graph import StateGraph, END
 from kg_extractor.utils.model_setup import (
     REASONING_PROVIDER,
     ORCHESTRATOR_MODEL,
-    WORKER_MODEL,
     SYNTHESIZER_MODEL,
     PREPROCESSING_MODEL,
 )
@@ -21,12 +36,14 @@ from kg_reasoning.agents.orchestrator import OrchestratorAgent
 from kg_reasoning.agents.preprocessor import PreProcessor
 from kg_reasoning.agents.worker import WorkerAgent, execute_strategy_parallel
 from kg_reasoning.agents.synthesizer import SynthesizerAgent
+from kg_reasoning.agents.aggregator import aggregate_results
 from kg_reasoning.workflows.state import (
     MultiAgentState,
     create_initial_state,
     update_state_from_orchestrator,
     update_state_from_preprocessor,
     update_state_from_worker,
+    update_state_from_aggregator,
     update_state_from_synthesizer,
 )
 
@@ -34,11 +51,7 @@ load_dotenv()
 
 
 def preprocessor_node(state: MultiAgentState) -> MultiAgentState:
-    """PreProcessor node: Runs 9-step pipeline before orchestrator.
-
-    Expands query, searches evidence, filters with LLM, resolves canonical IDs.
-    Non-fatal: on failure, orchestrator falls back to original ReAct behavior.
-    """
+    """PreProcessor: expand query → search evidence → filter → resolve IDs + chunk_ids."""
     print("\n" + "=" * 60)
     print("🔍 PRE-PROCESSOR AGENT")
     print("=" * 60)
@@ -54,11 +67,15 @@ def preprocessor_node(state: MultiAgentState) -> MultiAgentState:
         state = update_state_from_preprocessor(state, result)
 
         print(f"\n  ✅ Pre-processor complete:")
-        print(f"     - Query type: {state['preprocessor_query_type']}")
-        print(f"     - Entity IDs: {len(state['preprocessor_entity_ids'])}")
-        print(f"     - Predicate IDs: {len(state['preprocessor_predicate_ids'])}")
-        print(f"     - Community IDs: {state['preprocessor_community_ids']}")
-        print(f"     - Needs pathing: {state['preprocessor_needs_pathing']}")
+        print(f"     - Query type:      {state['preprocessor_query_type']}")
+        print(f"     - Entity IDs:      {len(state['preprocessor_entity_ids'])}")
+        print(f"     - Predicate IDs:   {len(state['preprocessor_predicate_ids'])}")
+        print(f"     - Community IDs:   {state['preprocessor_community_ids']}")
+        print(f"     - Chunk IDs:       {len(state['preprocessor_chunk_ids'])}")
+        chunk_texts = state.get("preprocessor_chunk_texts", {})
+        fetched_count = sum(1 for v in chunk_texts.values() if v.get("text"))
+        print(f"     - S3 chunk texts:  {fetched_count}/{len(state['preprocessor_chunk_ids'])} fetched")
+        print(f"     - Needs pathing:   {state['preprocessor_needs_pathing']}")
         print(f"     - Needs community: {state['preprocessor_needs_community']}")
 
     except Exception as e:
@@ -70,13 +87,11 @@ def preprocessor_node(state: MultiAgentState) -> MultiAgentState:
 
 
 def orchestrator_node(state: MultiAgentState) -> MultiAgentState:
-    """Orchestrator node: Analyzes query and plans strategies.
+    """Orchestrator: reads preprocessor signals → emits WorkerSpec list.
 
-    Args:
-        state: Current workflow state
-
-    Returns:
-        Updated state with strategies
+    Uses the fast single-shot structured-output path when the preprocessor
+    resolved at least some canonical IDs or chunk IDs. Falls back to the
+    original ReAct tool-calling loop when the preprocessor produced nothing.
     """
     print("\n" + "=" * 60)
     print("🎯 ORCHESTRATOR AGENT")
@@ -85,34 +100,41 @@ def orchestrator_node(state: MultiAgentState) -> MultiAgentState:
     try:
         state["current_step"] = "orchestrator_running"
 
-        # Initialize orchestrator
         orchestrator = OrchestratorAgent(
             llm_provider=state["llm_provider"],
             llm_model=state["llm_model_orchestrator"],
         )
 
-        # Analyze and plan
-        # Use context-aware planning if pre-processor resolved IDs
-        if state.get("preprocessor_entity_ids") or state.get("preprocessor_predicate_ids"):
+        has_preprocessor_output = (
+            state.get("preprocessor_entity_ids")
+            or state.get("preprocessor_predicate_ids")
+            or state.get("preprocessor_chunk_ids")
+        )
+
+        if has_preprocessor_output:
+            print("  → Using structured spec-planning (single-shot, no ReAct loop)")
             result = orchestrator.analyze_and_plan_with_context(state)
         else:
+            print("  → Using ReAct fallback (preprocessor produced no output)")
             result = orchestrator.analyze_and_plan(state["user_query"])
 
-        # Update state
         state = update_state_from_orchestrator(state, result)
 
-        print(f"\n✅ Orchestrator complete:")
-        print(f"   - Entities found: {len(state['entities_found'])}")
-        print(f"   - Predicates found: {len(state['predicates_found'])}")
-        print(f"   - Communities identified: {len(state['communities_identified'])}")
-        print(f"   - Resolution method: {state.get('resolution_method', 'unknown')}")
-        print(f"   - Strategies planned: {len(state['strategies'])}")
+        specs = state.get("worker_specs", [])
+        print(f"\n  ✅ Orchestrator complete:")
+        print(f"     - Entities found:      {len(state['entities_found'])}")
+        print(f"     - Predicates found:    {len(state['predicates_found'])}")
+        print(f"     - Communities:         {len(state['communities_identified'])}")
+        print(f"     - Resolution method:   {state.get('resolution_method', 'unknown')}")
+        print(f"     - Worker specs:        {len(specs)}")
 
-        for i, strategy in enumerate(state["strategies"], 1):
-            print(f"   {i}. {strategy.get('name', 'unnamed')}")
+        for i, spec in enumerate(specs, 1):
+            tool = spec.get("tool") or spec.get("approach", "?")
+            name = spec.get("name", "unnamed")
+            print(f"       {i}. [{tool}] {name}")
 
     except Exception as e:
-        print(f"\n❌ Orchestrator error: {e}")
+        print(f"\n  ❌ Orchestrator error: {e}")
         state["status"] = "error"
         state["error"] = f"Orchestrator failed: {e}"
 
@@ -120,88 +142,118 @@ def orchestrator_node(state: MultiAgentState) -> MultiAgentState:
 
 
 def workers_node(state: MultiAgentState) -> MultiAgentState:
-    """Workers node: Execute strategies in parallel.
-
-    Args:
-        state: Current workflow state
-
-    Returns:
-        Updated state with query results
-    """
+    """Workers: execute WorkerSpecs in parallel via TOOL_MAP, no LLM calls."""
     print("\n" + "=" * 60)
     print("⚙️  WORKER AGENTS (Parallel Execution)")
     print("=" * 60)
 
     try:
         state["current_step"] = "workers_running"
-        strategies = state.get("strategies", [])
 
-        if not strategies:
-            print("⚠️  No strategies to execute")
+        # Accept both new worker_specs and legacy strategies key
+        specs = state.get("worker_specs") or state.get("strategies", [])
+
+        if not specs:
+            print("  ⚠️  No specs to execute")
             return state
 
-        print(f"\nExecuting {len(strategies)} strategies in parallel...")
+        print(f"\n  Executing {len(specs)} specs in parallel...")
 
-        # Execute strategies in parallel using ThreadPoolExecutor
         results = []
-
-        with ThreadPoolExecutor(max_workers=min(len(strategies), 5)) as executor:
-            # Submit all strategies
-            future_to_strategy = {
+        with ThreadPoolExecutor(max_workers=min(len(specs), 5)) as executor:
+            future_to_spec = {
                 executor.submit(
                     execute_strategy_parallel,
-                    strategy,
+                    spec,
                     state["user_query"],
-                    state["llm_model_worker"],
-                ): strategy
-                for strategy in strategies
+                ): spec
+                for spec in specs
             }
 
-            # Collect results as they complete
-            for i, future in enumerate(as_completed(future_to_strategy), 1):
-                strategy = future_to_strategy[future]
+            for i, future in enumerate(as_completed(future_to_spec), 1):
+                spec = future_to_spec[future]
+                tool = spec.get("tool") or spec.get("approach", "?")
+                name = spec.get("name", "unnamed")
                 try:
                     result = future.result()
                     results.append(result)
-                    print(
-                        f"   ✓ [{i}/{len(strategies)}] {strategy.get('name', 'unnamed')} - "
-                        f"{result.get('status', 'unknown')}"
-                    )
+                    status = result.get("status", "unknown")
+                    count = result.get("results_count", 0)
+                    print(f"     ✓ [{i}/{len(specs)}] [{tool}] {name} — {status} ({count} results)")
                 except Exception as e:
-                    print(f"   ✗ [{i}/{len(strategies)}] {strategy.get('name', 'unnamed')} - Error: {e}")
+                    print(f"     ✗ [{i}/{len(specs)}] [{tool}] {name} — Error: {e}")
                     results.append({
-                        "strategy_name": strategy.get("name", "unnamed"),
+                        "strategy_name": name,
                         "status": "error",
                         "error": str(e),
+                        "markdown_file": None,
+                        "results_count": 0,
                     })
 
-        # Update state with all results
         for result in results:
             state = update_state_from_worker(state, result)
 
-        print(f"\n✅ Workers complete:")
-        print(f"   - Successful: {len([r for r in results if r.get('status') == 'success'])}")
-        print(f"   - Failed: {len(state.get('failed_strategies', []))}")
-        print(f"   - Total results: {state.get('total_results_count', 0)}")
-        print(f"   - Markdown files: {len(state.get('markdown_files', []))}")
+        successful = [r for r in results if r.get("status") == "success"]
+        print(f"\n  ✅ Workers complete:")
+        print(f"     - Successful:    {len(successful)}/{len(results)}")
+        print(f"     - Total results: {state.get('total_results_count', 0)}")
+        print(f"     - Files written: {len(state.get('markdown_files', []))}")
 
     except Exception as e:
-        print(f"\n❌ Workers error: {e}")
+        print(f"\n  ❌ Workers error: {e}")
         state["status"] = "error"
         state["error"] = f"Workers failed: {e}"
 
     return state
 
 
-def synthesizer_node(state: MultiAgentState) -> MultiAgentState:
-    """Synthesizer node: Generate final answer.
+def aggregator_node(state: MultiAgentState) -> MultiAgentState:
+    """Aggregator: deduplicate + rank worker outputs → single file for synthesizer.
 
-    Args:
-        state: Current workflow state
-
-    Returns:
-        Updated state with final answer
+    NEW NODE. Pure Python — no LLM, no network call, just file I/O + string
+    scoring. Adds no meaningful latency but saves the synthesizer from
+    reading N files and doing dedup/ranking itself inside its context window.
     """
+    print("\n" + "=" * 60)
+    print("📊 AGGREGATOR")
+    print("=" * 60)
+
+    try:
+        state["current_step"] = "aggregator_running"
+
+        markdown_files = state.get("markdown_files", [])
+
+        if not markdown_files:
+            print("  ⚠️  No markdown files to aggregate — synthesizer will report no results")
+            state["aggregated_filepath"] = None
+            state["aggregated_result_count"] = 0
+            state["current_step"] = "aggregator_complete"
+            return state
+
+        result = aggregate_results(
+            markdown_files=markdown_files,
+            user_query=state["user_query"],
+            entity_details=state.get("preprocessor_entity_details", {}),
+            predicate_details=state.get("preprocessor_predicate_details", {}),
+            chunk_texts=state.get("preprocessor_chunk_texts", {}),
+            community_labels=state.get("preprocessor_community_labels", {}),
+        )
+        state = update_state_from_aggregator(state, result)
+
+        print(f"\n  ✅ Aggregator complete:")
+        print(f"     - Input files:    {len(markdown_files)}")
+        print(f"     - Unique results: {state['aggregated_result_count']}")
+        print(f"     - Output file:    {state.get('aggregated_filepath', 'none')}")
+
+    except Exception as e:
+        print(f"\n  ⚠️  Aggregator error: {e} — synthesizer will fall back to reading raw files")
+        state["current_step"] = "aggregator_fallback"
+
+    return state
+
+
+def synthesizer_node(state: MultiAgentState) -> MultiAgentState:
+    """Synthesizer: single LLM call against the aggregated file — no ReAct loop."""
     print("\n" + "=" * 60)
     print("📝 SYNTHESIZER AGENT")
     print("=" * 60)
@@ -209,119 +261,111 @@ def synthesizer_node(state: MultiAgentState) -> MultiAgentState:
     try:
         state["current_step"] = "synthesizer_running"
 
-        # Initialize synthesizer
         synthesizer = SynthesizerAgent(
             llm_provider=state["llm_provider"],
             llm_model=state["llm_model_synthesizer"],
         )
 
-        # Synthesize answer
+        # Pass the pre-ranked single file when available; synthesizer falls
+        # back to reading all recent files if the aggregator node failed.
         result = synthesizer.synthesize_answer(
-            state["user_query"],
-            state.get("strategies", []),
+            user_query=state["user_query"],
+            strategies=state.get("worker_specs") or state.get("strategies"),
+            aggregated_filepath=state.get("aggregated_filepath"),
         )
 
-        # Update state
         state = update_state_from_synthesizer(state, result)
 
-        print(f"\n✅ Synthesizer complete:")
-        print(f"   - Files read: {state['files_read']}")
-        print(f"   - Results analyzed: {state['results_analyzed']}")
-        print(f"   - Answer quality: {state['synthesis_quality']}")
+        print(f"\n  ✅ Synthesizer complete:")
+        print(f"     - Files read:      {state['files_read']}")
+        print(f"     - Results analyzed:{state['results_analyzed']}")
+        print(f"     - Answer quality:  {state['synthesis_quality']}")
 
     except Exception as e:
-        print(f"\n❌ Synthesizer error: {e}")
+        print(f"\n  ❌ Synthesizer error: {e}")
         state["status"] = "error"
         state["error"] = f"Synthesizer failed: {e}"
 
     return state
 
 
+# ---------------------------------------------------------------------------
+# Conditional edges
+# ---------------------------------------------------------------------------
+
 def should_continue_after_orchestrator(state: MultiAgentState) -> str:
-    """Decision node after orchestrator.
-
-    Args:
-        state: Current workflow state
-
-    Returns:
-        Next node name or END
-    """
     if state.get("status") == "error":
         return END
 
-    if not state.get("strategies"):
-        print("⚠️  No strategies planned, skipping to synthesizer")
+    specs = state.get("worker_specs") or state.get("strategies", [])
+    if not specs:
+        print("  ⚠️  No specs planned — skipping workers and aggregator")
         return "synthesizer"
 
     return "workers"
 
 
 def should_continue_after_workers(state: MultiAgentState) -> str:
-    """Decision node after workers.
-
-    Args:
-        state: Current workflow state
-
-    Returns:
-        Next node name
-    """
     if state.get("status") == "error":
         return END
+    return "aggregator"
 
+
+def should_continue_after_aggregator(state: MultiAgentState) -> str:
+    if state.get("status") == "error":
+        return END
     return "synthesizer"
 
+
+# ---------------------------------------------------------------------------
+# Graph construction
+# ---------------------------------------------------------------------------
 
 def create_workflow() -> StateGraph:
     """Create the multi-agent LangGraph workflow.
 
-    Returns:
-        Configured StateGraph
+    Node order:
+      preprocessor → orchestrator → workers → aggregator → synthesizer → END
     """
-    # Create graph
     workflow = StateGraph(MultiAgentState)
 
-    # Add nodes
     workflow.add_node("preprocessor", preprocessor_node)
     workflow.add_node("orchestrator", orchestrator_node)
     workflow.add_node("workers", workers_node)
+    workflow.add_node("aggregator", aggregator_node)
     workflow.add_node("synthesizer", synthesizer_node)
 
-    # Add edges — preprocessor is the new entry point
     workflow.set_entry_point("preprocessor")
     workflow.add_edge("preprocessor", "orchestrator")
 
-    # Conditional edge after orchestrator
     workflow.add_conditional_edges(
         "orchestrator",
         should_continue_after_orchestrator,
-        {
-            "workers": "workers",
-            "synthesizer": "synthesizer",
-            END: END,
-        },
+        {"workers": "workers", "synthesizer": "synthesizer", END: END},
     )
-
-    # Conditional edge after workers
     workflow.add_conditional_edges(
         "workers",
         should_continue_after_workers,
-        {
-            "synthesizer": "synthesizer",
-            END: END,
-        },
+        {"aggregator": "aggregator", END: END},
     )
-
-    # End after synthesizer
+    workflow.add_conditional_edges(
+        "aggregator",
+        should_continue_after_aggregator,
+        {"synthesizer": "synthesizer", END: END},
+    )
     workflow.add_edge("synthesizer", END)
 
     return workflow
 
 
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
 def run_multi_agent_workflow(
     user_query: str,
     llm_provider: str = REASONING_PROVIDER,
     llm_model_orchestrator: str = ORCHESTRATOR_MODEL,
-    llm_model_worker: str = WORKER_MODEL,
     llm_model_synthesizer: str = SYNTHESIZER_MODEL,
     llm_model_preprocessor: str = PREPROCESSING_MODEL,
     qdrant_url: Optional[str] = None,
@@ -335,10 +379,9 @@ def run_multi_agent_workflow(
     Args:
         user_query: The user's question
         llm_provider: LLM provider to use
-        llm_model_orchestrator: Model for orchestrator
-        llm_model_worker: Model for workers
-        llm_model_synthesizer: Model for synthesizer
-        llm_model_preprocessor: Model for pre-processor
+        llm_model_orchestrator: Model for orchestrator (single structured-output call)
+        llm_model_synthesizer: Model for synthesizer (single non-agentic call)
+        llm_model_preprocessor: Model for pre-processor (expand + filter calls)
         qdrant_url: Qdrant server URL
         qdrant_api_key: Qdrant API key
         neo4j_uri: Neo4j server URI
@@ -349,16 +392,14 @@ def run_multi_agent_workflow(
         Final state dictionary with answer and metadata
     """
     print("\n" + "=" * 60)
-    print("🚀 MULTI-AGENT KG REASONING WORKFLOW")
+    print("🚀 MULTI-AGENT KG REASONING WORKFLOW  v2.0")
     print("=" * 60)
-    print(f"\nUser Query: {user_query}\n")
+    print(f"\n  Query: {user_query}\n")
 
-    # Create initial state
     initial_state = create_initial_state(
         user_query=user_query,
         llm_provider=llm_provider,
         llm_model_orchestrator=llm_model_orchestrator,
-        llm_model_worker=llm_model_worker,
         llm_model_synthesizer=llm_model_synthesizer,
         llm_model_preprocessor=llm_model_preprocessor,
         qdrant_url=qdrant_url,
@@ -368,27 +409,33 @@ def run_multi_agent_workflow(
         neo4j_password=neo4j_password,
     )
 
-    # Create and compile workflow
     workflow = create_workflow()
     app = workflow.compile()
-
-    # Run workflow
     final_state = app.invoke(initial_state)
 
-    # Print summary
+    # ── Summary ──────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("📊 WORKFLOW SUMMARY")
     print("=" * 60)
-    print(f"Status: {final_state.get('status', 'unknown')}")
-    print(f"Execution time: {final_state.get('execution_time_seconds') or 0:.2f}s")
-    print(f"Strategies executed: {len(final_state.get('strategies', []))}")
-    print(f"Total results: {final_state.get('total_results_count', 0)}")
-    print(f"Markdown files created: {len(final_state.get('markdown_files', []))}")
+    status = final_state.get("status", "unknown")
+    elapsed = final_state.get("execution_time_seconds") or 0
+    specs = final_state.get("worker_specs") or final_state.get("strategies", [])
+    unique_results = final_state.get("aggregated_result_count", 0)
+    total_results = final_state.get("total_results_count", 0)
+
+    print(f"  Status:           {status}")
+    print(f"  Execution time:   {elapsed:.2f}s")
+    print(f"  Specs executed:   {len(specs)}")
+    print(f"  Total results:    {total_results}")
+    print(f"  Unique (deduped): {unique_results}")
+    print(f"  Markdown files:   {len(final_state.get('markdown_files', []))}")
+    print(f"  Aggregated file:  {final_state.get('aggregated_filepath', 'none')}")
 
     if final_state.get("error"):
-        print(f"\n❌ Error: {final_state['error']}")
+        print(f"\n  ❌ Error: {final_state['error']}")
     else:
-        print(f"\n✅ Answer generated (quality: {final_state.get('synthesis_quality', 'unknown')})")
+        quality = final_state.get("synthesis_quality", "unknown")
+        print(f"\n  ✅ Answer generated (quality: {quality})")
 
     print("=" * 60 + "\n")
 

@@ -21,6 +21,7 @@ from kg_extractor.workflow.langgraph_workflow import (
     run_extract_metadata_only,
     run_chunk_document_only,
     run_extract_triples_only,
+    run_translate_triples_only,
     run_refine_triples_only,
     run_build_graph_only,
 )
@@ -95,6 +96,8 @@ def langgraph_command(args) -> None:
         result = run_parse_document_only(
             input_file=args.input_file,
             pages=pages_to_process,
+            location_moo=args.location_moo,
+            location_village=args.location_village,
         )
         if result["status"] == "success":
             print("✅ Parse-document node completed successfully!")
@@ -138,6 +141,8 @@ def langgraph_command(args) -> None:
         result = run_chunk_document_only(
             input_file=args.input_file,
             chunk_granularity=args.chunk_granularity,
+            location_moo=args.location_moo,
+            location_village=args.location_village,
         )
         if result["status"] == "success":
             print("✅ Chunk-document node completed successfully!")
@@ -152,15 +157,41 @@ def langgraph_command(args) -> None:
         print("🔗 [Debug] Running ONLY extract-triples node...")
         print(f"📄 Input file: {args.input_file}")
         print(f"🤖 Triple LLM: {TRIPLET_PROVIDER}/{TRIPLET_MODEL}")
+        if args.chunk_id is not None:
+            print(f"🎯 Only chunk_id: {args.chunk_id} (other chunks preserved)")
         print()
         result = run_extract_triples_only(
             input_file=args.input_file,
+            location_moo=args.location_moo,
+            location_village=args.location_village,
+            chunk_id=args.chunk_id,
         )
         if result["status"] == "success":
             print("✅ Extract-triples node completed successfully!")
             print(f"🔗 Triples output: {result['triples_output']}")
         else:
             print(f"❌ Extract-triples node failed: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    # --- Single-node debug mode: --translate-triples ---
+    if args.translate_triples:
+        print("🌐 [Debug] Running ONLY translate-triples node...")
+        print(f"📄 Input file: {args.input_file}")
+        if args.chunk_id is not None:
+            print(f"🎯 Only chunk_id: {args.chunk_id} (other chunks preserved)")
+        print()
+        result = run_translate_triples_only(
+            input_file=args.input_file,
+            location_moo=args.location_moo,
+            location_village=args.location_village,
+            chunk_id=args.chunk_id,
+        )
+        if result["status"] == "success":
+            print("✅ Translate-triples node completed successfully!")
+            print(f"🌐 Triples output: {result['triples_output']}")
+        else:
+            print(f"❌ Translate-triples node failed: {result['error']}", file=sys.stderr)
             sys.exit(1)
         return
 
@@ -174,6 +205,8 @@ def langgraph_command(args) -> None:
         result = run_refine_triples_only(
             input_file=args.input_file,
             similarity_threshold=args.similarity_threshold,
+            location_moo=args.location_moo,
+            location_village=args.location_village,
         )
         if result["status"] == "success":
             print("✅ Refine-triples node completed successfully!")
@@ -190,6 +223,8 @@ def langgraph_command(args) -> None:
         print()
         result = run_build_graph_only(
             input_file=args.input_file,
+            location_moo=args.location_moo,
+            location_village=args.location_village,
         )
         if result["status"] == "success":
             print("✅ Build-graph node completed successfully!")
@@ -332,6 +367,14 @@ Model configuration is done via environment variables (see .env):
         "derived from input_file, then stop. Without this flag the full pipeline runs (extraction included).",
     )
     parser.add_argument(
+        "--translate-triples",
+        action="store_true",
+        default=False,
+        help="Debug mode: run ONLY the translate-triples node using the existing triples file "
+        "derived from input_file, translating Thai/mixed chunks in place, then stop. "
+        "Without this flag the full pipeline runs (translation included).",
+    )
+    parser.add_argument(
         "--refine-triples",
         action="store_true",
         default=False,
@@ -348,7 +391,7 @@ Model configuration is done via environment variables (see .env):
     parser.add_argument(
         "--until",
         type=str,
-        choices=["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_refining", "graph_building"],
+        choices=["document_parsing", "metadata_extraction", "semantic_chunking", "triple_extraction", "triple_translation", "triple_refining", "graph_building"],
         default=None,
         help="Stop workflow after this step (default: run all steps)",
     )
@@ -357,6 +400,15 @@ Model configuration is done via environment variables (see .env):
         type=str,
         default=None,
         help="Process only specific pages (e.g., '1,2,4,6' or '2-5' or '1,3-5,7')",
+    )
+    parser.add_argument(
+        "--chunk-id",
+        "--chunk_id",
+        type=int,
+        default=None,
+        help="With --extract-triples or --translate-triples: (re-)process only "
+        "this chunk_id and merge the result into the existing triples file in "
+        "place (other chunks are preserved). Ignored without those flags.",
     )
     parser.add_argument(
         "--location-moo",

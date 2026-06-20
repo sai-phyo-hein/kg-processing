@@ -6,7 +6,8 @@
       "Bash(uv sync *)",
       "Bash(rtk grep *)",
       "Bash(rtk find *)",
-      "Bash(rtk ls *)"
+      "Bash(rtk ls *)",
+      "Bash(rtk read *)"
     ]
   }
 }

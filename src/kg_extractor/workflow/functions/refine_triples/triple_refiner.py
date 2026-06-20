@@ -46,7 +46,6 @@ Payload schema (entity / predicate / label registries)
     type         – alias for label (backward-compat)
     is_canonical – bool; True  = this point IS the canonical entry
     canonical_id – UUID of the canonical point (when is_canonical=False)
-    attributes   – free-form dict
 
 Optimisation notes
 ------------------
@@ -333,10 +332,27 @@ class TripleRefiner:
                     f"Original error: {e}"
                 ) from e
 
+            # Evidence collection: index community_id and chunk_id.  Both are
+            # payload-only fields used for exact-match filtering when grouping /
+            # merging evidence points (_identity_filter), so they need KEYWORD
+            # indexes for the filter to be efficient.  The values are coerced
+            # to str in _upsert_evidence_triples (chunk_id arrives as an int)
+            # so they match this KEYWORD index — Qdrant rejects an integer
+            # value against a KEYWORD index with "Index required but not found".
             if spec_key == evidence_spec:
-                print(f"  Skipping payload indexes for evidence collection '{qdrant_name}'")
+                for _evidence_index_field in ("community_id", "chunk_id"):
+                    try:
+                        self.qdrant_client.create_payload_index(
+                            collection_name=qdrant_name,
+                            field_name=_evidence_index_field,
+                            field_schema=qm.PayloadSchemaType.KEYWORD,
+                        )
+                        print(f"  Payload index on '{_evidence_index_field}' ensured for '{qdrant_name}'.")
+                    except Exception as e:
+                        print(f"  Warning: Could not create payload index on '{_evidence_index_field}' for '{qdrant_name}': {e}")
                 continue
 
+            # Entity / predicate / label registries: index is_canonical.
             try:
                 self.qdrant_client.create_payload_index(
                     collection_name=qdrant_name,
@@ -677,10 +693,6 @@ class TripleRefiner:
                 payload["canonical_id"] = str(point_id)
             elif entity.get("canonical_id") is not None:
                 payload["canonical_id"] = entity["canonical_id"]
-            if entity.get("attributes"):
-                payload["attributes"] = entity["attributes"]
-            if entity.get("attributes_en"):
-                payload["attributes_en"] = entity["attributes_en"]
 
             points.append(qm.PointStruct(id=point_id, vector=vectors, payload=payload))
 
@@ -931,7 +943,6 @@ class TripleRefiner:
                     "name":       old_payload.get("name", ""),
                     "name_en":    old_payload.get("name_en"),
                     "label":      old_payload.get("label") or old_payload.get("type", ""),
-                    "attributes": old_payload.get("attributes") or {},
                     "id":         canonical.get("id"),
                     "score":      round(canonical.get("score", 0.0), 3),
                 },
@@ -939,7 +950,6 @@ class TripleRefiner:
                     "name":       entity.get("name", ""),
                     "name_en":    entity.get("name_en"),
                     "label":      entity.get("label", ""),
-                    "attributes": entity.get("attributes") or {},
                 },
             })
         return json.dumps(payload, ensure_ascii=False)
@@ -1098,8 +1108,6 @@ class TripleRefiner:
             base.update({
                 "label":         "predicate" if is_predicate else entity.get("label", ""),
                 "name_en":       entity.get("name_en"),
-                "attributes":    {} if is_predicate else entity.get("attributes", {}),
-                "attributes_en": {} if is_predicate else entity.get("attributes_en", {}),
             })
         return base
 
@@ -1357,7 +1365,6 @@ class TripleRefiner:
                     "payload": {
                         "name":       rep_entity["name"],
                         "name_en":    rep_entity.get("name_en"),
-                        "attributes": rep_entity.get("attributes", {}),
                     },
                     "id":    rep_cache.get("canonical_id"),
                     "score": score,
@@ -1433,41 +1440,6 @@ class TripleRefiner:
     # Evidence collection
     # ------------------------------------------------------------------
 
-    def _dedup_evidence_within_batch(
-        self,
-        records: List[Dict[str, Any]],
-        embeddings: List[List[float]],
-    ) -> Tuple[List[int], List[Tuple[int, int, float]]]:
-        """Greedy within-batch dedup for evidence records."""
-        n = len(records)
-        if n <= 1:
-            return list(range(n)), []
-
-        rep_indices: List[int]                   = []
-        dup_pairs:   List[Tuple[int, int, float]] = []
-
-        for i in range(n):
-            best_rep_idx: Optional[int] = None
-            best_score = 0.0
-            text_i     = records[i].get("evidence_quote_en") or records[i].get("evidence_quote", "")
-            has_num_i  = bool(re.search(r"\d", text_i))
-
-            for rep_idx in rep_indices:
-                text_rep    = records[rep_idx].get("evidence_quote_en") or records[rep_idx].get("evidence_quote", "")
-                has_num_rep = bool(re.search(r"\d", text_rep))
-                threshold   = 0.999 if (has_num_i or has_num_rep) else self.similarity_threshold
-                score       = self._cosine_similarity(embeddings[i], embeddings[rep_idx])
-                if score >= threshold and score > best_score:
-                    best_score   = score
-                    best_rep_idx = rep_idx
-
-            if best_rep_idx is None:
-                rep_indices.append(i)
-            else:
-                dup_pairs.append((i, best_rep_idx, best_score))
-
-        return rep_indices, dup_pairs
-
     def _upsert_evidence_triples(self, chunks: List[Dict[str, Any]]) -> None:
         """Embed and upsert evidence into the evidence collection.
 
@@ -1481,28 +1453,44 @@ class TripleRefiner:
         sparse_vec_en, sparse_vec_th = self._sparse_vector_names(evidence_spec)
         evidence_collection = self._qdrant_name(evidence_spec)
 
-        # ── Group triples by evidence_quote ──────────────────────────────────
-        groups: Dict[str, Dict[str, Any]] = {}
+        # ── Group triples by (evidence_quote, community_id, chunk_id) ─────────
+        # A triple is only considered a duplicate of a stored evidence point when
+        # the quote *and* community_id *and* chunk_id all match, so all three are
+        # part of the group key and persisted in the payload.  community_id and
+        # chunk_id are payload-only — they are never embedded.
+        groups: Dict[Tuple, Dict[str, Any]] = {}
         total_triples = 0
         for chunk in chunks:
             for triple in chunk.get("triples", []):
                 total_triples += 1
-                props  = triple.get("properties", {})
-                eq     = props.get("evidence_quote", "")
-                eq_en  = props.get("evidence_quote_en", "")
-                if eq not in groups:
-                    groups[eq] = {
+                props        = triple.get("properties", {})
+                eq           = props.get("evidence_quote", "")
+                eq_en        = props.get("evidence_quote_en", "")
+                # community_id (str) and chunk_id (int from the extractor) are
+                # payload-only IDs filtered by exact match in _identity_filter.
+                # The evidence collection indexes them as KEYWORD, so coerce
+                # both to str: an integer chunk_id would otherwise require a
+                # separate integer index and Qdrant rejects the KEYWORD filter
+                # with "Index required but not found … of type [integer]".
+                community_id = props.get("community_id")
+                chunk_id     = triple.get("chunk_id")
+                community_id = str(community_id) if community_id is not None else None
+                chunk_id     = str(chunk_id)     if chunk_id     is not None else None
+                group_key    = (eq, community_id, chunk_id)
+                if group_key not in groups:
+                    groups[group_key] = {
                         "evidence_quote":    eq,
                         "evidence_quote_en": eq_en,
                         "entities":          set(),
                         "predicates":        set(),
-                        "community_id":      props.get("community_id"),
+                        "community_id":      community_id,
+                        "chunk_id":          chunk_id,
                     }
-                groups[eq]["entities"].add(triple["subject"]["name"])
-                groups[eq]["entities"].add(triple["object"]["name"])
-                groups[eq]["predicates"].add(triple["predicate"])
-                if eq_en and not groups[eq]["evidence_quote_en"]:
-                    groups[eq]["evidence_quote_en"] = eq_en
+                groups[group_key]["entities"].add(triple["subject"]["name"])
+                groups[group_key]["entities"].add(triple["object"]["name"])
+                groups[group_key]["predicates"].add(triple["predicate"])
+                if eq_en and not groups[group_key]["evidence_quote_en"]:
+                    groups[group_key]["evidence_quote_en"] = eq_en
 
         if not groups:
             print("No evidence triples to upsert.")
@@ -1536,9 +1524,26 @@ class TripleRefiner:
             th_sparse = self._compute_sparse_tf_batch(th_doc_texts, th_vocab)
 
         # ── Batch-query Qdrant for exact matches (score 1.0) ──────────────────
+        # Match requires full equality: same evidence quote (embedding ~1.0) AND
+        # same community_id AND same chunk_id.  community_id / chunk_id are
+        # filtered as exact payload values — never embedded.
         merged_count  = 0
         new_indices: List[int] = []
         print(f"  Querying {len(records)} exact matches (batched)...")
+
+        def _identity_filter(record: Dict[str, Any]) -> Optional[qm.Filter]:
+            must: List[Any] = []
+            if record.get("community_id") is not None:
+                must.append(qm.FieldCondition(
+                    key="community_id",
+                    match=qm.MatchValue(value=record["community_id"]),
+                ))
+            if record.get("chunk_id") is not None:
+                must.append(qm.FieldCondition(
+                    key="chunk_id",
+                    match=qm.MatchValue(value=record["chunk_id"]),
+                ))
+            return qm.Filter(must=must) if must else None
 
         requests_batch = [
             qm.QueryRequest(
@@ -1547,6 +1552,7 @@ class TripleRefiner:
                 limit=1,
                 with_payload=True,
                 score_threshold=1.0,
+                filter=_identity_filter(records[i]),
             )
             for i in range(len(records))
         ]
@@ -1593,15 +1599,22 @@ class TripleRefiner:
         points: List[qm.PointStruct] = []
         for i in new_indices:
             record   = records[i]
-            point_id = self._generate_uuid(record["evidence_quote"] or f"evidence_{i}")
+            # Fold community_id + chunk_id into the UUID so the same quote in a
+            # different chunk/community maps to a distinct point (matches the
+            # grouping/match identity above).
+            uid_key = record["evidence_quote"] or f"evidence_{i}"
+            uid_key = f"{uid_key}::{record.get('community_id')}::{record.get('chunk_id')}"
+            point_id = self._generate_uuid(uid_key)
             payload: Dict[str, Any] = {
                 "entities":          sorted(record["entities"]),
                 "predicates":        sorted(record["predicates"]),
                 "evidence_quote":    record["evidence_quote"],
                 "evidence_quote_en": record["evidence_quote_en"],
             }
-            if record["community_id"]:
+            if record["community_id"] is not None:
                 payload["community_id"] = record["community_id"]
+            if record["chunk_id"] is not None:
+                payload["chunk_id"] = record["chunk_id"]
 
             vectors: Dict[str, Any] = {vec_en: en_embeddings[i], vec_th: th_embeddings[i]}
             if sparse_vec_en and en_sparse:
@@ -1657,8 +1670,6 @@ class TripleRefiner:
                         "is_new":       True,
                         "label":        subj_raw.get("label", ""),
                         "name_en":      subj_raw.get("name_en"),
-                        "attributes":   subj_raw.get("attributes", {}),
-                        "attributes_en": subj_raw.get("attributes_en", {}),
                     },
                 )
                 refined_predicate = entity_cache.get(
@@ -1681,8 +1692,6 @@ class TripleRefiner:
                         "is_new":       True,
                         "label":        obj_raw.get("label", ""),
                         "name_en":      obj_raw.get("name_en"),
-                        "attributes":   obj_raw.get("attributes", {}),
-                        "attributes_en": obj_raw.get("attributes_en", {}),
                     },
                 )
                 refined_obj_label = entity_cache.get(
@@ -1718,10 +1727,6 @@ class TripleRefiner:
                 # Bilingual metadata
                 if refined_subject.get("name_en"):
                     refined_triple["subject"]["name_en"] = refined_subject["name_en"]
-                if subj_raw.get("attributes"):
-                    refined_triple["subject"]["attributes"] = subj_raw["attributes"]
-                if subj_raw.get("attributes_en"):
-                    refined_triple["subject"]["attributes_en"] = subj_raw["attributes_en"]
 
                 pred_en = triple.get("predicate_en") or refined_predicate.get("name_en")
                 if pred_en:
@@ -1729,10 +1734,6 @@ class TripleRefiner:
 
                 if refined_object.get("name_en"):
                     refined_triple["object"]["name_en"] = refined_object["name_en"]
-                if obj_raw.get("attributes"):
-                    refined_triple["object"]["attributes"] = obj_raw["attributes"]
-                if obj_raw.get("attributes_en"):
-                    refined_triple["object"]["attributes_en"] = obj_raw["attributes_en"]
 
                 if triple.get("relationship_attributes"):
                     refined_triple["relationship_attributes"] = triple["relationship_attributes"]
@@ -1741,11 +1742,7 @@ class TripleRefiner:
 
                 refined_triples.append(refined_triple)
 
-            # R3 fix: preserve document_metadata (detected_language, source_id, etc.)
-            # that was silently dropped from every chunk in the original implementation.
             chunk_out: Dict[str, Any] = {"chunk_id": chunk_id, "triples": refined_triples}
-            if chunk_data.get("document_metadata"):
-                chunk_out["document_metadata"] = chunk_data["document_metadata"]
             refined_chunks.append(chunk_out)
 
         return {
@@ -1791,8 +1788,6 @@ class TripleRefiner:
                             "name":          name,
                             "name_en":       node.get("name_en"),
                             "label":         node.get("label", ""),
-                            "attributes":    node.get("attributes", {}),
-                            "attributes_en": node.get("attributes_en", {}),
                         }
 
                 pred    = triple["predicate"]
