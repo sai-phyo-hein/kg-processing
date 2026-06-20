@@ -209,7 +209,9 @@ def get_reasoning_llm(model: str = None, temperature: float = 0.1, max_tokens: i
     """Return a cached LangChain ChatOpenAI instance for the active REASONING_PROVIDER.
 
     Supports: openai (default), openrouter, groq, nvidia.
-    Instance is cached by (provider, model) so the HTTP connection pool is reused.
+    Instance is cached by (provider, model, temperature, max_tokens) so the
+    HTTP connection pool is reused across calls with identical settings, while
+    calls that differ on temperature or max_tokens get distinct instances.
 
     Args:
         model: Model name (uses ORCHESTRATOR_MODEL if not provided)
@@ -223,7 +225,7 @@ def get_reasoning_llm(model: str = None, temperature: float = 0.1, max_tokens: i
 
     provider = REASONING_PROVIDER
     model_name = model or ORCHESTRATOR_MODEL
-    cache_key = (provider, model_name)
+    cache_key = (provider, model_name, temperature, max_tokens)
 
     if cache_key in _reasoning_llm_cache:
         return _reasoning_llm_cache[cache_key]

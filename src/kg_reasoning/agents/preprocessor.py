@@ -85,7 +85,15 @@ class PreProcessor:
         llm_provider: str = "",
         llm_model: str = PREPROCESSING_MODEL,
     ):
+        # Low-temperature LLM for the deterministic filtering/classification
+        # calls (community resolution, Stage A source selection, Stage B
+        # entity/predicate filtering).
         self.llm = get_reasoning_llm(model=llm_model, temperature=0.1)
+        # Separate, higher-temperature LLM used ONLY for query expansion —
+        # diversity of rewrites matters there, unlike the filtering calls.
+        # get_reasoning_llm caches by (provider, model, temperature,
+        # max_tokens), so this stays a distinct instance from self.llm.
+        self.llm_expansion = get_reasoning_llm(model=llm_model, temperature=0.7)
         self.qdrant_manager = _get_manager()
 
     # ------------------------------------------------------------------
@@ -263,11 +271,13 @@ class PreProcessor:
     # ------------------------------------------------------------------
 
     def _expand_query(self, user_query: str) -> str:
+        # Use the higher-temperature expansion LLM — diversity of rewrites
+        # matters here, unlike the deterministic filtering calls.
         messages = [
             SystemMessage(content=QUERY_EXPANSION_SYSTEM_PROMPT),
             HumanMessage(content=user_query),
         ]
-        response = self.llm.invoke(messages)
+        response = self.llm_expansion.invoke(messages)
         return response.content.strip()
 
     # ------------------------------------------------------------------
