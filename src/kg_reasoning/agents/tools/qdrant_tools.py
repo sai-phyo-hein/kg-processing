@@ -934,10 +934,29 @@ class QdrantToolsManager:
         Args:
             query_texts: List of text queries to search for
             limit: Maximum number of results per query
-            threshold: Minimum similarity threshold
+            threshold: Minimum similarity threshold (applied only to
+                dense-only results — see "score" below)
 
         Returns:
-            List of matching evidence records with entities, predicates, and quotes
+            List of matching evidence records with entities, predicates, and
+            quotes. Each result's "score" is now ALWAYS a relevance value on
+            a comparable [0, 1] scale, regardless of which retrieval path
+            produced it:
+              - Dense-only results: the real cosine similarity, unchanged.
+              - RRF (hybrid dense+sparse fusion) results: min-max normalized
+                against that query's own RRF result set, NOT the raw fusion
+                score. Qdrant's RRF score is Σ 1/(k + rank) — bounded by rank
+                position, not by how similar the result actually is to the
+                query — so comparing or adding it directly to a cosine
+                similarity (as any downstream consumer naturally would,
+                since they're both just floats called "score") silently
+                produces meaningless rankings. Normalizing here, once, at
+                the source, means every caller of this function gets a
+                consistent contract instead of having to know which
+                retrieval path fired for which result.
+            Each result also carries "raw_score" (the original, unnormalized
+            Qdrant score) and "is_rrf" (bool) for debugging/audit — these are
+            informational only and should not be used for ranking math.
         """
         from qdrant_client.http import models as qm
 
@@ -1027,15 +1046,19 @@ class QdrantToolsManager:
                 if result is not None:
                     all_results.append((task[0], result, is_rrf))
 
-        # Deduplicate across languages per query text.
+        # Deduplicate across languages per query text. Track is_rrf alongside
+        # each point so downstream normalization (below) knows which scoring
+        # regime produced it — RRF fusion scores and dense-only cosine
+        # similarities are different kinds of numbers and must never be
+        # compared or combined without normalizing first.
         # RRF fusion scores are rank-based (typically 0.01–0.03) and must NOT
         # be compared against the cosine-similarity threshold — doing so drops
         # nearly every result. Dense-only scores are cosine similarities where
         # the threshold is meaningful. Use limit to cap RRF result count instead.
-        results_map: Dict[str, Dict[str, Any]] = {}  # query_text -> {seen, points_by_id}
+        results_map: Dict[str, Dict[str, Any]] = {}  # query_text -> {seen, points_by_id, is_rrf_by_id}
         for query_text, search_results, is_rrf in all_results:
             if query_text not in results_map:
-                results_map[query_text] = {"seen": {}, "points_by_id": {}}
+                results_map[query_text] = {"seen": {}, "points_by_id": {}, "is_rrf_by_id": {}}
             entry = results_map[query_text]
 
             for point in search_results.points:
@@ -1046,9 +1069,39 @@ class QdrantToolsManager:
                 if pid not in entry["seen"] or point.score > entry["seen"][pid]:
                     entry["seen"][pid] = point.score
                     entry["points_by_id"][pid] = point
+                    entry["is_rrf_by_id"][pid] = is_rrf
 
         results = []
         for query_text, entry in results_map.items():
+            # ---- Normalize RRF scores to a comparable [0, 1] relevance scale ----
+            # RRF fusion scores (Σ 1/(k + rank), Qdrant's default k=60) are
+            # bounded by rank position, not by query-result similarity — a
+            # 0.02 from RRF and a 0.85 from dense-only cosine similarity are
+            # NOT the same kind of number and must not be compared or added
+            # directly (the original code did exactly that downstream, in
+            # aggregator._score_result, which silently assumed every score
+            # was a cosine similarity).
+            #
+            # The correct normalization for a rank-based score within one
+            # query's own result set is min-max rescaling against that same
+            # set: the top-ranked RRF result becomes 1.0, the lowest becomes
+            # 0.0, everything else interpolates. This preserves RRF's actual
+            # signal (its ranking) while putting it on the same scale
+            # dense-only cosine similarity already uses, so a downstream
+            # consumer can compare/combine scores regardless of which
+            # retrieval path produced them — WITHOUT pretending RRF's
+            # absolute magnitude means anything (it doesn't; only its
+            # relative order does).
+            rrf_pids = [pid for pid, is_r in entry["is_rrf_by_id"].items() if is_r]
+            normalized_score: Dict[str, float] = {}
+            if rrf_pids:
+                rrf_scores = [entry["seen"][pid] for pid in rrf_pids]
+                lo, hi = min(rrf_scores), max(rrf_scores)
+                span = hi - lo
+                for pid in rrf_pids:
+                    raw = entry["seen"][pid]
+                    normalized_score[pid] = (raw - lo) / span if span > 0 else 1.0
+
             for pid, point in entry["points_by_id"].items():
                 # chunk_id resolution order:
                 # 1. an explicit chunk/source reference in the payload, if the
@@ -1063,9 +1116,20 @@ class QdrantToolsManager:
                     or point.payload.get("source_ref")
                     or pid
                 )
+                is_rrf = entry["is_rrf_by_id"].get(pid, False)
                 results.append({
                     "query": query_text,
-                    "score": point.score,
+                    # "score" is now ALWAYS a comparable [0, 1] relevance
+                    # value regardless of retrieval path: dense-only results
+                    # keep their real cosine similarity unchanged; RRF
+                    # results get their rank-normalized score instead of
+                    # their raw, scale-incompatible fusion score.
+                    "score": normalized_score[pid] if is_rrf else point.score,
+                    # Raw, unnormalized score preserved for debugging/audit —
+                    # never used for ranking math, since its scale depends on
+                    # is_rrf.
+                    "raw_score": point.score,
+                    "is_rrf": is_rrf,
                     "chunk_id": chunk_id,
                     "entities": point.payload.get("entities", []),
                     "predicates": point.payload.get("predicates", []),

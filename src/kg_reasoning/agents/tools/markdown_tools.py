@@ -222,6 +222,23 @@ class MarkdownToolsManager:
     def _slim_rel_community(value: Dict[str, Any]) -> Optional[str]:
         return value.get("properties", {}).get("community_id")
 
+    @staticmethod
+    def _slim_rel_chunk_id(value: Dict[str, Any]) -> Optional[Any]:
+        """Same extraction pattern as _slim_rel_community, for chunk_id.
+
+        Exists so _slim_path can surface each hop's chunk_id as its own
+        top-level field — exactly how _slim_result already does for
+        triples (see its `chunk_id = (rel.get("properties") or
+        {}).get("chunk_id")` line) — instead of relying on
+        _slim_rel_properties, which deliberately excludes chunk_id from
+        the generic "properties" passthrough to avoid duplicating it
+        there. Without this, a path hop's chunk_id had no top-level home
+        and _slim_path silently dropped it, leaving aggregator.scoreResult
+        with no way to look up that hop's evidence chunk in chunkDetails
+        and therefore no embedding-similarity signal for any path result.
+        """
+        return value.get("properties", {}).get("chunk_id")
+
     # Properties excluded from the surfaced "properties" dict:
     #   - community_id, chunk_id: already surfaced as their own top-level
     #     fields elsewhere in the slimmed result, so kept out here to avoid
@@ -267,15 +284,36 @@ class MarkdownToolsManager:
 
     @staticmethod
     def _slim_path(value: Dict[str, Any]) -> Dict[str, Any]:
+        """Slim a Neo4j path into {"chain": [...], "community_ids": [...],
+        "chunk_ids": [...]}.
+
+        Each hop's rel_entry now carries its own "chunk_id" field, the
+        same top-level treatment _slim_result already gives triples. This
+        is what lets aggregator._result_chunk_ids (or its TS twin) look up
+        a path's REAL per-hop evidence in chunk_details for embedding-
+        similarity scoring, instead of falling back to lexical-only
+        overlap on node names — the same blind spot triples used to have
+        before chunk_id was surfaced there.
+
+        chunk_ids (path-level) parallels community_ids: every hop's
+        chunk_id, deduplicated, in case a path's hops were evidenced by
+        different chunks (a multi-hop path crossing several source
+        passages). A hop without a resolvable chunk_id (older data, or a
+        relationship type that genuinely has none) simply contributes
+        nothing to either list — never guessed at.
+        """
         nodes = value.get("nodes", [])
         rels  = value.get("relationships", [])
         if not nodes:
-            return {"chain": []}
+            return {"chain": [], "community_ids": [], "chunk_ids": []}
         chain: List[Any] = [MarkdownToolsManager._slim_node(nodes[0])]
         for i, rel in enumerate(rels):
             rel_entry: Dict[str, Any] = {
                 "predicate": MarkdownToolsManager._slim_rel_type(rel),
             }
+            chunk_id = MarkdownToolsManager._slim_rel_chunk_id(rel)
+            if chunk_id is not None and chunk_id != "":
+                rel_entry["chunk_id"] = chunk_id
             extra_props = MarkdownToolsManager._slim_rel_properties(rel)
             if extra_props:
                 rel_entry["properties"] = extra_props
@@ -287,7 +325,13 @@ class MarkdownToolsManager:
             for r in rels
             if MarkdownToolsManager._slim_rel_community(r)
         })
-        return {"chain": chain, "community_ids": community_ids}
+        chunk_ids = list({
+            cid for cid in (
+                MarkdownToolsManager._slim_rel_chunk_id(r) for r in rels
+            )
+            if cid is not None and cid != ""
+        })
+        return {"chain": chain, "community_ids": community_ids, "chunk_ids": chunk_ids}
 
     @staticmethod
     def _slim_value(value: Any) -> Any:

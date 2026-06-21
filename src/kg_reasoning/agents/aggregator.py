@@ -28,25 +28,53 @@ old flat-JSON format never carried:
     own S3 fetch, see preprocessor.py Step 9), used to populate "relevant
     content" with real source text instead of nothing
 
-SCORING APPROACH (v2 — semantic signal-aware, unchanged):
-Naive keyword overlap between the query and result text fails for knowledge
-graph triples because:
-  - The query says "issues" but the graph stores "OralHealthProblem",
-    "EnvironmentalImpact", "IMPACT_ON" — none of which share tokens with
-    "issues" or "problems"
-  - Community ID tokens ("village", "1", "หมู่") match every result equally
-    since all results share the same community_id, making the overlap score
-    a constant that doesn't distinguish anything
+SCORING APPROACH (v3 — embedding-aware, no hardcoded categories):
+v2 mapped node types and predicates to hand-picked relevance weights per
+query "intent" (issue/people/activity), guessed in advance. That breaks for
+any query, type, or predicate whose wording wasn't anticipated — e.g. a
+query about "irrigation" when the hardcoded table only knows "issue",
+"people", "activity", or a new node type added to the graph after the
+table was written. It's a strictly maintenance-bound approach: relevance
+for unseen vocabulary is exactly zero until someone edits this file.
 
-The v2 scorer combines three signals:
-1. Query token overlap (same as before, but stripped of community/location
-   tokens that appear in every result and add noise)
-2. Semantic type signal — node types and predicate names are mapped to
-   a relevance weight based on the query's intent category (issues/problems,
-   people, activities, organizations, etc.)
-3. Predicate directionality bonus — predicates like IMPACT_ON,
-   HAS_AFFECTING_FACTORS, CREATES_IMPACT_FROM score higher for issue queries
-   than structural predicates like IS, HAS_EXPERTISE_IN, HOLDS_EVENTS_OF
+v3 replaces all of that with two query-aware signals, neither of which
+requires anticipating vocabulary in advance:
+
+1. EMBEDDING SIMILARITY (primary). Every triple in this pipeline is
+   evidenced by a specific chunk_id (markdown_tools._slim_result pulls it
+   off the originating Neo4j edge's properties), and every path hop now
+   carries its own chunk_id the same way (markdown_tools._slim_path was
+   updated to surface it instead of stripping it). The preprocessor
+   already computed a real relevance score between the user's query and
+   that exact chunk's text during its own evidence search (see
+   preprocessor._restructure_by_indices /
+   preprocessor._cap_chunks_per_community, which store this as
+   chunk_details[chunk_id]["score"]). That score is NOT always a plain
+   cosine similarity — qdrant_tools.search_evidence runs hybrid dense+
+   sparse retrieval with RRF fusion when a sparse vector is configured for
+   evidence_registry (the common case), and RRF's raw score is a rank-
+   based quantity, not a similarity. qdrant_tools.search_evidence
+   normalizes this at the source (min-max rescaled within each query's own
+   RRF result set) before it ever reaches chunk_details, so by the time it
+   gets here it's always a comparable [0, 1] relevance value regardless of
+   which retrieval path produced it — this scorer does not need to know or
+   care which one fired. Looking that score up per result means the
+   embedding/retrieval layer — not a hand-written table — decides how
+   relevant a result's underlying evidence is to whatever the user asked,
+   for triples and multi-hop paths alike, in whatever language or
+   vocabulary they used.
+2. LEXICAL OVERLAP (secondary). Plain token overlap between the query and
+   the result's own subject/predicate/object names (or, for paths, its
+   chain's node names), stripped of community/location noise tokens. This
+   catches exact-term matches (a literal entity name, a specific figure)
+   that a chunk-level embedding score can blur, and costs nothing extra
+   since it's derived purely from the query and the result — no category
+   table involved.
+
+chunk_details must be passed in (state["preprocessor_chunk_details"]) for
+signal 1 to be available; without it, scoring degrades to lexical overlap
+only, which is still no worse than v2's behavior for any term outside its
+hardcoded tables.
 """
 
 import json
@@ -63,62 +91,13 @@ _RESULT_BLOCK_RE = re.compile(
 
 _WORD_RE = re.compile(r"[a-zA-Z0-9ก-๙]+", re.UNICODE)
 
-# Query intent signals → which node types and predicates carry weight
-_ISSUE_QUERY_TOKENS: Set[str] = {
-    "issue", "issues", "problem", "problems", "challenge", "challenges",
-    "concern", "concerns", "difficulty", "difficulties", "obstacle", "obstacles",
-    "ปัญหา", "อุปสรรค", "ความยาก",
-}
-
-_PEOPLE_QUERY_TOKENS: Set[str] = {
-    "who", "person", "people", "leader", "leaders", "member", "members",
-    "resident", "residents", "คน", "ผู้นำ", "สมาชิก",
-}
-
-_ACTIVITY_QUERY_TOKENS: Set[str] = {
-    "activity", "activities", "event", "events", "do", "does", "doing",
-    "กิจกรรม", "งาน",
-}
-
-# Node type → base relevance score for each intent category
-# Shape: {node_type_lowercase: {intent: score}}
-_TYPE_SCORES: Dict[str, Dict[str, float]] = {
-    "impact":                   {"issue": 1.0, "people": 0.1, "activity": 0.2},
-    "directimpact":             {"issue": 1.0, "people": 0.1, "activity": 0.2},
-    "healthimpact":             {"issue": 1.0, "people": 0.3, "activity": 0.1},
-    "environmentalimpact":      {"issue": 1.0, "people": 0.1, "activity": 0.2},
-    "environmentalimpactvalue": {"issue": 0.9, "people": 0.1, "activity": 0.1},
-    "socialimpact":             {"issue": 0.9, "people": 0.3, "activity": 0.2},
-    "economicimpact":           {"issue": 0.9, "people": 0.1, "activity": 0.1},
-    "oralhealthproblem":        {"issue": 1.0, "people": 0.2, "activity": 0.1},
-    "researchtopic":            {"issue": 0.7, "people": 0.1, "activity": 0.2},
-    "person":                   {"issue": 0.2, "people": 1.0, "activity": 0.3},
-    "leader":                   {"issue": 0.2, "people": 1.0, "activity": 0.3},
-    "communityworkergroup":     {"issue": 0.3, "people": 0.6, "activity": 0.5},
-    "waterusergroup":           {"issue": 0.3, "people": 0.4, "activity": 0.4},
-    "socialcapitalactivity":    {"issue": 0.2, "people": 0.3, "activity": 0.8},
-    "waterupplyservice":        {"issue": 0.3, "people": 0.1, "activity": 0.5},
-}
-
-# Predicate → base relevance score for each intent
-_PREDICATE_SCORES: Dict[str, Dict[str, float]] = {
-    "IMPACT_ON":                    {"issue": 1.0, "people": 0.2, "activity": 0.2},
-    "HAS_AFFECTING_FACTORS":        {"issue": 0.9, "people": 0.1, "activity": 0.2},
-    "CREATES_IMPACT_FROM":          {"issue": 0.9, "people": 0.1, "activity": 0.2},
-    "IMPACTS_REDUCTION_OF":         {"issue": 0.8, "people": 0.1, "activity": 0.1},
-    "HAS_PROBLEM":                  {"issue": 1.0, "people": 0.1, "activity": 0.1},
-    "CAUSES":                       {"issue": 0.8, "people": 0.1, "activity": 0.1},
-    "LEADS_TO":                     {"issue": 0.7, "people": 0.2, "activity": 0.3},
-    "IS_MEMBER_OF":                 {"issue": 0.1, "people": 0.9, "activity": 0.3},
-    "IS_LEADER_OF":                 {"issue": 0.1, "people": 1.0, "activity": 0.3},
-    "HAS_EXPERTISE_IN":             {"issue": 0.1, "people": 0.2, "activity": 0.5},
-    "IS":                           {"issue": 0.0, "people": 0.1, "activity": 0.1},
-    "HOLDS_EVENTS_AND_ACTIVITIES_OF_SOCIAL_CAPITAL": {"issue": 0.1, "people": 0.2, "activity": 0.8},
-    "HAS_MANAGEMENT_OF_WORK_AND_ACTIVITIES":         {"issue": 0.1, "people": 0.2, "activity": 0.7},
-}
-
 # Community/location tokens that appear in every result's community_id and
-# add noise to overlap scoring — strip these before computing token overlap.
+# add noise to lexical overlap scoring — strip these before computing
+# overlap. This is NOT a relevance judgment about what the query means (it
+# doesn't claim "issue" or "people" matters more than another word) — it's
+# a structural fact about this pipeline's data: every triple in a community
+# carries that community's id/number tokens regardless of content, so they
+# can never discriminate between results and only dilute real overlap.
 _NOISE_TOKENS: Set[str] = {
     "village", "หมู่", "หมู่บ้าน", "moo", "1", "2", "3", "4", "5",
     "6", "7", "8", "9", "10", "community", "ชุมชน",
@@ -156,56 +135,123 @@ def _tokenize(text: str) -> Set[str]:
     return {w.lower() for w in _WORD_RE.findall(text or "")}
 
 
-def _detect_intent(query_tokens: Set[str]) -> str:
-    """Detect the dominant intent category from the query token set."""
-    issue_overlap = len(query_tokens & _ISSUE_QUERY_TOKENS)
-    people_overlap = len(query_tokens & _PEOPLE_QUERY_TOKENS)
-    activity_overlap = len(query_tokens & _ACTIVITY_QUERY_TOKENS)
+def _result_chunk_ids(result: Dict[str, Any]) -> List[str]:
+    """Every chunk_id a result is evidenced by, as strings (matching the
+    string keys chunk_details/chunk_texts use — see
+    preprocessor._fetch_s3_chunk_texts, which stores str(chunk_id)).
 
-    scores = {"issue": issue_overlap, "people": people_overlap, "activity": activity_overlap}
-    best = max(scores, key=lambda k: scores[k])
-    return best if scores[best] > 0 else "general"
-
-
-def _score_result(result: Dict[str, Any], query_tokens: Set[str], intent: str) -> float:
-    """Score a single result using token overlap + semantic type/predicate signals.
-
-    Returns a float in [0, 2.0] — higher is more relevant.
+    Triples carry a single top-level chunk_id (markdown_tools._slim_result
+    reads it off the Neo4j relationship's own properties). Paths carry a
+    chunk_ids LIST inside their unwrapped chain dict (markdown_tools.
+    _slim_path now surfaces each hop's chunk_id the same way _slim_result
+    already did for triples — see that function's docstring) since a
+    multi-hop path can be evidenced by more than one source chunk, one per
+    hop. A result with neither shape (or hops with no resolvable chunk_id
+    at all) returns an empty list rather than guessing.
     """
-    # Strip noise tokens before overlap — community_id tokens appear in
-    # every result and drown out meaningful signal.
+    chunk_id = result.get("chunk_id")
+    if chunk_id is not None and chunk_id != "":
+        return [str(chunk_id)]
+
+    path_data = _unwrap_path(result)
+    if path_data is not None:
+        return [str(cid) for cid in path_data.get("chunk_ids", []) if cid is not None and cid != ""]
+
+    return []
+
+
+def _score_result(
+    result: Dict[str, Any],
+    query_tokens: Set[str],
+    chunk_details: Dict[str, Dict[str, Any]],
+) -> float:
+    """Score a single result by combining two query-aware signals — no
+    hardcoded category/type/predicate tables:
+
+    1. EMBEDDING SIMILARITY (primary, when available): the result's own
+       evidence chunk(s) were already scored against the user's query by
+       the preprocessor's evidence search (see
+       preprocessor._restructure_by_indices, which stores
+       chunk_details[chunk_id]["score"]). This is normalized to a
+       comparable [0, 1] relevance value at the source
+       (qdrant_tools.search_evidence) regardless of whether that chunk was
+       matched via dense-only cosine similarity or hybrid dense+sparse RRF
+       fusion — the two retrieval paths produce structurally different raw
+       scores (a bounded cosine value vs. an unbounded-below, rank-based
+       fusion score), so this function never has to know or care which one
+       fired for a given chunk. A triple is evidenced by exactly the
+       chunk_id markdown_tools._slim_result pulled off its Neo4j edge, so
+       looking that chunk_id up in chunk_details gives this triple a TRUE
+       query-relevance score with no guessing about which node types or
+       predicates "should" matter — the retrieval layer already decided
+       that when it searched the query against the source text.
+    2. LEXICAL OVERLAP (secondary): plain token overlap between the query
+       and the result's own text (names, predicate, properties). This
+       stays useful for exact terms (a literal entity name, a specific
+       number) that embedding similarity can blur across a whole chunk,
+       and costs nothing extra since it's derived purely from the query
+       and the result itself — not from any hardcoded category mapping.
+
+    Returns a float, roughly in [0, 2.0] but not hard-capped the way the
+    old version was, since embedding_score is already normalized to
+    [0, 1] at the source and doesn't need an artificial ceiling stacked on
+    top of token overlap to stay sane.
+
+    When NO chunk_details are available for a result (chunk_id/chunk_ids
+    entirely missing, or the caller didn't pass chunk_details at all),
+    this degrades gracefully to lexical-overlap-only scoring. With
+    markdown_tools._slim_path now surfacing chunk_ids per hop, this
+    applies equally to triples and paths — neither is structurally locked
+    out of the embedding signal anymore.
+    """
     clean_query = query_tokens - _NOISE_TOKENS
 
-    # Collect text tokens from result, also stripping noise
+    # ---- Signal 1: embedding similarity via evidenced chunk(s) ----------
+    embedding_score = 0.0
+    chunk_ids = _result_chunk_ids(result)
+    if chunk_ids and chunk_details:
+        chunk_scores = [
+            chunk_details[cid]["score"]
+            for cid in chunk_ids
+            if cid in chunk_details and isinstance(chunk_details[cid].get("score"), (int, float))
+        ]
+        if chunk_scores:
+            # A triple can (rarely) be evidenced by more than one chunk_id
+            # if it was independently surfaced by multiple worker specs
+            # with different evidence — take the best, not the average, so
+            # the strongest real evidence for this triple wins rather than
+            # being diluted by a weaker secondary source.
+            embedding_score = max(chunk_scores)
+
+    # ---- Signal 2: lexical overlap (query-derived, not category-derived) -
     flat_text = _flatten_text(result)
     result_tokens = _tokenize(flat_text) - _NOISE_TOKENS
-
     token_overlap = (
         len(clean_query & result_tokens) / max(len(clean_query), 1)
         if clean_query else 0.0
     )
 
-    # Semantic type signal
-    subject_type = ""
-    object_type = ""
-    predicate = ""
-
-    if "subject" in result and isinstance(result["subject"], dict):
-        subject_type = (result["subject"].get("type") or "").lower()
-    if "object" in result and isinstance(result["object"], dict):
-        object_type = (result["object"].get("type") or "").lower()
-    if "predicate" in result:
-        predicate = result.get("predicate", "")
-
-    # For evidence chunk results
+    # For evidence chunk results — same lexical-only treatment as before,
+    # since these results ARE the evidence text itself; the embedding
+    # signal above doesn't add anything beyond what token_overlap already
+    # measures here, and these results may not carry a chunk_id in the
+    # same field name.
     if "evidence_quote" in result or "evidence_quote_en" in result:
         quote_tokens = _tokenize(
             result.get("evidence_quote_en", "") + " " + result.get("evidence_quote", "")
         ) - _NOISE_TOKENS
         quote_overlap = len(clean_query & quote_tokens) / max(len(clean_query), 1) if clean_query else 0.0
-        return min(2.0, token_overlap + quote_overlap)
+        return token_overlap + quote_overlap
 
-    # For path/chain results
+    # For path/chain results — chunk_ids (one per hop, deduplicated) are
+    # now surfaced by markdown_tools._slim_path, so paths get the same
+    # embedding-similarity signal triples do, not lexical-only overlap.
+    # embedding_score above already covers this (it's computed from
+    # _result_chunk_ids, which now reads path_data["chunk_ids"] too) — this
+    # branch only adds the path-specific lexical signal: overlap against
+    # the chain's own node names, which still catches exact-term matches
+    # (a literal place or entity name in the query) that a chunk-level
+    # embedding score can blur.
     path_data = _unwrap_path(result)
     if path_data is not None:
         chain = path_data.get("chain", [])
@@ -215,26 +261,25 @@ def _score_result(result: Dict[str, Any], query_tokens: Set[str], intent: str) -
         )
         chain_tokens = _tokenize(chain_text) - _NOISE_TOKENS
         chain_overlap = len(clean_query & chain_tokens) / max(len(clean_query), 1) if clean_query else 0.0
-        return min(2.0, token_overlap + chain_overlap)
+        lexical_signal = max(token_overlap, chain_overlap)
+        return embedding_score + lexical_signal
 
-    # Type-based semantic score
-    type_score = 0.0
-    if intent != "general":
-        subj_weight = _TYPE_SCORES.get(subject_type, {}).get(intent, 0.0)
-        obj_weight = _TYPE_SCORES.get(object_type, {}).get(intent, 0.0)
-        type_score = max(subj_weight, obj_weight)
-
-    # Predicate-based semantic score
-    pred_score = _PREDICATE_SCORES.get(predicate, {}).get(intent, 0.0) if intent != "general" else 0.0
-
-    # Also check if object/subject name contains query-relevant text
+    # Triple case: combine both signals. Embedding similarity is weighted
+    # as the primary term since it's a real measurement of query relevance;
+    # lexical overlap (capped contribution) rescues exact-term matches the
+    # embedding may have blurred, without letting raw keyword stuffing
+    # alone dominate the score the way the old token_overlap-as-equal-term
+    # design allowed.
     name_tokens = (
         _tokenize(result.get("subject", {}).get("name", "") if isinstance(result.get("subject"), dict) else "")
         | _tokenize(result.get("object", {}).get("name", "") if isinstance(result.get("object"), dict) else "")
+        | _tokenize(result.get("predicate", "") if isinstance(result.get("predicate"), str) else "")
     ) - _NOISE_TOKENS
     name_overlap = len(clean_query & name_tokens) / max(len(clean_query), 1) if clean_query else 0.0
 
-    return min(2.0, token_overlap + type_score + pred_score + name_overlap)
+    lexical_signal = max(token_overlap, name_overlap)
+
+    return embedding_score + lexical_signal
 
 
 def _flatten_text(result: Dict[str, Any]) -> str:
@@ -510,6 +555,7 @@ def aggregate_results(
     predicate_details: Optional[Dict[str, Any]] = None,
     chunk_texts: Optional[Dict[str, Any]] = None,
     community_labels: Optional[Dict[str, str]] = None,
+    chunk_details: Optional[Dict[str, Any]] = None,
     max_results: int = 200,
 ) -> Dict[str, Any]:
     """Deduplicate and rank results across all worker output files, then
@@ -535,6 +581,22 @@ def aggregate_results(
             exactly the kind of thing an LLM can get wrong, especially when
             sibling IDs are inconsistently formatted (a missing hyphen
             between two otherwise-parallel village IDs, for example).
+        chunk_details: state["preprocessor_chunk_details"] — chunk_id ->
+            {"score", "community_id", "quote"}, produced by
+            preprocessor._restructure_by_indices /
+            preprocessor._all_from_sources. "score" is a normalized [0, 1]
+            relevance value between the user's (expanded) query and that
+            chunk — qdrant_tools.search_evidence computes this during
+            evidence search, and normalizes it at the source regardless of
+            whether the underlying Qdrant retrieval was dense-only (a true
+            cosine similarity) or hybrid dense+sparse RRF fusion (a
+            rank-based score on a completely different scale, rescaled to
+            [0, 1] before it ever reaches this dict — see that function's
+            docstring for why mixing the two scales directly would silently
+            produce meaningless rankings). This is what _score_result now
+            uses as its primary relevance signal instead of any hardcoded
+            node-type or predicate weight table. Distinct from chunk_texts,
+            which carries the fetched S3 text but drops the score field.
         max_results: Hard cap on unique results passed to the synthesizer
 
     Returns:
@@ -544,17 +606,22 @@ def aggregate_results(
     predicate_details = predicate_details or {}
     chunk_texts = chunk_texts or {}
     community_labels = community_labels or {}
+    chunk_details = chunk_details or {}
 
     query_tokens = _tokenize(user_query)
-    intent = _detect_intent(query_tokens)
-    print(f"  [Aggregator] Detected query intent: {intent}")
+    if not chunk_details:
+        print(
+            "  [Aggregator] No chunk_details provided — scoring will fall "
+            "back to lexical overlap only. Pass state['preprocessor_chunk_details'] "
+            "to enable embedding-similarity-based ranking."
+        )
 
     seen: Dict[Tuple, Dict[str, Any]] = {}
 
     for filepath in markdown_files:
         for result in _extract_results_from_file(filepath):
             key = _result_key(result)
-            score = _score_result(result, query_tokens, intent)
+            score = _score_result(result, query_tokens, chunk_details)
 
             existing = seen.get(key)
             if existing is None or score > existing["score"]:
@@ -646,7 +713,7 @@ def _write_aggregated_file(
     # could dominate the file even after the global max_results cap,
     # since that cap operates across all communities combined, not per
     # community.
-    MAX_RELATIONSHIPS_PER_COMMUNITY = 40
+    MAX_RELATIONSHIPS_PER_COMMUNITY = 50
 
     lines: List[str] = []
     lines.append(f"# Aggregated results for: {user_query}\n")

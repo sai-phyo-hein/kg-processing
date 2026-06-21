@@ -237,13 +237,30 @@ def aggregator_node(state: MultiAgentState) -> MultiAgentState:
             predicate_details=state.get("preprocessor_predicate_details", {}),
             chunk_texts=state.get("preprocessor_chunk_texts", {}),
             community_labels=state.get("preprocessor_community_labels", {}),
+            # NEW: chunk_id -> {score, community_id, quote}, where "score" is
+            # the REAL cosine similarity between the user's query and that
+            # chunk's embedding (computed by the preprocessor's own evidence
+            # search — see preprocessor._restructure_by_indices). This was
+            # already sitting in state (state.py populates it from the
+            # preprocessor's output) but was never threaded into the
+            # aggregator call, so every triple/path was scored on lexical
+            # overlap alone even though a real embedding-similarity score
+            # existed for it the whole time. Without this line,
+            # aggregate_results silently falls back to lexical-only scoring
+            # (it warns but does not fail) — passing it is what actually
+            # turns on embedding-aware reranking.
+            chunk_details=state.get("preprocessor_chunk_details", {}),
         )
         state = update_state_from_aggregator(state, result)
 
+        chunk_details_count = len(state.get("preprocessor_chunk_details", {}) or {})
         print(f"\n  ✅ Aggregator complete:")
         print(f"     - Input files:    {len(markdown_files)}")
         print(f"     - Unique results: {state['aggregated_result_count']}")
         print(f"     - Output file:    {state.get('aggregated_filepath', 'none')}")
+        print(f"     - Chunk scores:   {chunk_details_count} available for embedding-based ranking"
+              if chunk_details_count else
+              "     - Chunk scores:   0 available — ranking fell back to lexical overlap only")
 
     except Exception as e:
         print(f"\n  ⚠️  Aggregator error: {e} — synthesizer will fall back to reading raw files")
