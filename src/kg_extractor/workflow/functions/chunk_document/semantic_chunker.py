@@ -56,12 +56,18 @@ class SemanticChunker:
         llm_model: str = CHUNKING_MODEL,
         max_retries: int = 3,
         enable_fallback: bool = True,
+        start_chunk_id: int = 1,
     ):
         self.chunk_granularity = chunk_granularity
         self.llm_provider = llm_provider
         self.llm_model = llm_model
         self.max_retries = max_retries
         self.enable_fallback = enable_fallback
+        # First chunk_id to assign. Defaults to 1, but when a community already
+        # has chunks in S3 we resume numbering so ids stay unique across
+        # separately processed files (no chunk_NNN.txt overwrite). See
+        # ``chunk_markdown_file`` / ``get_max_chunk_id_from_s3``.
+        self.start_chunk_id = start_chunk_id
         self.context_limit = 50_000  # Token limit per section
         self.CONTEXT_OVERLAP = 50    # Lines to overlap between sections
         self.SAFETY_MARGIN = 500
@@ -265,7 +271,7 @@ class SemanticChunker:
         current_line = 0
         total_lines = len(source_lines)
         section_number = 1
-        chunk_id_counter = 1
+        chunk_id_counter = self.start_chunk_id
         context_overlap = self.CONTEXT_OVERLAP
         MIN_LINES_PER_CHUNK = 3
 
@@ -422,6 +428,7 @@ class SemanticChunker:
                 "llm_model": self.llm_model,
                 "context_limit": self.context_limit,
                 "context_overlap": self.CONTEXT_OVERLAP,
+                "start_chunk_id": self.start_chunk_id,
             },
             "chunk_statistics": {
                 "total_characters": sum(chunk_sizes),
@@ -469,7 +476,7 @@ class SemanticChunker:
 
         chunks: List[Dict[str, Any]] = []
         current_lines: List[str] = []
-        chunk_id = 1
+        chunk_id = self.start_chunk_id
         chunk_start = 0
 
         for i, line in enumerate(source_lines):
@@ -526,10 +533,16 @@ def chunk_markdown_file(
     """Chunk a markdown file into separate chunk files.
 
     Args:
-        community_id: Optional community/document unique_id. When set, every
-            chunk file (chunk_001.txt, chunk_002.txt, ... plus manifest.json)
-            is uploaded to ``s3://<bucket>/<community_id>/`` after saving.
-            Upload is best-effort and never aborts chunking.
+        community_id: Optional community/document unique_id. When set:
+
+            * Chunk numbering *resumes* from the largest existing chunk_id in
+              ``s3://<bucket>/<community_id>/`` so that separately processed
+              files sharing a community never overwrite earlier chunks
+              (``chunk_001.txt`` etc.). Falls back to 1 when S3 is unreachable
+              or the community is new.
+            * Every chunk file (chunk_001.txt, chunk_002.txt, ... plus
+              manifest.json) is uploaded to ``s3://<bucket>/<community_id>/``
+              after saving. Upload is best-effort and never aborts chunking.
 
     Returns:
         Path to ``manifest.json`` inside the chunks directory.
@@ -539,12 +552,26 @@ def chunk_markdown_file(
             Path(__file__).parent.parent.parent.parent.parent.parent / "output"
         )
 
+    # Resume chunk numbering from S3 so separately processed files under the
+    # same community never collide/overwrite. A fresh or unreachable community
+    # yields 0, so numbering starts at 1 as before.
+    start_chunk_id = 1
+    if community_id:
+        max_existing = get_max_chunk_id_from_s3(community_id)
+        start_chunk_id = max_existing + 1
+        if start_chunk_id > 1:
+            print(
+                f"🔢 Resuming chunk numbering at {start_chunk_id} for "
+                f"community {community_id}"
+            )
+
     chunker = SemanticChunker(
         chunk_granularity=chunk_granularity,
         llm_provider=llm_provider,
         llm_model=llm_model,
         max_retries=max_retries,
         enable_fallback=enable_fallback,
+        start_chunk_id=start_chunk_id,
     )
 
     try:
@@ -642,3 +669,79 @@ def upload_chunks_to_s3(
         f"to s3://{bucket}/{community_id}/"
     )
     return uploaded
+
+
+def get_max_chunk_id_from_s3(
+    community_id: str,
+    bucket: str = None,
+) -> int:
+    """Return the largest existing ``chunk_id`` under ``s3://<bucket>/<community_id>/``.
+
+    Lists the actual chunk files (``chunk_001.txt``, ``chunk_002.txt``, ...) under
+    the ``<community_id>/`` key prefix and returns the highest numeric id found.
+    Used by :func:`chunk_markdown_file` to resume chunk numbering across
+    separately processed files so ids never restart at 1 and overwrite earlier
+    chunks.
+
+    The chunk *files* are the source of truth rather than ``manifest.json``,
+    because each processed file overwrites the manifest for its community — the
+    files themselves persist as long as ids keep increasing.
+
+    AWS credentials are read from the environment, mirroring
+    :func:`upload_chunks_to_s3`.
+
+    Args:
+        community_id: S3 key prefix (the community/document unique_id).
+        bucket: S3 bucket name. Defaults to env ``SOURCE_DOC_BUCKET`` or ``"document"``.
+
+    Returns:
+        The largest existing chunk_id, or ``0`` when the community has no chunks
+        yet (or S3 cannot be queried — boto3 missing or credentials unset), in
+        which case the caller starts numbering at 1.
+    """
+    if not HAS_BOTO3:
+        return 0
+
+    access_key = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    region = os.getenv("AWS_REGION")
+    if not (access_key and secret_key):
+        return 0
+
+    if bucket is None:
+        bucket = os.getenv("SOURCE_DOC_BUCKET", "document")
+
+    s3 = boto3.client(
+        "s3",
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+    )
+
+    pattern = re.compile(r"chunk_(\d+)\.txt$")
+    prefix = f"{community_id}/"
+    max_id = 0
+    continuation_token = None
+
+    try:
+        while True:
+            list_kwargs: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix}
+            if continuation_token:
+                list_kwargs["ContinuationToken"] = continuation_token
+            resp = s3.list_objects_v2(**list_kwargs)
+            for obj in resp.get("Contents", []):
+                match = pattern.search(obj["Key"])
+                if match:
+                    max_id = max(max_id, int(match.group(1)))
+            if resp.get("IsTruncated"):
+                continuation_token = resp.get("NextContinuationToken")
+            else:
+                break
+    except (ClientError, NoCredentialsError) as e:
+        print(f"⚠️  Could not list S3 chunks for {community_id}: {e}")
+        return 0
+
+    print(
+        f"☁️  Largest existing chunk_id in s3://{bucket}/{prefix} is {max_id}"
+    )
+    return max_id
